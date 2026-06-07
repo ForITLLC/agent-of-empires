@@ -2458,6 +2458,16 @@ impl Instance {
         Ok(())
     }
 
+    /// True for the single fleet-manager session ("AoE-Commander"). Used to
+    /// pin it to the absolute top of every sidebar view regardless of status
+    /// tier or group membership (see `HomeView::pin_commander_first`).
+    /// `favorite`/`pinned_at` only pin within a status tier and sink when the
+    /// row goes idle; the commander must stay top-visible in every state.
+    /// Title-based so it tracks the session the user sees as the commander.
+    pub fn is_commander(&self) -> bool {
+        self.title == "AoE-Commander"
+    }
+
     /// Read the agent-raised urgent flag from `attention.json`. Sourced
     /// on-demand from `/tmp/aoe-hooks-<euid>/{id}/attention.json` so it picks up
     /// changes the running agent makes (via the `attention-urgent` script)

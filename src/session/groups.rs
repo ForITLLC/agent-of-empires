@@ -1063,6 +1063,42 @@ fn count_sessions_in_group(path: &str, instances: &[Instance]) -> usize {
     group_members(path, instances).count()
 }
 
+/// Hoist the AoE-Commander session to the absolute top of `items` (index 0,
+/// depth 0), above ungrouped sessions, every group, and the Archived section,
+/// in every sort order and grouping mode. `favorite`/`pinned_at` only pin
+/// within a status tier and sink/clear when the row goes idle or is archived;
+/// the commander must stay top-visible in every state, so we lift its row to
+/// the front as a post-pass after the natural flow is built.
+///
+/// Group-/sort-/view-agnostic by construction: it finds the commander row
+/// wherever it landed and moves it. If the commander isn't already in `items`
+/// (e.g. filtered out by an active profile) it's still inserted at the top, so
+/// the fleet manager is visible from every view. No-op when no non-archived
+/// commander session exists (an archived commander stays in the Archived
+/// section rather than clawing back to the top).
+pub fn pin_commander_first(items: &mut Vec<Item>, instances: &[Instance]) {
+    let commander_id = match instances
+        .iter()
+        .find(|i| i.is_commander() && !i.is_archived())
+    {
+        Some(inst) => inst.id.clone(),
+        None => return,
+    };
+    if let Some(pos) = items
+        .iter()
+        .position(|it| matches!(it, Item::Session { id, .. } if *id == commander_id))
+    {
+        items.remove(pos);
+    }
+    items.insert(
+        0,
+        Item::Session {
+            id: commander_id,
+            depth: 0,
+        },
+    );
+}
+
 /// Append the synthetic "Archived" section to `items`, pinned to the
 /// bottom of the sidebar across every sort mode. The section contains
 /// every session with `is_archived() == true`, ordered by most-recently
@@ -1322,6 +1358,98 @@ mod tests {
 
         // First item should be ungrouped session
         assert!(matches!(items[0], Item::Session { .. }));
+    }
+
+    fn session_ids(items: &[Item]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_pin_commander_first_hoists_above_ungrouped_and_groups() {
+        // Ungrouped sessions render before any group (see flatten_tree), and
+        // the commander lives inside a group ("fleet") — so without the pin it
+        // is buried. The pin must lift it to index 0, depth 0.
+        let ungrouped = Instance::new("ungrouped", "/tmp/u");
+        let mut worker = Instance::new("worker", "/tmp/w");
+        worker.group_path = "fleet".to_string();
+        let mut commander = Instance::new("AoE-Commander", "/tmp/c");
+        commander.group_path = "fleet".to_string();
+        let commander_id = commander.id.clone();
+
+        let instances = vec![ungrouped, worker, commander];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        let mut items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+
+        // Precondition: commander is NOT first before the pin.
+        assert!(
+            !matches!(&items[0], Item::Session { id, .. } if *id == commander_id),
+            "precondition: commander should be buried before pinning"
+        );
+
+        pin_commander_first(&mut items, &instances);
+
+        match &items[0] {
+            Item::Session { id, depth } => {
+                assert_eq!(*id, commander_id, "commander must be the first row");
+                assert_eq!(*depth, 0, "pinned commander must render at depth 0");
+            }
+            other => panic!("expected commander Session at index 0, got {other:?}"),
+        }
+        // Hoisted, not duplicated.
+        let count = items
+            .iter()
+            .filter(|it| matches!(it, Item::Session { id, .. } if *id == commander_id))
+            .count();
+        assert_eq!(count, 1, "commander row must appear exactly once");
+    }
+
+    #[test]
+    fn test_pin_commander_first_noop_without_commander() {
+        let a = Instance::new("a", "/tmp/a");
+        let mut b = Instance::new("b", "/tmp/b");
+        b.group_path = "work".to_string();
+        let instances = vec![a, b];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        let mut items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let before = session_ids(&items);
+        pin_commander_first(&mut items, &instances);
+        assert_eq!(
+            session_ids(&items),
+            before,
+            "no commander present → order must be unchanged"
+        );
+    }
+
+    #[test]
+    fn test_pin_commander_first_skips_archived_commander() {
+        // An archived commander belongs in the Archived section, not pinned to
+        // the top. flatten_tree already excludes archived rows from the flow;
+        // the pin must not claw it back.
+        let mut commander = Instance::new("AoE-Commander", "/tmp/c");
+        commander.archived_at = Some(Utc::now());
+        let commander_id = commander.id.clone();
+        let worker = Instance::new("worker", "/tmp/w");
+        let worker_id = worker.id.clone();
+        let instances = vec![commander, worker];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        let mut items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        pin_commander_first(&mut items, &instances);
+        assert!(
+            matches!(&items[0], Item::Session { id, .. } if *id == worker_id),
+            "archived commander must not displace the live worker at top"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|it| matches!(it, Item::Session { id, .. } if *id == commander_id)),
+            "archived commander must not be pinned into the flow"
+        );
     }
 
     #[test]

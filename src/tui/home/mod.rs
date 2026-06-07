@@ -25,8 +25,9 @@ use tui_input::Input;
 use crate::session::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
-    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
-    DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance, Item, Storage,
+    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, pin_commander_first,
+    resolve_config_or_warn, DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance,
+    Item, Storage,
 };
 use crate::tmux::AvailableTools;
 
@@ -5257,6 +5258,20 @@ impl HomeView {
     }
 
     pub(super) fn build_flat_items(&self) -> Vec<Item> {
+        // Single funnel for every view. Build the natural flow, then hoist the
+        // AoE-Commander row to the absolute top as a post-pass so it pins
+        // above ungrouped sessions, every group, and the Archived section in
+        // every sort order and grouping mode. This wraps the project and org
+        // branches too (build_flat_items_by_project / _by_org are only
+        // reached from here).
+        let mut items = self.build_flat_items_unpinned();
+        // Pass the full instance set (not a profile-filtered slice) so the
+        // commander pins to the top even in views that would otherwise hide it.
+        pin_commander_first(&mut items, &self.instances);
+        items
+    }
+
+    fn build_flat_items_unpinned(&self) -> Vec<Item> {
         // Project and org grouping are honored across every sort order.
         // Combined with Attention sort, sessions sort by tier within each
         // group and the headers float by their top-attention member (driven
