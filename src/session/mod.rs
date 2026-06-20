@@ -469,7 +469,15 @@ fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> 
             }
         }
     }
-    profiles.sort();
+    // Alphabetical, but always sink a profile literally named "default" to the
+    // end. `default` is the catch-all account profile; pinning it last in every
+    // picker that reads this list (TUI profile dialog, `aoe profile list`, the
+    // web profile list) keeps it from being fat-fingered as a working profile.
+    profiles.sort_by(|a, b| {
+        (a == "default")
+            .cmp(&(b == "default"))
+            .then_with(|| a.cmp(b))
+    });
     Ok(profiles)
 }
 
@@ -516,7 +524,8 @@ mod profile_listing_tests {
         let names = list_profile_names_in(&dir).expect("list");
         assert_eq!(
             names,
-            vec!["default".to_string(), "personal".to_string()],
+            // `default` sinks last (see sort comment); `personal` leads.
+            vec!["personal".to_string(), "default".to_string()],
             "symlinked aliases must be invisible to list_profiles; \
              otherwise each alias inflates the all-profiles session list \
              with duplicates of the linked profile's data (the original \
@@ -535,7 +544,33 @@ mod profile_listing_tests {
         fs::write(dir.join("README"), "ignore me").unwrap();
 
         let names = list_profile_names_in(&dir).expect("list");
-        assert_eq!(names, vec!["default".to_string(), "work".to_string()]);
+        // `default` sinks last; `work` leads.
+        assert_eq!(names, vec!["work".to_string(), "default".to_string()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_profile_names_sinks_default_to_last() {
+        // The picker-ordering contract: every real profile stays alphabetical,
+        // but a profile literally named "default" is always last so it cannot
+        // be fat-fingered as a working profile in the TUI/CLI/web picker.
+        let dir = make_temp_profiles_dir();
+        for name in ["default", "aoe-wmw", "forit-main", "zeta"] {
+            fs::create_dir(dir.join(name)).unwrap();
+        }
+
+        let names = list_profile_names_in(&dir).expect("list");
+        assert_eq!(
+            names,
+            vec![
+                "aoe-wmw".to_string(),
+                "forit-main".to_string(),
+                "zeta".to_string(),
+                "default".to_string(),
+            ],
+            "default must sort last; all other profiles stay alphabetical"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
