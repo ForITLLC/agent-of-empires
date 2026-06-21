@@ -344,19 +344,11 @@ impl Preview {
                     } else {
                         (
                             format!("{:?}", instance.status),
-                            match instance.status {
-                                crate::session::Status::Running => theme.running,
-                                crate::session::Status::Waiting => theme.waiting,
-                                crate::session::Status::Idle => {
-                                    theme.idle_color_at_age(instance.idle_age(), idle_decay_window)
-                                }
-                                crate::session::Status::Unknown => theme.waiting,
-                                crate::session::Status::Stopped => theme.dimmed,
-                                crate::session::Status::Error => theme.error,
-                                crate::session::Status::Starting => theme.dimmed,
-                                crate::session::Status::Deleting => theme.waiting,
-                                crate::session::Status::Creating => theme.accent,
-                            },
+                            theme.status_color(
+                                instance.status,
+                                instance.idle_age(),
+                                idle_decay_window,
+                            ),
                         )
                     };
                     Span::styled(label, Style::default().fg(color))

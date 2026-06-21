@@ -79,6 +79,36 @@ Most dev tools are cold (blue, purple, teal-only). AoE is warm. The amber/copper
 | Error   | #ef4444 | Docker not running, session failed, destructive actions |
 | Info    | #0d9488 | Active session count, informational (shares accent-600) |
 
+### Status colors -- one hue, one meaning
+
+A session row's color encodes exactly one piece of information: what the row
+needs from the user. Each hue maps to one meaning and no other status may
+borrow it. The base map lives in `Theme::status_color()` and is shared by the
+TUI list (`src/tui/home/render.rs`) and the preview pane
+(`src/tui/components/preview.rs`) so the two cannot drift.
+
+| Status | Token | Meaning |
+|--------|-------|---------|
+| Running | `running` (green) | working |
+| Waiting | `waiting` (**bright amber**, reserved) | needs you -- act |
+| Idle | `idle` slate (decays with age) | resting |
+| Unknown | `idle` slate | resting (no false alarm) |
+| Starting / Creating / Deleting | `transition` (teal/cyan) | transient lifecycle |
+| Stopped | `dimmed` | stopped |
+| Error | `error` (red) | failed |
+
+- **Bright amber is reserved for `Waiting`.** Nothing else may paint amber. A
+  resting `Unknown` and a self-resolving `Deleting` used to share `Waiting`'s
+  amber, so a machine state read as "a human must act"; both moved off it.
+- **`transition` is a token outside the green/amber/red attention ramp**
+  (teal/cyan, per theme) so a transient lifecycle state
+  (`Starting`/`Creating`/`Deleting`) can never be misread as
+  Running/Waiting/Error.
+- **Unread override:** a resting `Idle`/`Unknown` row the user has not seen
+  renders `unread` (sky) instead of its base hue; checked before the base map.
+- The help overlay (`?`) carries a "Status colors" legend rendering a `●`
+  swatch in each status color.
+
 ### Dark Mode
 Default. Deep navy surfaces (#020617 to #0f172a), white/light gray text, brand amber for emphasis.
 
@@ -194,6 +224,7 @@ This makes the two panels feel like one cohesive surface with a divider rather t
 ## Decisions Log
 | Date       | Decision | Rationale |
 |------------|----------|-----------|
+| 2026-06-20 | One hue, one meaning for status colors + `transition` token | Bright amber leaked across `Waiting`, `Unknown`, and `Deleting`, so a resting/self-resolving machine state read as "a human must act." Amber is now reserved for `Waiting`; `Unknown` routes to slate (resting); a new `transition` token (teal/cyan, off the green/amber/red ramp) carries `Starting`/`Creating`/`Deleting`. Base map centralized in `Theme::status_color()` (shared by list + preview) and surfaced as a help legend. |
 | 2026-03-22 | Initial design system created | Created by /design-consultation based on product context, competitive research (Warp, Zed, Railway, Ghostty, Cursor, Linear), and analysis of existing website |
 | 2026-03-22 | Satoshi over Inter for display | Inter is the default for every dev tool since 2020. Satoshi has the same geometric clarity with distinctive letterforms that give AoE typographic personality. |
 | 2026-03-22 | DM Sans for body over Inter | Clean, great tabular numerals, not overused. Pairs naturally with Satoshi's geometry. |

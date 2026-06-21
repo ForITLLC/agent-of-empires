@@ -145,6 +145,30 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
 struct HelpSection {
     title: &'static str,
     rows: Vec<(String, String)>,
+    /// When set, this section renders as a color legend instead of key/desc
+    /// rows: each entry is `(swatch color, meaning)` drawn as a `●` glyph in
+    /// that status color followed by its meaning. This is the one place the
+    /// dashboard documents "one hue = one meaning", so a user can map a row's
+    /// color to a state without guessing. Mutually exclusive with `rows`.
+    legend: Option<Vec<(Color, String)>>,
+}
+
+/// The status-color legend: one hue, one meaning. Pulls live theme colors so
+/// the swatches always match what the session list actually paints (and a
+/// custom theme legends itself correctly). Mirrors `Theme::status_color`.
+fn status_legend(theme: &Theme) -> HelpSection {
+    HelpSection {
+        title: "Status colors",
+        rows: Vec::new(),
+        legend: Some(vec![
+            (theme.running, "Running — working".to_string()),
+            (theme.waiting, "Waiting — needs you (act)".to_string()),
+            (theme.idle, "Idle — resting".to_string()),
+            (theme.unread, "Unread — finished, unseen".to_string()),
+            (theme.transition, "Starting/Creating/Deleting".to_string()),
+            (theme.error, "Error — failed".to_string()),
+        ]),
+    }
 }
 
 fn build_sections(strict: bool, sort_order: SortOrder, live_on_enter: bool) -> Vec<HelpSection> {
@@ -156,14 +180,18 @@ fn build_sections(strict: bool, sort_order: SortOrder, live_on_enter: bool) -> V
             if title == "Views" {
                 rows.push((String::new(), sort_label.clone()));
             }
-            HelpSection { title, rows }
+            HelpSection {
+                title,
+                rows,
+                legend: None,
+            }
         })
         .collect()
 }
 
 #[cfg(test)]
 fn section_height(section: &HelpSection) -> usize {
-    1 + section.rows.len()
+    1 + section.rows.len() + section.legend.as_ref().map_or(0, Vec::len)
 }
 
 /// Minimum width a column needs to render every row of every section
@@ -176,8 +204,15 @@ fn min_column_width(sections: &[HelpSection]) -> u16 {
         .unwrap_or(0)
         + ROW_INDENT
         + KEY_FIELD_WIDTH;
+    // Legend lines are `<indent>●  <meaning>`: 1 swatch cell + 2 padding.
+    let legend_width = sections
+        .iter()
+        .filter_map(|s| s.legend.as_ref())
+        .flat_map(|l| l.iter().map(|(_, m)| ROW_INDENT + 3 + m.width()))
+        .max()
+        .unwrap_or(0);
     let title_width = sections.iter().map(|s| s.title.width()).max().unwrap_or(0);
-    row_width.max(title_width) as u16
+    row_width.max(legend_width).max(title_width) as u16
 }
 
 /// Pick a column count that fits `inner_width` while giving each column
@@ -238,6 +273,17 @@ fn render_column_lines(
             section.title.to_string(),
             Style::default().fg(theme.accent).bold(),
         )));
+        if let Some(legend) = &section.legend {
+            // Color-swatch rows: `<indent>●  meaning`, the dot painted in the
+            // status's own color so the legend self-documents the live palette.
+            for (color, meaning) in legend {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(ROW_INDENT)),
+                    Span::styled("\u{25cf}", Style::default().fg(*color)),
+                    Span::styled(format!("  {meaning}"), Style::default().fg(theme.text)),
+                ]));
+            }
+        }
         for (key, desc) in &section.rows {
             let pad = KEY_FIELD_WIDTH.saturating_sub(key.width());
             let key_cell = format!("{}{}{}", " ".repeat(ROW_INDENT), key, " ".repeat(pad));
@@ -316,7 +362,10 @@ impl HelpOverlay {
         let dialog_area = compute_dialog_area(area);
         frame.render_widget(Clear, dialog_area);
 
-        let sections = build_sections(strict_hotkeys, sort_order, live_on_enter);
+        let mut sections = build_sections(strict_hotkeys, sort_order, live_on_enter);
+        // The status-color legend is theme-derived, so it's appended here
+        // (where the theme is in hand) rather than in `build_sections`.
+        sections.push(status_legend(theme));
 
         let version = format!(" Agent of Empires v{} ", env!("CARGO_PKG_VERSION"));
         let block = Block::default()
@@ -733,6 +782,26 @@ mod tests {
         assert!(
             scroll < u16::MAX,
             "scroll should be clamped to the layout max"
+        );
+    }
+
+    #[test]
+    fn render_includes_status_color_legend() {
+        // The `?` overlay must document the status palette so a user can map
+        // a row's color to a meaning. A roomy viewport fits everything.
+        let mut scroll = 0;
+        let buf = render_to_buffer(200, 60, &mut scroll);
+        assert!(
+            buffer_contains(&buf, "Status colors"),
+            "help overlay should render the Status colors legend header"
+        );
+        assert!(
+            buffer_contains(&buf, "needs you"),
+            "legend should explain that Waiting means the user must act"
+        );
+        assert!(
+            buffer_contains(&buf, "\u{25cf}"),
+            "legend rows should render a ● swatch glyph"
         );
     }
 

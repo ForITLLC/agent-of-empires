@@ -19,6 +19,10 @@ waiting = "#fbbf24"
 fresh_idle = "#f59e0b"
 idle = "#64748b"
 unread = "#38bdf8"
+# Transient lifecycle (Starting/Creating/Deleting). Bright teal, sitting
+# OUTSIDE the green/amber/red attention ramp so a self-resolving machine
+# state can never be misread as Running/Waiting/Error. One hue, one meaning.
+transition = "#2dd4bf"
 error = "#ef4444"
 terminal_active = "#0d9488"
 group = "#cbd5e1"

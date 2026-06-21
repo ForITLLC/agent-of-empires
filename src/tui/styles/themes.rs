@@ -6,6 +6,7 @@ use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
 use super::palette::color_to_palette;
+use crate::session::Status;
 
 /// Whether a theme renders against a dark or light surface. Drives
 /// web-side surface ramp derivation (dark themes lighten from
@@ -95,6 +96,14 @@ pub struct Theme {
     /// time by `fill_unread_from_accent`), not Empire's default.
     #[serde(with = "hex_color")]
     pub unread: Color,
+    /// Color for the transient lifecycle states (Starting / Creating /
+    /// Deleting) — "the machine is busy and this resolves itself; do
+    /// nothing." A teal/cyan, deliberately OUTSIDE the green/amber/red
+    /// attention ramp so a transition can never be mistaken for Running,
+    /// Waiting, or Error. One hue, one meaning. A theme TOML that omits
+    /// this key inherits Empire's teal via the container `#[serde(default)]`.
+    #[serde(with = "hex_color")]
+    pub transition: Color,
     #[serde(with = "hex_color")]
     pub error: Color,
     #[serde(with = "hex_color")]
@@ -171,6 +180,8 @@ struct RawThemeDefaults {
     #[serde(with = "hex_color")]
     unread: Color,
     #[serde(with = "hex_color")]
+    transition: Color,
+    #[serde(with = "hex_color")]
     error: Color,
     #[serde(with = "hex_color")]
     terminal_active: Color,
@@ -213,6 +224,7 @@ impl From<RawThemeDefaults> for Theme {
             fresh_idle: raw.fresh_idle,
             idle: raw.idle,
             unread: raw.unread,
+            transition: raw.transition,
             error: raw.error,
             terminal_active: raw.terminal_active,
             group: raw.group,
@@ -275,6 +287,42 @@ impl Theme {
     pub fn dormant(&self) -> Color {
         blend(self.fresh_idle, self.dimmed, 0.5)
     }
+
+    /// The base status -> color mapping, "one hue = one meaning". The single
+    /// source of truth shared by the session list (`home/render.rs`) and the
+    /// preview info pane (`components/preview.rs`) so the two can never drift.
+    ///
+    /// The mapping reserves each hue for exactly one idea:
+    /// - `running` (green): actively working
+    /// - `waiting` (bright amber): NEEDS THE HUMAN — the only "act now" color
+    /// - `idle` / `fresh_idle` (slate): resting; decays with age
+    /// - `transition` (teal): Starting / Creating / Deleting — machine-busy,
+    ///   resolves itself, do nothing
+    /// - `error` (red): failed
+    /// - `dimmed` (slate): Stopped — disambiguated from idle by glyph, not hue
+    ///
+    /// `Unknown` routes to `idle`, not `waiting`: an unknown status is not a
+    /// call to action, so it must not borrow the "needs you" amber.
+    ///
+    /// Callers layer their own overrides ON TOP (unread, archive, snooze,
+    /// urgent) — those are row decorations, not base status, and are not the
+    /// concern of this function.
+    pub fn status_color(
+        &self,
+        status: Status,
+        idle_age: Option<Duration>,
+        window: Duration,
+    ) -> Color {
+        match status {
+            Status::Running => self.running,
+            Status::Waiting => self.waiting,
+            Status::Idle => self.idle_color_at_age(idle_age, window),
+            Status::Unknown => self.idle,
+            Status::Stopped => self.dimmed,
+            Status::Error => self.error,
+            Status::Starting | Status::Creating | Status::Deleting => self.transition,
+        }
+    }
 }
 
 /// Linear RGB blend of `a` and `b` at `t` (0.0 = all `a`, 1.0 = all `b`).
@@ -300,7 +348,7 @@ impl Theme {
     /// single authoritative list shared by `downsample_to_palette` and the
     /// structural guard test. New `Color` fields added to `Theme` must be
     /// added here too; non-color metadata (appearance, syntax, etc.) must not.
-    pub fn color_fields_mut(&mut self) -> [&mut Color; 26] {
+    pub fn color_fields_mut(&mut self) -> [&mut Color; 27] {
         [
             &mut self.background,
             &mut self.border,
@@ -316,6 +364,7 @@ impl Theme {
             &mut self.fresh_idle,
             &mut self.idle,
             &mut self.unread,
+            &mut self.transition,
             &mut self.error,
             &mut self.terminal_active,
             &mut self.group,
@@ -332,7 +381,7 @@ impl Theme {
     }
 
     /// Read-only counterpart to `color_fields_mut`.
-    pub fn color_fields(&self) -> [Color; 26] {
+    pub fn color_fields(&self) -> [Color; 27] {
         [
             self.background,
             self.border,
@@ -348,6 +397,7 @@ impl Theme {
             self.fresh_idle,
             self.idle,
             self.unread,
+            self.transition,
             self.error,
             self.terminal_active,
             self.group,

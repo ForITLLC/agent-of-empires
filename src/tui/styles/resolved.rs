@@ -249,9 +249,11 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-text-dim".into(), hex(theme.dimmed));
     css.insert("--color-text-bright".into(), hex(theme.title));
 
-    // Status colors map directly onto the TUI's semantic fields.
-    // starting + stopped don't have TUI equivalents; derive from
-    // waiting + dimmed so they still pulse against the picked theme.
+    // Status colors map directly onto the TUI's semantic fields. One hue,
+    // one meaning (see `Theme::status_color`): starting/creating/deleting
+    // share the `transition` teal so a self-resolving machine state never
+    // borrows the "needs you" amber. `stopped` has no TUI equivalent; derive
+    // from dimmed so it still reads against the picked theme.
     css.insert("--color-status-running".into(), hex(theme.running));
     css.insert("--color-status-waiting".into(), hex(theme.waiting));
     css.insert("--color-status-warning".into(), hex(theme.waiting));
@@ -259,10 +261,10 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-status-idle".into(), hex(theme.idle));
     css.insert("--color-status-unread".into(), hex(theme.unread));
     css.insert("--color-status-error".into(), hex(theme.error));
-    css.insert(
-        "--color-status-starting".into(),
-        hex(mix(theme.waiting, BLACK, 0.1)),
-    );
+    css.insert("--color-status-transition".into(), hex(theme.transition));
+    // `starting` is the web class shared by Starting + Creating; point it at
+    // the transition teal so the web inherits the new semantics for free.
+    css.insert("--color-status-starting".into(), hex(theme.transition));
     css.insert(
         "--color-status-stopped".into(),
         hex(mix(theme.dimmed, BLACK, 0.1)),

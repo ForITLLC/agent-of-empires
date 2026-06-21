@@ -1545,24 +1545,17 @@ impl HomeView {
                                 && !inst.is_archived()
                                 && !inst.is_snoozed()
                                 && matches!(inst.status, Status::Idle | Status::Unknown);
+                            // Dormant (auto-stopped, resumable) wins unless the
+                            // row is unread; unread then overrides the base hue;
+                            // otherwise the shared one-hue-one-meaning map in
+                            // `Theme::status_color` decides, so this list and the
+                            // preview pane can't drift.
                             let color = if is_shown_dormant && !unread_resting {
                                 theme.dormant()
+                            } else if unread_resting {
+                                theme.unread
                             } else {
-                                match inst.status {
-                                    Status::Running => theme.running,
-                                    Status::Waiting => theme.waiting,
-                                    Status::Idle if unread_resting => theme.unread,
-                                    Status::Idle => {
-                                        theme.idle_color_at_age(idle_age, self.idle_decay_window)
-                                    }
-                                    Status::Unknown if unread_resting => theme.unread,
-                                    Status::Unknown => theme.waiting,
-                                    Status::Stopped => theme.dimmed,
-                                    Status::Error => theme.error,
-                                    Status::Starting => theme.dimmed,
-                                    Status::Deleting => theme.waiting,
-                                    Status::Creating => theme.accent,
-                                }
+                                theme.status_color(inst.status, idle_age, self.idle_decay_window)
                             };
                             let mut style = Style::default().fg(color);
                             if unread_resting {
