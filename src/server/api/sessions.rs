@@ -954,14 +954,24 @@ fn workspace_id_for_session(s: &SessionResponse) -> String {
 // disk write.
 // Pure helper: merges newly observed workspace ids on top of the
 // existing ordering, deduplicating and putting unknowns first
-// (newest-first). Extracted so the merge math can run from both the
+// (newest-first), and PRUNES any persisted entry no longer backed by a
+// live session. Extracted so the merge math can run from both the
 // read-only path (no lock) and the locked closure (where it operates
 // on `ord.order` directly to avoid the read-modify-write race that
 // `merge_workspace_ordering` originally had on a pre-lock snapshot).
+//
+// The prune is what keeps the ordering bounded. Without it the list only
+// ever grew: every closed session's workspace id stayed forever, so the
+// ordering inflated to hundreds of dead `::__session__::<id>` keys (the
+// 267-vs-63 gap the manager loop hit). An entry survives only when some
+// current session still derives that same workspace id, so closed
+// sessions fall out on the next GET and the array tracks live sessions.
 fn compute_merged_ordering(sessions: &[SessionResponse], current_order: &[String]) -> Vec<String> {
+    let live: std::collections::HashSet<String> =
+        sessions.iter().map(workspace_id_for_session).collect();
     let known: std::collections::HashSet<&str> = current_order.iter().map(String::as_str).collect();
-    let mut seen_unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut new_ids: Vec<String> = Vec::new();
+    let mut seen_unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in sessions {
         let id = workspace_id_for_session(s);
         if known.contains(id.as_str()) {
@@ -971,11 +981,17 @@ fn compute_merged_ordering(sessions: &[SessionResponse], current_order: &[String
             new_ids.push(id);
         }
     }
+    // Retain existing order, minus entries whose session has gone away.
+    let retained: Vec<String> = current_order
+        .iter()
+        .filter(|e| live.contains(e.as_str()))
+        .cloned()
+        .collect();
     if new_ids.is_empty() {
-        return current_order.to_vec();
+        return retained;
     }
     new_ids.reverse();
-    new_ids.extend_from_slice(current_order);
+    new_ids.extend(retained);
     new_ids
 }
 
@@ -11715,8 +11731,14 @@ mod workspace_ordering_tests {
 
     #[test]
     fn compute_merged_ordering_pure_preserves_existing_order() {
+        // x and y are still live (sessions present), so they survive the
+        // prune and keep their relative order below the freshly-seen z.
         let existing = vec!["/repo/x::main".to_string(), "/repo/y::dev".to_string()];
-        let sessions = vec![mock_response("s1", "/repo/z", Some("feat"))];
+        let sessions = vec![
+            mock_response("s1", "/repo/z", Some("feat")),
+            mock_response("s2", "/repo/x", Some("main")),
+            mock_response("s3", "/repo/y", Some("dev")),
+        ];
         let merged = compute_merged_ordering(&sessions, &existing);
         assert_eq!(
             merged,
@@ -11737,6 +11759,34 @@ mod workspace_ordering_tests {
         ];
         let merged = compute_merged_ordering(&sessions, &existing);
         assert_eq!(merged, existing);
+    }
+
+    #[test]
+    fn compute_merged_ordering_pure_prunes_dead_entries() {
+        // `dead` has no backing session and must drop out; `keep` is still
+        // live and stays. This is the bound that stops the ordering from
+        // accumulating closed-session keys forever.
+        let existing = vec![
+            "/repo/keep::main".to_string(),
+            "/repo/dead::__session__::gone".to_string(),
+        ];
+        let sessions = vec![mock_response("s1", "/repo/keep", Some("main"))];
+        let merged = compute_merged_ordering(&sessions, &existing);
+        assert_eq!(merged, vec!["/repo/keep::main".to_string()]);
+    }
+
+    #[test]
+    fn compute_merged_ordering_pure_prunes_even_with_no_new_ids() {
+        // The new-ids-empty fast path must STILL prune. The pre-fix bug
+        // returned current_order verbatim here, which is exactly how dead
+        // entries survived indefinitely.
+        let existing = vec![
+            "/repo/a::main".to_string(),
+            "/repo/b::__session__::closed".to_string(),
+        ];
+        let sessions = vec![mock_response("s1", "/repo/a", Some("main"))];
+        let merged = compute_merged_ordering(&sessions, &existing);
+        assert_eq!(merged, vec!["/repo/a::main".to_string()]);
     }
 }
 
