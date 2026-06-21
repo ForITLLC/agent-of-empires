@@ -354,6 +354,13 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     };
     let dir = base.join("profiles").join(profile_name);
     if !dir.exists() {
+        // Root-cause guard for stray profiles: only validate when about to
+        // CREATE. Any subcommand that takes `-p`/`--profile` (even read-only
+        // `list`/`status`) lands here via `Storage::new`, so an unvalidated
+        // junk name would auto-vivify a directory. Reads of an
+        // already-existing dir skip this, keeping older malformed profiles
+        // listable and deletable.
+        validate_new_profile_name(profile_name)?;
         fs::create_dir_all(&dir)?;
     }
     Ok(dir)
@@ -635,8 +642,40 @@ fn validate_profile_name(name: &str) -> Result<()> {
     }
 }
 
-pub fn create_profile(name: &str) -> Result<()> {
+/// Stricter gate applied only when a profile directory is about to be CREATED.
+///
+/// `validate_profile_name` (shared by create/delete/rename) only guards path
+/// traversal, so a name like `forit-main 1a2b3c4d Some Title` is a single
+/// `Normal` component and passes it; `get_profile_dir` would then
+/// `create_dir_all` that junk directory. That is exactly how stray profiles
+/// were born (2026-06-18): any string handed to `-p`/`--profile` on a
+/// read-only subcommand (`aoe list -p "<pasted fleet display line>"`) flowed
+/// through `Storage::new` -> `get_profile_dir` and auto-vivified a profile dir
+/// whose name was a space-joined `<profile> <id> <title>`.
+///
+/// Creation is therefore held to a tighter charset (`[A-Za-z0-9._-]`, max 64)
+/// than deletion. Deletion must STAY permissive so malformed strays minted by
+/// older binaries can still be removed via the CLI; creation must never mint a
+/// new one.
+fn validate_new_profile_name(name: &str) -> Result<()> {
     validate_profile_name(name)?;
+    if name.len() > 64 {
+        anyhow::bail!("Profile name is too long ({} chars; max 64)", name.len());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        anyhow::bail!(
+            "Profile name '{}' has disallowed characters (allowed: A-Z a-z 0-9 . _ -)",
+            name
+        );
+    }
+    Ok(())
+}
+
+pub fn create_profile(name: &str) -> Result<()> {
+    validate_new_profile_name(name)?;
 
     let profiles = list_profiles()?;
     if profiles.contains(&name.to_string()) {
@@ -1504,6 +1543,99 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("expected {bad:?} to be rejected"));
         }
+    }
+
+    #[test]
+    fn test_validate_new_profile_name_accepts_every_real_profile() {
+        // The canonical live profile set must all pass the strict create gate.
+        for name in [
+            "aoe-commander",
+            "aoe-fiw",
+            "aoe-wmw",
+            "default",
+            "forit-backup",
+            "forit-main",
+            "forit-work",
+            "gna-main",
+            "pivot-main",
+            "wma-work",
+            "personal-main",
+            "main",
+            ".hidden",
+            "client-a",
+            "1",
+        ] {
+            validate_new_profile_name(name)
+                .unwrap_or_else(|e| panic!("expected {name:?} to pass create gate: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_validate_new_profile_name_rejects_stray_shapes() {
+        // The exact stray shape (`<profile> <16hex> <title>`, space-joined)
+        // plus other junk must be rejected by the create gate.
+        for bad in [
+            "forit-main a83bcfb5d2e14f60 for-Christine Loop",
+            "ZZTEST spaced name",
+            "has space",
+            "tab\tname",
+            "emoji\u{1f600}",
+            "all",
+            "..",
+            "a/b",
+        ] {
+            validate_new_profile_name(bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected create gate to reject {bad:?}"));
+        }
+        // 65 chars exceeds the length cap.
+        let too_long = "a".repeat(65);
+        validate_new_profile_name(&too_long).expect_err("65-char name must be rejected");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_get_profile_dir_refuses_to_vivify_stray() {
+        // ROOT-CAUSE regression: a stray-shaped name passed to get_profile_dir
+        // (the path `aoe list -p "<junk>"` -> Storage::new -> get_profile_dir
+        // travels) must error and must NOT create a directory under profiles/.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("forit-main")).unwrap();
+
+        let stray = "forit-main a83bcfb5d2e14f60 for-Christine Loop";
+        let err = get_profile_dir(stray).expect_err("stray name must be refused");
+        assert!(
+            err.to_string().contains("disallowed characters")
+                || err.to_string().contains("path separators"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.join("profiles").join(stray).exists(),
+            "stray profile dir must NOT have been created"
+        );
+        // A valid name on the same path still vivifies normally.
+        let good = get_profile_dir("forit-work").expect("valid name must create dir");
+        assert!(good.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_delete_profile_still_removes_preexisting_stray() {
+        // Deletion stays PERMISSIVE: a malformed stray minted by an older
+        // binary (spaces in the name) must remain removable via the CLI path,
+        // even though creation now rejects that same shape.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        let stray = "forit-main a83bcfb5d2e14f60 for-Christine Loop";
+        fs::create_dir_all(dir.join("profiles").join(stray)).unwrap();
+        fs::create_dir_all(dir.join("profiles").join("forit-main")).unwrap();
+
+        delete_profile(stray).expect("a pre-existing spaced stray must be deletable");
+        assert!(!dir.join("profiles").join(stray).exists());
+        assert!(dir.join("profiles").join("forit-main").exists());
     }
 
     #[test]
