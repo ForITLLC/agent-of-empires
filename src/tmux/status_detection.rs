@@ -210,6 +210,14 @@ fn claude_blocking_prompt_rule(
     if claude_has_ask_user_question(recent) {
         return Some("ask_user_question");
     }
+    // The resume-from-summary picker is also a blocking input-wait and must
+    // outrank the spinner. On the pane-fallback path it would otherwise read
+    // Idle (no question, no interrupt hint), and on the primary hook path the
+    // recycled pane's stale `running` write keeps reporting Running until the
+    // selection is made. Surface it as Waiting either way.
+    if claude_has_resume_picker(recent) {
+        return Some("resume_picker");
+    }
     None
 }
 
@@ -814,9 +822,43 @@ fn claude_pane_shows_ready_prompt(
         && !claude_pane_has_running_signal(recent, recent_joined, recent_lower)
 }
 
-/// When Claude's status hook reports Running, the pane is consulted to catch two
-/// cases the hook stream can't express on its own:
+/// Claude Code shows a blocking "resume" picker when an interactive
+/// `--resume <id>` lands on a COMPACTED session: a one-line preamble ("We
+/// recommend resuming from a summary.") over a numbered menu whose options are
+/// "1. Resume from summary (recommended)" and "2. Resume full session as-is".
+/// Like the approval prompt it is a blocking input-wait, but it carries no
+/// "do you want to" question, no spinner, and no "esc to interrupt", so the
+/// spinner/interrupt detectors would call it Idle while the stale `running`
+/// hook status (the session was Running when its pane got recycled by the
+/// daemon's startup recovery) keeps the daemon reporting Running. Match the
+/// structural signature: a numbered-choice line whose text is one of the resume
+/// options. Requiring the numbered-choice shape, not a bare substring, keeps a
+/// pane that merely quotes the picker in prose (a chat message describing it,
+/// a commit diff) from being mistaken for the live menu.
+fn claude_has_resume_picker(recent: &[&str]) -> bool {
+    recent.iter().any(|line| {
+        if !claude_line_is_numbered_choice(line) {
+            return false;
+        }
+        let line_lower = line.to_lowercase();
+        line_lower.contains("resume from summary") || line_lower.contains("resume full session")
+    })
+}
+
+/// Strip ANSI and scan the recent pane lines for the resume picker. Shares the
+/// recent-window shape with `detect_claude_status`; mirrors
+/// `claude_pane_has_approval_prompt` for callers holding raw `capture-pane -e`.
+fn claude_pane_has_resume_picker(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
+    claude_has_resume_picker(&recent)
+}
+
+/// When Claude's status hook reports Running, the pane is consulted to catch
+/// four cases the hook stream can't express on its own:
 ///
+<<<<<<< HEAD
 /// 1. A blocking prompt the user must answer: a tool-permission approval prompt
 ///    or an `AskUserQuestion` selection UI. Claude keeps its live spinner
 ///    rendered below the prompt and re-emits running-mapped hook events
@@ -824,10 +866,23 @@ fn claude_pane_shows_ready_prompt(
 ///    stays `running` even though the agent is blocked on the user. Downgrade to
 ///    Waiting. See #1913 (permission prompt) and `claude_has_ask_user_question`.
 /// 2. An Esc-interrupted turn: cancelling a turn fires no `Stop` and no
+=======
+/// 1. A blocking approval prompt: Claude keeps its live spinner rendered below
+///    the prompt and re-emits running-mapped hook events (`PreToolUse`,
+///    `UserPromptSubmit`) while it waits, so the last hook write stays
+///    `running` even though the agent is blocked on the user. Downgrade to
+///    Waiting. See #1913.
+/// 2. The resume-from-summary picker the daemon's startup recovery triggers
+///    when it respawns a compacted session with `--resume`: a blocking
+///    input-wait whose recycled pane never relaunched Claude, so no newer hook
+///    fired and the daemon masks a frozen session as Running. Downgrade to
+///    Waiting.
+/// 3. An Esc-interrupted turn: cancelling a turn fires no `Stop` and no
+>>>>>>> 71df8456 (fix(status): classify resume-picker pane as Waiting, not Running)
 ///    `idle_prompt`, so the status file sticks on `running` indefinitely.
 ///    Downgrade to Idle when the pane shows the interrupt banner and no
 ///    active-turn signal.
-/// 3. A completed turn whose idle hook never fired (the "silent tool stop":
+/// 4. A completed turn whose idle hook never fired (the "silent tool stop":
 ///    a tool result with no following text fires neither `Stop` nor
 ///    `idle_prompt`). The pane parks at the idle ready prompt with no
 ///    active-turn signal, but that is also how a just-started turn looks
@@ -850,6 +905,7 @@ pub(crate) fn reconcile_claude_hook_status(
     if hook_status != Status::Running {
         return hook_status;
     }
+<<<<<<< HEAD
     with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
         if let Some(rule) = claude_blocking_prompt_rule(recent, recent_joined, recent_lower) {
             tracing::debug!(target: "tmux.status",
@@ -898,6 +954,9 @@ pub(crate) fn reconcile_claude_hook_status(
 /// adds no new false-positive surface, only the un-stick.
 pub(crate) fn reconcile_waiting_hook(agent: &str, raw_content: &str) -> Status {
     if raw_content.trim().is_empty() {
+=======
+    if claude_pane_has_approval_prompt(raw_content) || claude_pane_has_resume_picker(raw_content) {
+>>>>>>> 71df8456 (fix(status): classify resume-picker pane as Waiting, not Running)
         return Status::Waiting;
     }
     match detect_status_from_content(raw_content, agent) {
@@ -2857,6 +2916,51 @@ enter to select · esc to cancel";
         let pane = "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt";
         assert_eq!(
             reconcile_claude_hook_status(Status::Running, pane, None),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_resume_picker() {
+        // The interactive resume-from-summary picker is a blocking input-wait.
+        // It has no "do you want to" question, no spinner, no "esc to
+        // interrupt", so the pre-fix detector returned Idle; it must now read
+        // Waiting. ANSI preserved to exercise the strip path live capture hits.
+        let pane = "\x1b[2m  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.\x1b[0m\n\
+\x1b[36m  ❯ 1. Resume from summary (recommended)\x1b[0m\n    2. Resume full session as-is";
+        assert_eq!(detect_claude_status(pane), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_on_resume_picker() {
+        // The daemon's startup recovery respawned a compacted session with
+        // `--resume`; the pane froze at the picker before Claude relaunched, so
+        // the last hook write is the stale `running` from before the recycle.
+        // The reconciler must downgrade Running -> Waiting so the health view
+        // stops masking the frozen session as actively working.
+        let pane = "  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.\n\
+  ❯ 1. Resume from summary (recommended)\n    2. Resume full session as-is";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_resume_picker_not_confused_by_prose_quote() {
+        // A pane that merely *quotes* the picker text in prose (a fleet chat
+        // message describing the stall, a commit diff) has no numbered-choice
+        // line, so it must NOT be mistaken for the live menu. The spinner still
+        // wins; a bare hook Running is left untouched.
+        let prose = "\
+  Routed to per-dev: classify resume-picker stalls as a distinct status
+  instead of \"Running\" (the daemon reports \"Resume from summary\" panes as
+  Running). 2 of 4 sampled sessions were stalled at resume-pickers.
+✶ Working… (4s · ↓ 88 tokens)
+  esc to interrupt";
+        assert_eq!(detect_claude_status(prose), Status::Running);
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, prose),
             Status::Running
         );
     }
