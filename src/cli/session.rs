@@ -1927,7 +1927,18 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         let rekey_old_title = persisted_old_title.clone();
         let rekey_new_title = committed_title.clone();
         match tokio::task::spawn_blocking(move || {
-            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
+            let rekeyed =
+                crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)?;
+            if rekeyed {
+                // Pin the window name + pane title to the new title (and disable
+                // automatic/allow-rename) so the surfaces the operator sees track
+                // the rename instead of the agent's OSC-derived conversation
+                // summary, which otherwise reasserts the stale title.
+                let new_name = crate::tmux::Session::generate_name(&rekey_id, &rekey_new_title);
+                crate::tmux::Session::from_name(&new_name).pin_window_title(&rekey_new_title);
+                crate::tmux::refresh_session_cache();
+            }
+            Ok::<_, anyhow::Error>(rekeyed)
         })
         .await
         {

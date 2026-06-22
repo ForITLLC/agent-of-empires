@@ -632,6 +632,39 @@ impl Session {
         Ok(())
     }
 
+    /// Pin the window name and active pane title to `title`, and disable
+    /// `automatic-rename` + `allow-rename` so the agent's OSC title escape can
+    /// no longer overwrite them.
+    ///
+    /// `rename` updates the tmux SESSION name, but the window name and pane
+    /// title are auto-derived by the running agent from its conversation
+    /// summary (set via OSC 0/2). So after an operator renames a session, those
+    /// surfaces keep showing the stale auto-summary, drifting from the new
+    /// title (a recurring false-done signal). Turning `automatic-rename` off
+    /// stops tmux deriving the window name from the running command; turning
+    /// `allow-rename` off stops the agent's escape sequence from re-asserting
+    /// it, so the pin survives the next OSC title the agent emits.
+    ///
+    /// Best-effort: the rename has already landed, so a missing window or a
+    /// tmux error here must not fail the rename. Targets the session's single
+    /// active window/pane by name, which is unambiguous for aoe sessions.
+    pub fn pin_window_title(&self, title: &str) {
+        if !self.exists() {
+            return;
+        }
+        for (opt, val) in [("automatic-rename", "off"), ("allow-rename", "off")] {
+            let _ = Command::new("tmux")
+                .args(["set-option", "-w", "-t", &self.name, opt, val])
+                .output();
+        }
+        let _ = Command::new("tmux")
+            .args(["rename-window", "-t", &self.name, title])
+            .output();
+        let _ = Command::new("tmux")
+            .args(["select-pane", "-t", &self.name, "-T", title])
+            .output();
+    }
+
     pub fn attach(&self) -> Result<()> {
         if !self.exists() {
             bail!("Session does not exist: {}", self.name);
