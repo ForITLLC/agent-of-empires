@@ -1768,6 +1768,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             patch(api::update_session_diff_base),
         )
         .route(
+            "/api/sessions/{id}/goal",
+            get(api::get_session_goal).patch(api::set_session_goal),
+        )
+        .route(
             "/api/sessions/{id}/worktree-name",
             patch(api::set_worktree_name),
         )

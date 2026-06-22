@@ -1041,6 +1041,16 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
 
+    /// Free-text per-session goal or objective, set via `PATCH
+    /// /api/sessions/{id}/goal` and read back via `GET`. Surfaced on the
+    /// session list so a manager can see what each worker is meant to be
+    /// doing at a glance. Persisted alongside the session record; `None`
+    /// when unset. Distinct from `title` (a short label) and `status`
+    /// (lifecycle state): the goal is the human readable objective the
+    /// worker is accountable for. See per-dev WO #70.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+
     /// How this session is rendered: `Structured` (ACP native rendering) or
     /// `Terminal` (raw tmux pane). When `Structured`, aoe spawns an ACP agent
     /// subprocess and renders structured events natively; tmux integration is
@@ -1640,6 +1650,7 @@ impl Instance {
             idempotency_key: None,
             base_branch_override: None,
             color: None,
+            goal: None,
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
@@ -2172,6 +2183,9 @@ impl Instance {
         }
         if pre.color != post.color {
             self.color = post.color.clone();
+        }
+        if pre.goal != post.goal {
+            self.goal = post.goal.clone();
         }
         // Worktree workdir edit (move dir / rename branch) mutates these two;
         // both the TUI and the CLI can write them, so they go through the

@@ -62,6 +62,12 @@ pub struct SessionResponse {
     /// default, and auto-detection. See #970.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
+    /// Free-text per-session goal, set via `PATCH /api/sessions/{id}/goal`
+    /// and read via `GET /api/sessions/{id}/goal`. Omitted when unset. Lets
+    /// the web sidebar and MCP callers read a worker's objective off the
+    /// session list without a second round trip. See per-dev WO #70.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
     pub is_sandboxed: bool,
     /// True when the session was created with `--scratch`; the
     /// `project_path` points at an auto-provisioned directory under
@@ -400,6 +406,7 @@ impl SessionResponse {
                 .as_ref()
                 .and_then(|w| w.base_branch.clone()),
             base_branch_override: inst.base_branch_override.clone(),
+            goal: inst.goal.clone(),
             is_sandboxed: inst.is_sandboxed(),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
@@ -2663,6 +2670,119 @@ pub async fn update_session_diff_base(
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+// --- Per-session goal ---
+//
+// `GET /api/sessions/{id}/goal` reads the free-text objective for a session;
+// `PATCH /api/sessions/{id}/goal` sets or clears it. The goal persists on the
+// session record (survives restart) and also surfaces on the `/api/sessions`
+// list via `SessionResponse.goal`, so a manager or the Commander MCP layer can
+// see and steer what each worker is meant to be doing. See per-dev WO #70.
+
+#[derive(Deserialize)]
+pub struct UpdateGoalBody {
+    /// New goal. `Some(non-empty)` sets it; `Some("")` or `None` clears it.
+    #[serde(default)]
+    pub goal: Option<String>,
+}
+
+pub async fn get_session_goal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let instances = state.instances.read().await;
+    let Some(inst) = instances.iter().find(|i| i.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Session not found" })),
+        )
+            .into_response();
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "id": inst.id, "goal": inst.goal })),
+    )
+        .into_response()
+}
+
+pub async fn set_session_goal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateGoalBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        inst.source_profile.clone()
+    };
+
+    let new_goal = body
+        .goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+
+    // Persist first; only mutate memory once disk is durable. See #1589.
+    let persist_id = id.clone();
+    let persist_goal = new_goal.clone();
+    if persist_session_update(
+        profile,
+        "goal update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.goal = persist_goal;
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::error!(
+            target: "http.api.sessions",
+            session = %id,
+            "goal update: instance vanished after persist"
+        );
+        return persist_failed_response();
+    };
+    inst.goal = new_goal;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "id": inst.id, "goal": inst.goal })),
+    )
+        .into_response()
 }
 
 // --- Triage: pin / archive / snooze ---
@@ -11519,6 +11639,7 @@ mod workspace_ordering_tests {
             main_repo_path: None,
             base_branch: None,
             base_branch_override: None,
+            goal: None,
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,
