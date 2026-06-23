@@ -484,6 +484,14 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
         }
     })?;
     if landed {
+        crate::session::audit::record(
+            crate::session::audit::Event::Archive,
+            "session-archive",
+            &inst,
+            storage.profile(),
+            false,
+            false,
+        );
         println!("Archived: {}", title);
         Ok(())
     } else {
@@ -496,13 +504,21 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
 
 async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
-    let title = storage.update(|instances, _groups| {
+    let inst = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unarchive();
-            Ok(inst.title.clone())
+            Ok(inst.clone())
         })
     })?;
-    println!("Unarchived: {}", title);
+    crate::session::audit::record(
+        crate::session::audit::Event::Unarchive,
+        "session-unarchive",
+        &inst,
+        storage.profile(),
+        false,
+        false,
+    );
+    println!("Unarchived: {}", inst.title);
     Ok(())
 }
 

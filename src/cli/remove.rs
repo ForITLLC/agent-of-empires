@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::Args;
 
-use crate::session::{Instance, LifecycleOperation, Storage};
+use crate::session::{audit, Instance, LifecycleOperation, Storage};
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -197,6 +197,17 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             }
         }
 
+        // Record + worktree preserved on the trash path (restorable), so this
+        // audits as the non-destructive removal event.
+        audit::record(
+            audit::Event::Archive,
+            "cli-remove",
+            &inst,
+            storage.profile(),
+            false,
+            false,
+        );
+
         println!(
             "  Moved session to trash: {} (from profile '{}')",
             removed_title,
@@ -320,6 +331,22 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 "recording recent project after remove failed: {e}");
         }
     }
+
+    // The record is durably gone. If the worktree went too this was the
+    // destructive path; otherwise a record-only drop.
+    let event = if delete_worktree {
+        audit::Event::HardDelete
+    } else {
+        audit::Event::Remove
+    };
+    audit::record(
+        event,
+        "cli-remove-hard",
+        &inst,
+        &storage_profile,
+        delete_worktree,
+        delete_branch,
+    );
 
     println!(
         "  Removed session: {} (from profile '{}')",

@@ -24,6 +24,7 @@ use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
 use super::ps::PsArgs;
 use super::remove::RemoveArgs;
+use super::restore::RestoreArgs;
 use super::send::SendArgs;
 #[cfg(feature = "serve")]
 use super::serve::ServeArgs;
@@ -101,6 +102,10 @@ pub enum Commands {
     /// Remove a session
     #[command(alias = "rm")]
     Remove(RemoveArgs),
+
+    /// Restore (unarchive) an archived session
+    #[command(alias = "unarchive")]
+    Restore(RestoreArgs),
 
     /// Send a message to a running agent session
     Send(SendArgs),
@@ -267,6 +272,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "logs",
     "log_level",
     "remove",
+    "restore",
     "send",
     "status",
     "killall",
@@ -313,6 +319,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         #[cfg(feature = "serve")]
         Commands::LogLevel(_) => "log_level",
         Commands::Remove(_) => "remove",
+        Commands::Restore(_) => "restore",
         Commands::Send(_) => "send",
         Commands::Status(_) => "status",
         Commands::Killall(_) => "killall",

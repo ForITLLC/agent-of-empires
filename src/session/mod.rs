@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod attach_project;
+pub mod audit;
 pub mod builder;
 pub(crate) mod capture;
 pub mod cityhall_bundle;

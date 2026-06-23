@@ -4744,6 +4744,11 @@ pub async fn delete_session(
     // the persisted recent-projects store only once the delete fully
     // succeeds, so the project survives in the wizard Recent tab (#2141).
     let recent_entry = crate::session::recent_project_entry_for(&instance);
+    // Snapshot for the post-delete audit line: `instance` moves into the
+    // teardown task below, and the audit is emitted only after the durable
+    // store removal succeeds (the dashboard delete is one of the vanish
+    // vectors the CLI archive-preferred change can't reach).
+    let audit_inst = instance.clone();
 
     // Run the whole teardown + bookkeeping in a detached task. The
     // git / docker / tmux teardown below is irreversible once it starts, but
@@ -4767,15 +4772,40 @@ pub async fn delete_session(
         }
 
         match purge_session_artifacts(&state, &id, instance, &body, recent_entry).await {
-            Ok((removed, messages)) => (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    // A concurrent restore can keep the row (removed=false); do
-                    // not claim it was deleted in that case.
-                    "status": if removed { "deleted" } else { "kept" },
-                    "messages": messages,
-                })),
-            ),
+            Ok((removed, messages)) => {
+                // Audit the destruction (Commander WO #126). The dashboard
+                // delete is one of the vanish vectors the CLI archive-preferred
+                // change can't reach, so record it here on the web-delete path.
+                // Kept-vs-deleted is read back off the deletion messages:
+                // `perform_deletion` emits "Worktree removed" / "Branch '<n>'"
+                // lines (the request flags don't ride the returned messages).
+                let audit_worktree_deleted = messages
+                    .iter()
+                    .any(|m| m.to_lowercase().contains("worktree removed"));
+                let audit_branch_deleted = messages.iter().any(|m| m.starts_with("Branch '"));
+                let event = if audit_worktree_deleted {
+                    crate::session::audit::Event::HardDelete
+                } else {
+                    crate::session::audit::Event::Remove
+                };
+                crate::session::audit::record(
+                    event,
+                    "web-delete",
+                    &audit_inst,
+                    &audit_inst.source_profile,
+                    audit_worktree_deleted,
+                    audit_branch_deleted,
+                );
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        // A concurrent restore can keep the row (removed=false);
+                        // do not claim it was deleted in that case.
+                        "status": if removed { "deleted" } else { "kept" },
+                        "messages": messages,
+                    })),
+                )
+            }
             Err(msg) => {
                 mark_delete_error(&state, &id, msg.clone()).await;
                 tracing::error!(target: "http.api.sessions", "delete failed: {msg}");

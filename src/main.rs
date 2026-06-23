@@ -456,6 +456,7 @@ async fn run(
         Some(Commands::List(args)) => cli::list::run(&profile, args).await,
         Some(Commands::Ps(args)) => cli::ps::run(&profile, profile_explicit, args).await,
         Some(Commands::Remove(args)) => cli::remove::run(&profile, args).await,
+        Some(Commands::Restore(args)) => cli::restore::run(&profile, args).await,
         Some(Commands::Send(args)) => cli::send::run(&profile, args).await,
         Some(Commands::Status(args)) => cli::status::run(&profile, args).await,
         Some(Commands::Killall(args)) => cli::killall::run(args).await,

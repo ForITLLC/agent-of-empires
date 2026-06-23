@@ -3376,11 +3376,44 @@ impl HomeView {
         use crate::session::Status;
         use std::sync::mpsc::TryRecvError;
 
+        // Audit trail for the interactive (TUI) destructive delete, the
+        // vanish vector the CLI archive-preferred change can't cover.
+        // Recorded only after the durable save/purge, so the audit line
+        // never claims a removal the store didn't actually commit.
+        // kept-vs-deleted is read back off the deletion result's messages
+        // (the request flags don't ride the result).
+        fn record_tui_delete_audit(inst: &crate::session::Instance, messages: &[String]) {
+            let lower: Vec<String> = messages.iter().map(|m| m.to_lowercase()).collect();
+            let worktree_deleted = lower.iter().any(|m| m.contains("worktree removed"));
+            let branch_deleted = messages.iter().any(|m| m.starts_with("Branch '"));
+            let event = if worktree_deleted {
+                crate::session::audit::Event::HardDelete
+            } else {
+                crate::session::audit::Event::Remove
+            };
+            crate::session::audit::record(
+                event,
+                "tui-delete",
+                inst,
+                &inst.effective_profile(),
+                worktree_deleted,
+                branch_deleted,
+            );
+        }
+
         match self.deletion_poller.try_recv_result() {
             Ok(result) => {
                 match result.disposition {
                     DeletionDisposition::Removed | DeletionDisposition::AlreadyGone => {
-                        self.instances.shift_remove(&result.session_id);
+                        // Audit only a removal this process committed;
+                        // AlreadyGone means a peer removed it and owns the
+                        // audit line for it.
+                        let doomed = self.instances.shift_remove(&result.session_id);
+                        if result.disposition == DeletionDisposition::Removed {
+                            if let Some(inst) = &doomed {
+                                record_tui_delete_audit(inst, &result.messages);
+                            }
+                        }
                         self.rebuild_group_trees();
                         self.rebuild_flat_items();
                     }
