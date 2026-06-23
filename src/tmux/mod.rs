@@ -239,6 +239,18 @@ pub const TOOL_PREFIX: &str = if cfg!(debug_assertions) {
 #[derive(Debug, Clone)]
 pub struct PaneMetadata {
     pub pane_dead: bool,
+    /// Exit status of a dead pane (`#{pane_dead_status}`), valid only when the
+    /// pane is dead AND `remain-on-exit` is on (both aoe panes set it). `None`
+    /// when the pane is alive or tmux did not report a status. tmux populates
+    /// this ONLY for a normally-exited (`WIFEXITED`) pane; a signal-killed pane
+    /// reports an empty status and carries its cause in `pane_dead_signal`
+    /// instead. Lets the daemon audit a pane crash with its real exit code.
+    pub pane_dead_status: Option<i32>,
+    /// Signal number that killed a dead pane (`#{pane_dead_signal}`), set only
+    /// for a `WIFSIGNALED` death (crash/OOM/`kill`) where `pane_dead_status` is
+    /// empty. `None` for a live or normally-exited pane. The daemon surfaces a
+    /// signal death as the POSIX `128 + signal` exit code (SIGKILL → 137).
+    pub pane_dead_signal: Option<i32>,
     pub pane_current_command: Option<String>,
     pub pane_start_command_is_protected: bool,
 }
@@ -776,7 +788,7 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
+            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_current_command}|#{pane_start_command}",
         ])
         .output();
 
@@ -871,20 +883,59 @@ pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
     }
 }
 
+/// Map a tmux `#{pane_dead_signal}` value to its signal number. tmux builds
+/// differ: some emit the number ("9"), this `next-3.7` build emits the
+/// lowercase name ("kill"). Accept either; normalise an optional `SIG` prefix
+/// and case. Returns `None` for an empty or unrecognised value so a pane-exit
+/// audit still fires (just without an exit code) rather than being dropped.
+/// Only the platform-stable fatal signals are mapped — the ones a pane death
+/// realistically carries on macOS/Linux.
+fn signal_name_to_num(s: &str) -> Option<i32> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(n) = s.parse::<i32>() {
+        return Some(n);
+    }
+    let name = s.to_ascii_lowercase();
+    let name = name.strip_prefix("sig").unwrap_or(&name);
+    let num = match name {
+        "hup" => 1,
+        "int" => 2,
+        "quit" => 3,
+        "ill" => 4,
+        "trap" => 5,
+        "abrt" => 6,
+        "fpe" => 8,
+        "kill" => 9,
+        "segv" => 11,
+        "pipe" => 13,
+        "alrm" => 14,
+        "term" => 15,
+        _ => return None,
+    };
+    Some(num)
+}
+
 /// Parse the output of `tmux list-panes -a` into a map of session name to pane metadata.
 /// Filters to aoe sessions, pane index 0, and takes only the first window per session.
 fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     let mut map = HashMap::new();
 
     for line in output.lines() {
-        let mut parts = line.splitn(5, FIELD_SEP);
+        let mut parts = line.splitn(7, FIELD_SEP);
         let (
             Some(session_name),
             Some(pane_index),
             Some(pane_dead),
+            Some(pane_dead_status),
+            Some(pane_dead_signal),
             Some(pane_current_command),
             Some(pane_start_command),
         ) = (
+            parts.next(),
+            parts.next(),
             parts.next(),
             parts.next(),
             parts.next(),
@@ -913,6 +964,28 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
             session_name.to_string(),
             PaneMetadata {
                 pane_dead: pane_dead == "1",
+                // `#{pane_dead_status}` is empty for a live pane and the exit
+                // code for a dead one (with remain-on-exit). Parse leniently;
+                // a non-numeric/empty value just means "unknown" (None).
+                pane_dead_status: {
+                    let s = pane_dead_status.trim();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        s.parse::<i32>().ok()
+                    }
+                },
+                // `#{pane_dead_signal}` is set only for a signal-killed pane
+                // (empty otherwise). tmux builds vary on rendering — a number
+                // or a name ("kill") — so `signal_name_to_num` accepts either.
+                pane_dead_signal: {
+                    let s = pane_dead_signal.trim();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        signal_name_to_num(s)
+                    }
+                },
                 pane_current_command: if pane_current_command.is_empty() {
                     None
                 } else {
@@ -1773,11 +1846,20 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_basic() {
+<<<<<<< HEAD
         let output = format!("{P}my_proj_abc12345|0|0|claude|claude\n");
+=======
+        // 6-field format:
+        // name|index|pane_dead|pane_dead_status|pane_dead_signal|command.
+        // A live pane reports an empty pane_dead_status AND pane_dead_signal.
+        let output = format!("{P}my_proj_abc12345|0|0|||claude\n");
+>>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
         assert!(!meta.pane_dead);
+        assert!(meta.pane_dead_status.is_none());
+        assert!(meta.pane_dead_signal.is_none());
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
         assert!(!meta.pane_start_command_is_protected);
     }
@@ -1809,17 +1891,54 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_dead_pane() {
+<<<<<<< HEAD
         let output = format!("{P}proj_abc12345|0|1|bash|bash\n");
+=======
+        // A normally-exited dead pane carries its exit status in
+        // pane_dead_status and no signal.
+        let output = format!("{P}proj_abc12345|0|1|137||bash\n");
+>>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_dead);
+        assert_eq!(meta.pane_dead_status, Some(137));
+        assert!(meta.pane_dead_signal.is_none());
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_signal_killed_pane() {
+        // A SIGKILL'd pane (empirically tmux next-3.7) reports an EMPTY
+        // pane_dead_status and the signal NAME in pane_dead_signal. The signal
+        // must parse to its number (kill = 9); the daemon then surfaces it as
+        // the POSIX 128+9 = 137 exit code.
+        let output = format!("{P}proj_abc12345|0|1||kill|sleep\n");
+        let map = parse_pane_metadata(&output);
+        let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
+        assert!(meta.pane_dead);
+        assert!(meta.pane_dead_status.is_none());
+        assert_eq!(meta.pane_dead_signal, Some(9));
+    }
+
+    #[test]
+    fn test_signal_name_to_num_accepts_name_number_and_rejects_unknown() {
+        assert_eq!(signal_name_to_num("kill"), Some(9));
+        assert_eq!(signal_name_to_num("SIGTERM"), Some(15)); // SIG prefix + case
+        assert_eq!(signal_name_to_num("9"), Some(9)); // numeric build
+        assert_eq!(signal_name_to_num("segv"), Some(11));
+        assert_eq!(signal_name_to_num(""), None);
+        assert_eq!(signal_name_to_num("bogus"), None);
     }
 
     #[test]
     fn test_parse_pane_metadata_filters_non_aoe_sessions() {
+<<<<<<< HEAD
         let output = format!(
             "user_session|0|0|bash|bash\n{P}proj_abc12345|0|0|claude|claude\nmy_tmux|0|0|vim|vim\n"
         );
+=======
+        let output =
+            format!("user_session|0|0|||bash\n{P}proj_abc12345|0|0|||claude\nmy_tmux|0|0|||vim\n");
+>>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         assert!(map.contains_key(&format!("{P}proj_abc12345")));
@@ -1827,8 +1946,12 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_filters_non_zero_panes() {
+<<<<<<< HEAD
         let output =
             format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|1|0|bash|bash\n");
+=======
+        let output = format!("{P}proj_abc12345|0|0|||claude\n{P}proj_abc12345|1|0|||bash\n");
+>>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -1838,12 +1961,17 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_first_window_wins() {
         // Two windows both have pane 0, first window's data should be kept
+<<<<<<< HEAD
         let output =
             format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|0|1|bash|bash\n");
+=======
+        let output = format!("{P}proj_abc12345|0|0|||claude\n{P}proj_abc12345|0|1|0||bash\n");
+>>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(!meta.pane_dead);
+        assert!(meta.pane_dead_status.is_none());
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
     }
 
@@ -1854,14 +1982,24 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_malformed_lines() {
+<<<<<<< HEAD
         let output = format!("too|few|fields\n{P}proj_abc12345|0|0|claude|claude\n\n");
+=======
+        // "too|few|fields" has 3 fields (< 6) and is dropped; the valid line
+        // carries the full 6.
+        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|||claude\n\n");
+>>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn test_parse_pane_metadata_empty_command() {
+<<<<<<< HEAD
         let output = format!("{P}proj_abc12345|0|0||sh\n");
+=======
+        let output = format!("{P}proj_abc12345|0|0|||\n");
+>>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_current_command.is_none());
@@ -1870,7 +2008,11 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_multiple_sessions() {
         let output = format!(
+<<<<<<< HEAD
             "{P}proj_a_abc12345|0|0|claude|claude\n{P}proj_b_def67890|0|0|opencode|opencode\n{P}proj_c_ghi11111|0|1|bash|bash\n"
+=======
+            "{P}proj_a_abc12345|0|0|||claude\n{P}proj_b_def67890|0|0|||opencode\n{P}proj_c_ghi11111|0|1|143||bash\n"
+>>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 3);
@@ -1888,7 +2030,9 @@ mod tests {
                 .as_deref(),
             Some("opencode")
         );
-        assert!(map.get(&format!("{P}proj_c_ghi11111")).unwrap().pane_dead);
+        let dead = map.get(&format!("{P}proj_c_ghi11111")).unwrap();
+        assert!(dead.pane_dead);
+        assert_eq!(dead.pane_dead_status, Some(143));
     }
 
     fn tmux_available() -> bool {

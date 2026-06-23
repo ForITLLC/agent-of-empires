@@ -3341,6 +3341,14 @@ impl PriorById {
     fn get(&self, id: &str) -> Option<&Instance> {
         self.0.get(id)
     }
+
+    /// Iterate the prior snapshot's instances. Used by the registry-prune
+    /// detector to find ids that were live in memory but absent from the
+    /// freshly-read registry. Read-only; preserves invariant 5 (the map stays
+    /// intact for the post-merge acp overlay).
+    fn iter(&self) -> impl Iterator<Item = &Instance> {
+        self.0.values()
+    }
 }
 
 #[doc(hidden)]
@@ -3424,6 +3432,49 @@ pub(crate) async fn reload_state_instances_from_disk(
             row.status = Status::Starting;
         }
         merged.push(row);
+    }
+
+    // Detector C — registry-prune. An id present in the prior in-memory set but
+    // absent from the freshly-read registry is a session that left
+    // sessions.json. If its tmux pane is still present AND no explicit
+    // remove/archive accounted for it, that is a SILENT registry loss (prune /
+    // corruption under a live session), not a clean remove. Audit it as
+    // `registry-prune` so a disappearance via this path is explainable.
+    //
+    // False-positive guards:
+    //   - `merged.is_empty()` => a transient total-load failure (every row
+    //     gone at once); never mass-audit a blip. A real prune drops some rows
+    //     while others persist.
+    //   - pane NOT present (`session_exists_from_cache != Some(true)`) => the
+    //     session died at the tmux layer (Detector A's job) or a clean remove
+    //     killed the pane. Only a present pane means the registry lost a row
+    //     out from under a still-live session.
+    //   - `suppressed_ids` (in-flight restart) / `was_recently_removed` (an
+    //     explicit remove/archive already audited the departure) => the
+    //     absence is already explained; stay silent.
+    if !merged.is_empty() {
+        let merged_ids: std::collections::HashSet<&str> =
+            merged.iter().map(|i| i.id.as_str()).collect();
+        for prior in prior_by_id.iter() {
+            if merged_ids.contains(prior.id.as_str())
+                || suppressed_ids.contains(&prior.id)
+                || crate::session::audit::was_recently_removed(&prior.id)
+            {
+                continue;
+            }
+            let pane_name = crate::tmux::Session::generate_name(&prior.id, &prior.title);
+            if crate::tmux::session_exists_from_cache(&pane_name) == Some(true) {
+                crate::session::audit::record_disappearance(
+                    crate::session::audit::Event::RegistryPrune,
+                    "daemon-reload",
+                    &prior.id,
+                    &prior.title,
+                    &prior.project_path,
+                    &prior.source_profile,
+                    None,
+                );
+            }
+        }
     }
 
     #[cfg(feature = "serve")]
@@ -4464,6 +4515,32 @@ fn gc_reconciler_session_maps(
     capacity_deferred.retain(|id| live_ids.contains(id.as_str()));
 }
 
+/// Liveness of a registered session's tmux pane at one poll tick, used by
+/// Detector A (pane-death / pane-gone audit). Only produced when the pane
+/// scrape actually succeeded, so an `Err` scrape never makes a live session
+/// look gone.
+#[derive(Clone, Copy)]
+enum Life {
+    /// Pane present and not dead.
+    Alive,
+    /// Pane present but dead (`#{pane_dead}`); `exit_code` is its exit status
+    /// when tmux reported one.
+    PaneDead { exit_code: Option<i32> },
+    /// No pane for this session in `tmux list-panes` at all.
+    TmuxGone,
+}
+
+/// One Detector-A observation: a registered session's identity plus the
+/// liveness of its pane this tick. Carries the fields the audit record needs
+/// so the async post-pass does not re-touch `state.instances`.
+struct LifeObs {
+    id: String,
+    title: String,
+    path: String,
+    profile: String,
+    life: Life,
+}
+
 /// Background task that periodically refreshes session statuses. On each
 /// tick, diffs pre- and post-refresh statuses and emits a `StatusChange`
 /// on `state.status_tx` for every transition. Keeping the diff here,
@@ -4506,6 +4583,14 @@ async fn status_poll_loop(state: Arc<AppState>) {
     #[cfg(feature = "serve")]
     let mut acp_capacity_deferred: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Detector A state (persists across ticks). `seen_alive`: sessions this
+    // daemon process has witnessed with a live pane; only these are eligible
+    // for a death audit, so a pane already dead before the daemon started
+    // (cause/time unknown) is not spuriously logged on every boot.
+    // `death_audited`: ids whose death was already recorded, so each death is
+    // logged exactly once. Both are pruned to live registry ids each tick.
+    let mut seen_alive: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut death_audited: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         interval.tick().await;
 
@@ -4584,17 +4669,98 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     "holding tmux-backed statuses because pane metadata is unavailable",
                 );
             }
+            // Detector A observes liveness off the same scrape the status
+            // decisions use, and only when the scrape actually succeeded: an
+            // Err scrape has no map, and treating it as empty would make every
+            // session look pane-gone. Upstream owns the status transition
+            // inside `apply_tick_status_decisions`; Detector A only observes,
+            // so there is nothing to gain by inlining it back.
+            let mut life_obs: Vec<LifeObs> = Vec::new();
+            if let Ok(pane_map) = &pane_metadata {
+                for inst in instances.iter() {
+                    if suppressed_ids.contains(&inst.id) {
+                        continue;
+                    }
+                    let session_name = crate::tmux::resolve_agent_session_name_in(
+                        pane_map,
+                        &inst.id,
+                        &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+                    );
+                    let life = match pane_map.get(&session_name) {
+                        Some(m) if m.pane_dead => Life::PaneDead {
+                            // Normal exit → pane_dead_status. Signal death
+                            // (crash/OOM/`kill`) leaves status empty and the
+                            // signal in pane_dead_signal; surface it as the
+                            // POSIX 128+N code (SIGKILL → 137) so the audit
+                            // records a real "it DIED" exit code either way.
+                            exit_code: m
+                                .pane_dead_status
+                                .or_else(|| m.pane_dead_signal.map(|s| 128 + s)),
+                        },
+                        Some(_) => Life::Alive,
+                        None => Life::TmuxGone,
+                    };
+                    life_obs.push(LifeObs {
+                        id: inst.id.clone(),
+                        title: inst.title.clone(),
+                        path: inst.project_path.clone(),
+                        profile: inst.source_profile.clone(),
+                        life,
+                    });
+                }
+>>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
+            }
             apply_tick_status_decisions(
                 &mut instances,
                 &prev_for_poll,
                 &suppressed_ids,
                 pane_metadata.as_ref().ok(),
             );
-            (instances, live_structured_worker_records())
+            (instances, live_structured_worker_records(), life_obs)
         })
         .await;
 
-        if let Ok((mut instances, live_worker_records)) = updated {
+        if let Ok((mut instances, live_worker_records, life_obs)) = updated {
+            // Detector A post-pass: audit a witnessed pane death/disappearance
+            // exactly once, only for sessions seen alive by this daemon. A
+            // session still in the registry but whose pane died (pane-exit) or
+            // vanished (tmux-gone) leaves a durable cause here, so a later
+            // registry prune is not the first and only trace.
+            for obs in &life_obs {
+                match obs.life {
+                    Life::Alive => {
+                        seen_alive.insert(obs.id.clone());
+                        // A respawned pane can die again; allow re-audit.
+                        death_audited.remove(&obs.id);
+                    }
+                    Life::PaneDead { exit_code } => {
+                        if seen_alive.contains(&obs.id) && death_audited.insert(obs.id.clone()) {
+                            crate::session::audit::record_disappearance(
+                                crate::session::audit::Event::PaneExit,
+                                "daemon-poll",
+                                &obs.id,
+                                &obs.title,
+                                &obs.path,
+                                &obs.profile,
+                                exit_code,
+                            );
+                        }
+                    }
+                    Life::TmuxGone => {
+                        if seen_alive.contains(&obs.id) && death_audited.insert(obs.id.clone()) {
+                            crate::session::audit::record_disappearance(
+                                crate::session::audit::Event::TmuxGone,
+                                "daemon-poll",
+                                &obs.id,
+                                &obs.title,
+                                &obs.path,
+                                &obs.profile,
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
             // Diff BEFORE `reload_state_instances_from_disk`: for a tmux-backed
             // row, status_tx must observe the raw post-suppression,
             // post-tmux-scrape value, never the acp overlay that helper
@@ -4655,6 +4821,17 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 read_epoch,
             )
             .await;
+
+            // Bound Detector A's tracking sets to the live registry so a pruned
+            // session does not leak an entry forever. Done after the reload
+            // installs the merged set, so the ids reflect what is now live.
+            {
+                let live = state.instances.read().await;
+                let live_ids: std::collections::HashSet<String> =
+                    live.iter().map(|i| i.id.clone()).collect();
+                seen_alive.retain(|id| live_ids.contains(id));
+                death_audited.retain(|id| live_ids.contains(id));
+            }
 
             drain_session_id_updates_in_state(&state).await;
 
