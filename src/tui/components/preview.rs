@@ -1,7 +1,5 @@
 //! Preview panel component
 
-use std::time::Duration;
-
 use ansi_to_tui::IntoText;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -276,7 +274,6 @@ impl Preview {
         cached_output: CachedPreview<'_>,
         scroll_offset: u16,
         theme: &Theme,
-        idle_decay_window: Duration,
         compact: bool,
         show_info: bool,
     ) {
@@ -286,7 +283,7 @@ impl Preview {
         // already says "Preview", so an inner banner would be redundant chrome).
         let layout = PreviewLayout::compute(area, compact, show_info, agent_info_height(instance));
         if let Some(info_area) = layout.info {
-            Self::render_info(frame, info_area, instance, theme, idle_decay_window);
+            Self::render_info(frame, info_area, instance, theme);
         }
         Self::render_output_cached(
             frame,
@@ -299,13 +296,7 @@ impl Preview {
         );
     }
 
-    pub(crate) fn render_info(
-        frame: &mut Frame,
-        area: Rect,
-        instance: &Instance,
-        theme: &Theme,
-        idle_decay_window: Duration,
-    ) {
+    pub(crate) fn render_info(frame: &mut Frame, area: Rect, instance: &Instance, theme: &Theme) {
         let mut info_lines = Vec::new();
 
         // Profile and Tool on the same row to save vertical space
@@ -335,24 +326,10 @@ impl Preview {
             ]),
             Line::from(vec![
                 Span::styled("Status:  ", Style::default().fg(theme.dimmed)),
-                {
-                    // A dormant (idle-reaped, resumable) structured worker
-                    // reads "Dormant" in dim amber, distinct from a deliberate
-                    // Stop or a live Idle. See #2250.
-                    let (label, color) = if instance.is_shown_dormant() {
-                        ("Dormant".to_string(), theme.dormant())
-                    } else {
-                        (
-                            format!("{:?}", instance.status),
-                            theme.status_color(
-                                instance.status,
-                                instance.idle_age(),
-                                idle_decay_window,
-                            ),
-                        )
-                    };
-                    Span::styled(label, Style::default().fg(color))
-                },
+                Span::styled(
+                    format!("{:?}", instance.status),
+                    Style::default().fg(theme.status_color(instance.status)),
+                ),
             ]),
         ]);
 

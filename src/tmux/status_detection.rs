@@ -858,27 +858,18 @@ fn claude_pane_has_resume_picker(raw_content: &str) -> bool {
 /// When Claude's status hook reports Running, the pane is consulted to catch
 /// four cases the hook stream can't express on its own:
 ///
-<<<<<<< HEAD
 /// 1. A blocking prompt the user must answer: a tool-permission approval prompt
 ///    or an `AskUserQuestion` selection UI. Claude keeps its live spinner
 ///    rendered below the prompt and re-emits running-mapped hook events
 ///    (`PreToolUse`, `UserPromptSubmit`) while it waits, so the last hook write
 ///    stays `running` even though the agent is blocked on the user. Downgrade to
 ///    Waiting. See #1913 (permission prompt) and `claude_has_ask_user_question`.
-/// 2. An Esc-interrupted turn: cancelling a turn fires no `Stop` and no
-=======
-/// 1. A blocking approval prompt: Claude keeps its live spinner rendered below
-///    the prompt and re-emits running-mapped hook events (`PreToolUse`,
-///    `UserPromptSubmit`) while it waits, so the last hook write stays
-///    `running` even though the agent is blocked on the user. Downgrade to
-///    Waiting. See #1913.
 /// 2. The resume-from-summary picker the daemon's startup recovery triggers
 ///    when it respawns a compacted session with `--resume`: a blocking
 ///    input-wait whose recycled pane never relaunched Claude, so no newer hook
 ///    fired and the daemon masks a frozen session as Running. Downgrade to
 ///    Waiting.
 /// 3. An Esc-interrupted turn: cancelling a turn fires no `Stop` and no
->>>>>>> 71df8456 (fix(status): classify resume-picker pane as Waiting, not Running)
 ///    `idle_prompt`, so the status file sticks on `running` indefinitely.
 ///    Downgrade to Idle when the pane shows the interrupt banner and no
 ///    active-turn signal.
@@ -905,7 +896,6 @@ pub(crate) fn reconcile_claude_hook_status(
     if hook_status != Status::Running {
         return hook_status;
     }
-<<<<<<< HEAD
     with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
         if let Some(rule) = claude_blocking_prompt_rule(recent, recent_joined, recent_lower) {
             tracing::debug!(target: "tmux.status",
@@ -954,9 +944,6 @@ pub(crate) fn reconcile_claude_hook_status(
 /// adds no new false-positive surface, only the un-stick.
 pub(crate) fn reconcile_waiting_hook(agent: &str, raw_content: &str) -> Status {
     if raw_content.trim().is_empty() {
-=======
-    if claude_pane_has_approval_prompt(raw_content) || claude_pane_has_resume_picker(raw_content) {
->>>>>>> 71df8456 (fix(status): classify resume-picker pane as Waiting, not Running)
         return Status::Waiting;
     }
     match detect_status_from_content(raw_content, agent) {

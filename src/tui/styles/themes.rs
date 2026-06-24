@@ -258,69 +258,35 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// Color for an Idle session, given the elapsed time since it
-    /// transitioned to Idle and the user-configured decay window.
+    /// The base status -> color mapping, collapsed to the MINIMUM meaningful
+    /// palette (Ben's UX ask, 2026-06-24): the attention view should read at a
+    /// glance as "anything in the attention hue = act, everything else = leave
+    /// alone." Three colors, each one idea:
+    /// - `error` (red): NEEDS THE HUMAN — Waiting and Error merge into one
+    ///   "act now" hue. A session blocked for input and a crashed one both want
+    ///   Ben's hands, so they share the loudest color; the glyph still tells
+    ///   them apart.
+    /// - `running` (green): actively working — do nothing, don't interrupt.
+    /// - `dimmed` (slate): everything dormant or self-resolving — Idle,
+    ///   Unknown, Stopped, and the transient Starting/Creating/Deleting states
+    ///   all collapse to one neutral. Disambiguated by glyph (and, for Idle, a
+    ///   fresh-idle spinner), not by hue.
     ///
-    /// Two-state binary: `fresh_idle` while age is inside the window,
-    /// `idle` once past it (or when age/window aren't usable: `None` age,
-    /// zero window). The pulse phase deliberately holds a constant color
-    /// — a continuous lerp under the breathe rattle reads as noisy. If we
-    /// ever want a gradient back, add an interpolator and call it here.
-    pub fn idle_color_at_age(&self, age: Option<Duration>, window: Duration) -> Color {
-        let Some(age) = age else {
-            return self.idle;
-        };
-        if window.is_zero() || age >= window {
-            return self.idle;
-        }
-        self.fresh_idle
-    }
-
-    /// Color for a session shown as dormant: a structured-view worker that was
-    /// auto-stopped for inactivity and is resumable (see
-    /// `Instance::is_shown_dormant`). A dim amber, the `fresh_idle` attention
-    /// amber pulled halfway toward `dimmed`, so it reads as "parked, not
-    /// urgent" and stays distinct from both the bright fresh-idle amber and
-    /// the neutral `dimmed` used for a deliberate Stop. Derived from existing
-    /// theme colors (not a stored field) so it needs no per-theme definition
-    /// and stays out of the `color_fields_mut` drift guard. See #2250.
-    pub fn dormant(&self) -> Color {
-        blend(self.fresh_idle, self.dimmed, 0.5)
-    }
-
-    /// The base status -> color mapping, "one hue = one meaning". The single
-    /// source of truth shared by the session list (`home/render.rs`) and the
-    /// preview info pane (`components/preview.rs`) so the two can never drift.
-    ///
-    /// The mapping reserves each hue for exactly one idea:
-    /// - `running` (green): actively working
-    /// - `waiting` (bright amber): NEEDS THE HUMAN — the only "act now" color
-    /// - `idle` / `fresh_idle` (slate): resting; decays with age
-    /// - `transition` (teal): Starting / Creating / Deleting — machine-busy,
-    ///   resolves itself, do nothing
-    /// - `error` (red): failed
-    /// - `dimmed` (slate): Stopped — disambiguated from idle by glyph, not hue
-    ///
-    /// `Unknown` routes to `idle`, not `waiting`: an unknown status is not a
-    /// call to action, so it must not borrow the "needs you" amber.
-    ///
-    /// Callers layer their own overrides ON TOP (unread, archive, snooze,
-    /// urgent) — those are row decorations, not base status, and are not the
-    /// concern of this function.
-    pub fn status_color(
-        &self,
-        status: Status,
-        idle_age: Option<Duration>,
-        window: Duration,
-    ) -> Color {
+    /// The single source of truth shared by the session list
+    /// (`home/render.rs`) and the preview info pane (`components/preview.rs`) so
+    /// the two can never drift. Callers layer their own decorations ON TOP
+    /// (unread, archive, snooze, urgent) — those are row decorations, not base
+    /// status, and are not the concern of this function.
+    pub fn status_color(&self, status: Status) -> Color {
         match status {
+            Status::Waiting | Status::Error => self.error,
             Status::Running => self.running,
-            Status::Waiting => self.waiting,
-            Status::Idle => self.idle_color_at_age(idle_age, window),
-            Status::Unknown => self.idle,
-            Status::Stopped => self.dimmed,
-            Status::Error => self.error,
-            Status::Starting | Status::Creating | Status::Deleting => self.transition,
+            Status::Idle
+            | Status::Unknown
+            | Status::Stopped
+            | Status::Starting
+            | Status::Creating
+            | Status::Deleting => self.dimmed,
         }
     }
 }
@@ -534,46 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn idle_color_at_age_boundaries() {
-        let theme = load_theme("empire");
-        let window = idle_decay_window(20);
-        // No timestamp = decayed.
-        assert_eq!(theme.idle_color_at_age(None, window), theme.idle);
-        // Zero age = fresh.
-        assert_eq!(
-            theme.idle_color_at_age(Some(Duration::ZERO), window),
-            theme.fresh_idle
-        );
-        // Inside the window = fresh.
-        assert_eq!(
-            theme.idle_color_at_age(Some(window / 2), window),
-            theme.fresh_idle
-        );
-        // At the boundary clamps to decayed (age >= window).
-        assert_eq!(theme.idle_color_at_age(Some(window), window), theme.idle);
-        // Past the window = decayed.
-        assert_eq!(
-            theme.idle_color_at_age(Some(window + Duration::from_secs(60)), window),
-            theme.idle
-        );
-    }
-
-    #[test]
-    fn idle_color_at_age_zero_window_disables_freshness() {
-        // window = 0 is the documented opt-out: every Idle row renders
-        // as fully decayed regardless of age. No pulse, no fresh tint.
-        let theme = load_theme("empire");
-        assert_eq!(
-            theme.idle_color_at_age(Some(Duration::from_secs(1)), Duration::ZERO),
-            theme.idle
-        );
-        assert_eq!(
-            theme.idle_color_at_age(Some(Duration::from_secs(1_000_000)), Duration::ZERO),
-            theme.idle
-        );
-    }
-
-    #[test]
     fn theme_attention_hierarchy_holds() {
         // Visual hierarchy: Waiting is the most attention-grabbing state;
         // fresh-idle sits one rung dimmer; decayed idle blends in. On dark
@@ -628,5 +554,70 @@ mod tests {
             cmp("waiting", w, "unread", u);
             cmp("unread", u, "idle", i);
         }
+    }
+
+    #[test]
+    fn status_color_collapses_to_three_hues() {
+        // Ben's UX ask (2026-06-24): the attention view must read at a glance —
+        // ONE loud hue means "needs the human", everything else recedes.
+        // `status_color` is the single chokepoint both the session list
+        // (`home/render.rs`) and the preview info pane (`components/preview.rs`)
+        // route through, so pinning its FULL mapping here guards every render
+        // path at once and is the deterministic, exact-color stand-in for a
+        // live-TUI render check (no terminal down-conversion, every arm hit).
+        //
+        // Each built-in theme must collapse the 9 Status variants onto exactly
+        // three of its OWN colors: `error` (act now), `running` (working),
+        // `dimmed` (dormant/transient). The retired per-tier hues —
+        // `waiting`/`fresh_idle`/`transition` — must never paint a row again.
+        use Status::*;
+        const ALL: [Status; 9] = [
+            Running, Waiting, Idle, Unknown, Stopped, Error, Starting, Deleting, Creating,
+        ];
+        for name in builtin_theme_names() {
+            let theme = load_theme(name);
+            // The explicit merge: a session blocked for input and a crashed one
+            // both want Ben's hands, so they share the loudest hue.
+            for s in [Waiting, Error] {
+                assert_eq!(
+                    theme.status_color(s),
+                    theme.error,
+                    "{name}: {s:?} must paint with the attention hue (Waiting+Error merge)"
+                );
+            }
+            assert_eq!(
+                theme.status_color(Running),
+                theme.running,
+                "{name}: Running keeps the working hue"
+            );
+            // Everything dormant or self-resolving collapses to one neutral.
+            for s in [Idle, Unknown, Stopped, Starting, Deleting, Creating] {
+                assert_eq!(
+                    theme.status_color(s),
+                    theme.dimmed,
+                    "{name}: {s:?} must collapse to the shared neutral (dimmed)"
+                );
+            }
+            // No status may reach for any OTHER theme field — in particular the
+            // retired tier hues.
+            for s in ALL {
+                let c = theme.status_color(s);
+                assert!(
+                    c == theme.error || c == theme.running || c == theme.dimmed,
+                    "{name}: {s:?} painted {c:?}, outside the 3-hue set"
+                );
+            }
+        }
+        // The canonical palette must be a REAL three colors (none tied), so the
+        // collapse still distinguishes act / working / resting at a glance.
+        let empire = load_theme("empire");
+        let mut hues: Vec<Color> = ALL.iter().map(|s| empire.status_color(*s)).collect();
+        hues.sort_by_key(|c| format!("{c:?}"));
+        hues.dedup();
+        assert_eq!(
+            hues.len(),
+            3,
+            "empire status palette must be exactly 3 distinct hues, got {hues:?}"
+        );
     }
 }

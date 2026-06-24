@@ -1484,14 +1484,16 @@ impl HomeView {
                 if let Some(inst) = self.get_instance(id) {
                     match self.view_mode {
                         ViewMode::Structured => {
-                            // For Idle sessions, decay color from `fresh_idle`
-                            // toward `idle` over `idle_decay_window`. A slow
-                            // `breathe` rattle replaces the static braille
-                            // glyph while we're inside the window, matching
-                            // the animated visual language of the other
-                            // attention-worthy states (Running, Waiting,
-                            // Starting). Also serves as a redundant cue for
-                            // colorblind users / monochrome terminals.
+                            // For Idle sessions, the fresh-idle window now
+                            // drives ONLY the spinner: the row color collapses
+                            // to the shared neutral via `status_color` (the
+                            // palette was simplified to 3 hues), so the only
+                            // fresh-idle cue left is motion. A slow `breathe`
+                            // rattle replaces the static braille glyph while
+                            // we're inside the window, matching the animated
+                            // visual language of the other states (Running,
+                            // Waiting, Starting). Also serves as a redundant
+                            // cue for colorblind users / monochrome terminals.
                             //
                             // Archive/snooze then overrides the live spinner.
                             // A shelved session's underlying status is noise;
@@ -1555,7 +1557,7 @@ impl HomeView {
                             } else if unread_resting {
                                 theme.unread
                             } else {
-                                theme.status_color(inst.status, idle_age, self.idle_decay_window)
+                                theme.status_color(inst.status)
                             };
                             let mut style = Style::default().fg(color);
                             if unread_resting {
@@ -2521,24 +2523,26 @@ impl HomeView {
                         // distinct glyph + dim amber. See #2250.
                         (ICON_DORMANT, theme.dormant())
                     } else {
-                        match inst.status {
-                            Status::Running => (spinner_running(&inst.created_at), theme.running),
-                            Status::Waiting => (spinner_waiting(&inst.created_at), theme.waiting),
-                            Status::Idle if is_fresh_idle => (
-                                spinner_idle_fresh(&inst.created_at, inst.idle_entered_at),
-                                theme.idle_color_at_age(idle_age, self.idle_decay_window),
-                            ),
-                            Status::Idle => (
-                                ICON_IDLE,
-                                theme.idle_color_at_age(idle_age, self.idle_decay_window),
-                            ),
-                            Status::Unknown => (ICON_UNKNOWN, theme.waiting),
-                            Status::Stopped => (ICON_STOPPED, theme.dimmed),
-                            Status::Error => (ICON_ERROR, theme.error),
-                            Status::Starting => (spinner_starting(&inst.created_at), theme.dimmed),
-                            Status::Deleting => (ICON_DELETING, theme.waiting),
-                            Status::Creating => (spinner_starting(&inst.created_at), theme.accent),
-                        }
+                        // Icon/spinner stays per-status (the animation language
+                        // is fine); only the COLOR collapses through the shared
+                        // 3-hue `status_color` so the hoisted title can't paint
+                        // a hue the session list no longer uses (it used to leak
+                        // amber for Unknown/Deleting and accent for Creating).
+                        let icon = match inst.status {
+                            Status::Running => spinner_running(&inst.created_at),
+                            Status::Waiting => spinner_waiting(&inst.created_at),
+                            Status::Idle if is_fresh_idle => {
+                                spinner_idle_fresh(&inst.created_at, inst.idle_entered_at)
+                            }
+                            Status::Idle => ICON_IDLE,
+                            Status::Unknown => ICON_UNKNOWN,
+                            Status::Stopped => ICON_STOPPED,
+                            Status::Error => ICON_ERROR,
+                            Status::Starting => spinner_starting(&inst.created_at),
+                            Status::Deleting => ICON_DELETING,
+                            Status::Creating => spinner_starting(&inst.created_at),
+                        };
+                        (icon, theme.status_color(inst.status))
                     };
                     Line::from(vec![
                         Span::raw(" "),
@@ -2750,13 +2754,7 @@ impl HomeView {
                         inst.map(preview::agent_info_height).unwrap_or(0),
                     );
                     if let (Some(info_area), Some(inst)) = (layout.info, inst) {
-                        preview::Preview::render_info(
-                            frame,
-                            info_area,
-                            inst,
-                            theme,
-                            self.idle_decay_window,
-                        );
+                        preview::Preview::render_info(frame, info_area, inst, theme);
                     }
                     // No ` Output ` banner row: the transcript block has
                     // its own titled border, so the banner slot stays a
@@ -2858,7 +2856,6 @@ impl HomeView {
                                 CachedPreview::from_text(self.preview_cache.parsed_text.as_ref()),
                                 self.preview_scroll_offset,
                                 theme,
-                                self.idle_decay_window,
                                 compact,
                                 self.show_preview_info,
                             );
