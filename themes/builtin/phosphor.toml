@@ -14,7 +14,14 @@ waiting = "#ffb43c"
 fresh_idle = "#ff7b1c"
 idle = "#3c6446"
 unread = "#64c8ff"
-transition = "#2dd4bf"
+# Transient lifecycle (Starting/Creating/Deleting). Violet, OFF the
+# green/amber/red attention ramp AND off the cool sky/teal axis so it can't
+# be confused with running (green), unread (sky), or waiting (amber). In
+# palette mode teal #2dd4bf collapsed to xterm-256 idx 43 right next to
+# running(49)/unread(81) — three indistinct cool tones — and it was the token
+# that replaced amber, hence "a blue where orange used to be." Orange is NOT
+# an option: it quantizes to idx 215 == waiting, which would alias "needs you."
+transition = "#b478ff"
 error = "#ff6450"
 terminal_active = "#82aaff"
 group = "#64dca0"
