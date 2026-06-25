@@ -1576,15 +1576,21 @@ impl HomeView {
                                 // uniform muted glyph regardless of underlying
                                 // pane status. The pane is dead, so painting
                                 // the persisted Running/Waiting status
-                                // would be misleading. The Archived
-                                // section header is the sole textual
-                                // cue, so no italic/dim modifier is
-                                // applied here; just a dim color. Error and
-                                // Deleting are live delete-operation states,
-                                // not pane statuses, so they keep their real
-                                // glyph and color (see `agent_row_icon`).
+                                // would be misleading. Archived shares the
+                                // dormant gray (both mean "not asking for
+                                // you"), so to stop it reading as just
+                                // another resting row we strike it through
+                                // -- form, not a new hue -- the universal
+                                // "shelved / done" cue, distinct from a
+                                // live-but-idle gray row whose pane is
+                                // still alive. Error and Deleting are live
+                                // delete-operation states, not pane statuses,
+                                // so they keep their real glyph and color
+                                // (see `agent_row_icon`).
                                 icon = agent_row_icon(inst);
-                                style = Style::default().fg(theme.dimmed);
+                                style = Style::default()
+                                    .fg(theme.dimmed)
+                                    .add_modifier(ratatui::style::Modifier::CROSSED_OUT);
                             } else if in_attention && inst.is_snoozed() {
                                 // Snooze decoration is Attention-only.
                                 // Outside Attention the row paints its
@@ -1662,11 +1668,15 @@ impl HomeView {
                             let mut style = Style::default().fg(color);
                             if inst.is_archived() || inst.is_trashed() {
                                 // Archive/trash lifecycle override mirrors the
-                                // Agent-view path: dim color, stopped
-                                // icon, no italic/dim modifier; the
-                                // Archived section header is the cue.
+                                // Agent-view path: dim color + strike-through
+                                // (the "shelved / done" cue that tells it apart
+                                // from a live-but-idle gray row), stopped icon.
+                                // The Archived/Trash section header is the
+                                // additional cue.
                                 icon = ICON_STOPPED;
-                                style = Style::default().fg(theme.dimmed);
+                                style = Style::default()
+                                    .fg(theme.dimmed)
+                                    .add_modifier(ratatui::style::Modifier::CROSSED_OUT);
                             } else if in_attention && inst.is_snoozed() {
                                 icon = ICON_STOPPED;
                                 style = Style::default()
