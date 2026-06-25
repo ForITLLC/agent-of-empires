@@ -107,6 +107,15 @@ pub enum SessionCommands {
 
     /// Permanently purge every trashed session in the profile (irreversible).
     EmptyTrash,
+
+    /// Move a session to a different account profile in ONE step: relocate
+    /// the session RECORD from whatever profile currently owns it into the
+    /// target profile's `sessions.json`, then restart it so the live agent
+    /// re-binds under the target account (`CLAUDE_CONFIG_DIR`). Replaces the
+    /// error-prone manual recipe of hand-editing each profile's
+    /// `sessions.json` and then `aoe -p <target> session restart <id>`.
+    /// Idempotent: a no-op when the session is already in the target.
+    Move(MoveArgs),
 }
 
 #[derive(Args)]
@@ -188,6 +197,25 @@ pub struct RestartArgs {
     /// intentionally modest. Ignored when `--all` is not set.
     #[arg(long, default_value_t = 3)]
     pub parallel: usize,
+}
+
+#[derive(Args)]
+pub struct MoveArgs {
+    /// Session ID or title to relocate. Looked up across ALL profiles, so
+    /// no `-p` is needed (and `-p` is intentionally ignored for the lookup —
+    /// the move always finds the session in whatever profile owns it).
+    pub identifier: String,
+
+    /// Destination account profile (must already exist; see `aoe profile
+    /// list`). The session's record is rewritten with `source_profile` set
+    /// to this, then restarted so the live agent re-binds under it.
+    pub target_profile: String,
+
+    /// Relocate the record only; skip the live restart/re-bind. Useful when
+    /// the session is stopped or you want to stage the move and restart
+    /// later. The new account binding then takes effect on the next start.
+    #[arg(long = "no-restart")]
+    pub no_restart: bool,
 }
 
 #[derive(Args)]
@@ -409,7 +437,132 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Import(args) => import_sessions(profile, args).await,
         SessionCommands::ListTrash => list_trash(profile).await,
         SessionCommands::EmptyTrash => empty_trash(profile).await,
+        SessionCommands::Move(args) => move_session(args).await,
     }
+}
+
+/// Locate the single session matching `identifier` (exact id, id-prefix, or
+/// title) across EVERY profile's `sessions.json`, returning
+/// `(owning_profile, instance)`. An exact-id hit wins outright even if a
+/// title collides elsewhere; otherwise more than one matching profile is an
+/// ambiguity error (refuse rather than guess which account to touch).
+fn find_session_across_profiles(identifier: &str) -> Result<(String, crate::session::Instance)> {
+    let profiles = crate::session::list_profiles()?;
+    let mut hits: Vec<(String, crate::session::Instance)> = Vec::new();
+    for p in &profiles {
+        let storage = match Storage::new_unwatched(p) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let instances = match storage.load() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Exact-id match short-circuits: unambiguous regardless of titles.
+        if let Some(inst) = instances.iter().find(|i| i.id == identifier) {
+            return Ok((p.clone(), inst.clone()));
+        }
+        if let Ok(inst) = super::resolve_session(identifier, &instances) {
+            hits.push((p.clone(), inst.clone()));
+        }
+    }
+    match hits.len() {
+        0 => bail!("No session matching {:?} in any profile", identifier),
+        1 => Ok(hits.into_iter().next().unwrap()),
+        _ => {
+            let where_ = hits
+                .iter()
+                .map(|(p, i)| format!("{} (profile '{}')", i.id, p))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "Ambiguous: {:?} matches sessions in multiple profiles: {}. \
+                 Re-run with the exact session id.",
+                identifier,
+                where_
+            )
+        }
+    }
+}
+
+/// Relocate a session's record cross-profile, then re-bind the live account.
+///
+/// Profile is resolved from the session itself (via
+/// [`find_session_across_profiles`]), NOT from the caller's `-p`, so the
+/// command works the same no matter which profile the CLI defaulted to.
+async fn move_session(args: MoveArgs) -> Result<()> {
+    let target = args.target_profile.trim().to_string();
+    if target.is_empty() {
+        bail!("Target profile must not be empty");
+    }
+
+    // Validate the target exists in the registry up front: refuse to strand
+    // a record in a profile dir that no account is bound to.
+    let profiles = crate::session::list_profiles()?;
+    if !profiles.iter().any(|p| p == &target) {
+        bail!(
+            "Unknown target profile '{}'. Known profiles: {}",
+            target,
+            profiles.join(", ")
+        );
+    }
+
+    let (owner, record) = find_session_across_profiles(&args.identifier)?;
+    let id = record.id.clone();
+    let title = record.title.clone();
+
+    if owner == target {
+        println!(
+            "Session '{}' ({}) is already in profile '{}'; nothing to move.",
+            title, id, target
+        );
+        return Ok(());
+    }
+
+    // Build the relocated record: re-home it on the target profile and drop
+    // the per-profile group association (group_path is meaningful only
+    // within its origin profile; carrying it over would dangle).
+    let mut moved = record.clone();
+    moved.source_profile = target.clone();
+    moved.group_path = String::new();
+
+    // Insert into the target FIRST, then remove from the source. A crash
+    // between the two leaves a harmless duplicate (recoverable) rather than
+    // a vanished session. Insert is idempotent on id.
+    let target_storage = Storage::new_unwatched(&target)?;
+    target_storage.update(|instances, _groups| {
+        if !instances.iter().any(|i| i.id == id) {
+            instances.push(moved.clone());
+        }
+        Ok(())
+    })?;
+    let source_storage = Storage::new_unwatched(&owner)?;
+    source_storage.update(|instances, _groups| {
+        instances.retain(|i| i.id != id);
+        Ok(())
+    })?;
+
+    println!(
+        "✓ Moved record '{}' ({}): profile '{}' -> '{}'.",
+        title, id, owner, target
+    );
+
+    if args.no_restart {
+        println!("  (--no-restart) live account re-binds on the session's next start.",);
+        return Ok(());
+    }
+
+    // Re-bind the live account by restarting under the target profile. The
+    // restart path re-resolves CLAUDE_CONFIG_DIR from source_profile=target.
+    println!("  Re-binding live account under '{}'...", target);
+    restart_session(
+        &target,
+        SessionIdArgs {
+            identifier: id.clone(),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -1380,7 +1533,26 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
 }
 
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    // #99 default-launch drift fix: a plain `aoe session restart <id>` (no
+    // `-p`, so `profile` is empty) must operate on — and re-bind under — the
+    // profile that ACTUALLY owns the session, not the globally-resolved
+    // default profile. The previous code loaded the default profile's storage
+    // and stamped `source_profile = ""`, which re-homed every plain restart
+    // onto the default account and clustered the whole fleet on one wallet.
+    // An explicit `-p <profile>` still overrides (intentional migration — the
+    // path `aoe session move` relies on).
+    let owning_profile = if profile.is_empty() {
+        match find_session_across_profiles(&args.identifier) {
+            Ok((p, _)) => p,
+            // Not found in any profile's sessions.json: fall back to the
+            // resolved default so the normal "session missing" error surfaces
+            // from resolve_session below rather than a confusing lookup error.
+            Err(_) => crate::session::config::effective_profile(profile),
+        }
+    } else {
+        profile.to_string()
+    };
+    let storage = Storage::open_unwatched(&owning_profile)?;
 
     // Phase 1 (unlocked): snapshot the target by identifier and
     // rehydrate `source_profile` for config resolution.
@@ -1388,7 +1560,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "restart")?;
     let mut working = inst.clone();
-    working.source_profile = profile.to_string();
+    working.source_profile = owning_profile.clone();
 
     // Snapshot the sid before `restart_with_size` clears it on a forced-fresh
     // path: the abandoned rollout lingers and stays newest-by-mtime, so the
@@ -1409,7 +1581,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // Resolve the configured wake message (global default with per-profile
     // override). Empty string is the documented opt-out: the restart still
     // runs but no keys are sent.
-    let wake_msg = crate::session::resolve_config(profile)
+    let wake_msg = crate::session::resolve_config(&owning_profile)
         .map(|c| c.session.restart_wake_message.clone())
         .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
 
@@ -2940,6 +3112,58 @@ mod target_filter_tests {
     #[test]
     fn empty_input_yields_empty_targets() {
         assert!(pick_targets_for_restart_all(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod move_lookup_tests {
+    use super::find_session_across_profiles;
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    fn seed(profile: &str, id: &str, title: &str, path: &str) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new(id, path);
+        inst.id = id.to_string();
+        inst.title = title.to_string();
+        inst.source_profile = profile.to_string();
+        let on_disk = inst.clone();
+        storage
+            .update(|i, _g| {
+                i.push(on_disk.clone());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn finds_owner_exact_id_wins_and_title_collision_is_ambiguous() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+        // Two profiles, identical title in each, distinct ids.
+        seed("mvfind-a", "aaaa1111", "shared-title", "/tmp/a");
+        seed("mvfind-b", "bbbb2222", "shared-title", "/tmp/b");
+
+        // Exact id resolves to its owning profile even though the title
+        // collides across profiles (exact-id short-circuit).
+        let (owner, inst) = find_session_across_profiles("aaaa1111").unwrap();
+        assert_eq!(owner, "mvfind-a");
+        assert_eq!(inst.id, "aaaa1111");
+
+        // Title alone matches in both profiles -> ambiguous -> refuse to guess.
+        let err = find_session_across_profiles("shared-title").unwrap_err();
+        assert!(
+            err.to_string().contains("Ambiguous"),
+            "expected ambiguity error, got: {err}"
+        );
+
+        // No match anywhere -> error.
+        assert!(find_session_across_profiles("nope-nope-nope").is_err());
     }
 }
 
