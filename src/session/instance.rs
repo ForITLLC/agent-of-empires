@@ -977,6 +977,19 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resume_fork_recovered_sid: Option<String>,
 
+    /// WO #132 relink-recovery loop guard (sibling of #56): the last sid for
+    /// which a dead resume pane was auto-recovered by relinking a transcript
+    /// that was STRANDED under a stale encoded project dir. A managed worktree
+    /// rename (`tie_workdir_to_name`) changes the cwd but leaves `<sid>.jsonl`
+    /// under the OLD cwd's dir, so `claude --resume <sid>` from the new cwd
+    /// reports "No sessions match" though the conversation is intact. Keyed
+    /// per-sid so a relinked resume that still dies falls through to `Error`
+    /// instead of relinking forever. Persisted so the guard survives a daemon
+    /// restart. Unlike #56 this needs no launch-flag: relinking the file makes
+    /// the existing `--resume <sid>` resolve, so the launch command is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_relink_recovered_sid: Option<String>,
+
     /// Runtime-only one-shot: when set, the next launch appends
     /// `--fork-session` so resuming a background-agent-locked sid branches a
     /// context-preserving copy instead of bouncing off the lock. Set and
@@ -1671,6 +1684,7 @@ impl Instance {
             lifecycle_generation: 0,
             resume_probe_failed_sid: None,
             resume_fork_recovered_sid: None,
+            resume_relink_recovered_sid: None,
             fork_next_launch: false,
             resume_intent: ResumeIntent::Default,
             force_fresh_next_launch: false,
@@ -1935,6 +1949,13 @@ impl Instance {
         disk.fork_next_launch = self.fork_next_launch;
         if self.resume_fork_recovered_sid.is_some() {
             disk.resume_fork_recovered_sid = self.resume_fork_recovered_sid.take();
+        }
+        // #132: same carry for the relink-recovery guard. Set in-memory just
+        // before the relaunch reload in `start_with_resume_fallback`, written
+        // only by the daemon-internal stranded-transcript recovery path, never
+        // a peer. Carry it forward so it is not wiped before it is persisted.
+        if self.resume_relink_recovered_sid.is_some() {
+            disk.resume_relink_recovered_sid = self.resume_relink_recovered_sid.take();
         }
         // `before_start_env` is `#[serde(skip)]`, so the disk snapshot always
         // has it empty. Carry the live value forward; otherwise this reload
@@ -6466,6 +6487,59 @@ impl Instance {
                         self.id,
                     );
                     // fall through to the standard resume-failure handling
+                }
+            }
+        }
+
+        // #132 durable recovery: the renamed-cwd sibling of the #56 bg-lock
+        // case. A dead Claude resume pane whose transcript is simply STRANDED
+        // under a *different* encoded project dir (e.g. `tie_workdir_to_name`
+        // renamed the cwd, so the live `<sid>.jsonl` still sits under the old
+        // dir while Claude now looks under the new one) is recoverable by
+        // relinking that transcript into the dir Claude looks in — the existing
+        // `--resume <sid>` then resolves. No fork, no new sid, no launch flag.
+        // Auto-recover ONCE per sid (persisted guard, like #56). If no
+        // transcript is stranded anywhere (the wma-Jamf "never persisted"
+        // class) the helper returns None and we fall through to the Error path
+        // — fresh-start stays correct, do NOT auto-fork it. Gated on the resume
+        // still being pinned to `stale_sid`, so a prior #56 fork (which re-pins
+        // resume_intent to Default) cannot trigger an unrelated relink.
+        if self.tool == "claude"
+            && self.resume_relink_recovered_sid.as_deref() != Some(stale_sid.as_str())
+            && matches!(self.resume_intent, ResumeIntent::Use(ref s) if s == &stale_sid)
+        {
+            if let Some(path) =
+                crate::session::capture::recover_stranded_transcript(&self.project_path, &stale_sid)
+            {
+                tracing::warn!(
+                    target: "session.store",
+                    "start: sid {} for {} found no transcript in the live project \
+                     dir; relinked stranded transcript from {} and retrying resume \
+                     (one-shot, context preserved)",
+                    stale_sid,
+                    self.id,
+                    path.display(),
+                );
+                self.resume_relink_recovered_sid = Some(stale_sid.clone());
+                self.stop_poller();
+                self.session_id_poller = None;
+                self.kill_clean().with_context(|| {
+                    format!("kill_clean before relink recovery for {}", self.id)
+                })?;
+                let _ = self
+                    .start_with_size_opts(size, skip_on_launch)
+                    .with_context(|| format!("relink relaunch for {}", self.id))?;
+                match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
+                    Ok(ProbeResult::Alive) => return Ok(StartOutcome::Resumed),
+                    Ok(ProbeResult::Dead) | Err(_) => {
+                        tracing::warn!(
+                            target: "session.store",
+                            "relink recovery for {} also failed to settle; \
+                             falling through to Error (guard set, no retry)",
+                            self.id,
+                        );
+                        // fall through to the standard resume-failure handling
+                    }
                 }
             }
         }

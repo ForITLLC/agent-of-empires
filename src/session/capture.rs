@@ -120,6 +120,108 @@ pub(crate) fn encode_claude_project_path(project_path: &str) -> String {
         .collect()
 }
 
+/// Relink a transcript that was stranded under a *different* encoded project
+/// dir back to the dir Claude will look in for this session.
+///
+/// #132 — the sibling of the #56 background-lock case. When a session's working
+/// directory is renamed (e.g. `tie_workdir_to_name`), its agent home computes a
+/// *new* encoded project dir (`-Users-foo-newname`) while the live transcript
+/// `<sid>.jsonl` still sits under the *old* encoded dir (`-Users-foo-oldname`).
+/// `claude --resume <sid>` then finds no transcript in the new dir and dies, so
+/// the daemon would fall to `Status::Error`. This locates the stranded
+/// `<sid>.jsonl` anywhere under `projects_root` and links it into `target_dir`
+/// so the existing `--resume <sid>` resolves on the next launch — no fork, no
+/// new sid, no launch flag.
+///
+/// Returns the resolved transcript path on success. Returns `None` (no-op) when:
+///   - `target_dir_name` already holds `<sid>.jsonl` (nothing stranded — the
+///     caller must NOT treat this as a recovery and re-launch in a loop), or
+///   - no `<sid>.jsonl` exists under any sibling dir (the "never persisted"
+///     class, e.g. a session that died before its first transcript write —
+///     fresh-start stays correct, do NOT auto-fork it).
+///
+/// Pure over `projects_root`: takes the store root + target dir name + sid, so
+/// it is unit-testable hermetically against a tempdir.
+pub(crate) fn relink_stranded_transcript(
+    projects_root: &Path,
+    target_dir_name: &str,
+    sid: &str,
+) -> Option<PathBuf> {
+    let file_name = format!("{sid}.jsonl");
+    let target_dir = projects_root.join(target_dir_name);
+    let target_path = target_dir.join(&file_name);
+
+    // Already resolvable in the dir Claude will look in → nothing stranded.
+    if target_path.exists() {
+        return None;
+    }
+
+    // Find the stranded transcript under any OTHER encoded dir. If more than
+    // one exists (unlikely), pick the newest by mtime for determinism.
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in resilient_read_dir(projects_root).ok()? {
+        let dir = entry.path();
+        if !dir.is_dir() || dir == target_dir {
+            continue;
+        }
+        let candidate = dir.join(&file_name);
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_mtime)| mtime > *best_mtime)
+        {
+            best = Some((candidate, mtime));
+        }
+    }
+
+    let (source, _) = best?;
+
+    // Materialize the link. Prefer a hard link (same inode → appends by either
+    // path stay in sync, lossless for a live append-only transcript); fall back
+    // to a copy if hard-linking fails (e.g. cross-device).
+    if let Err(e) = std::fs::create_dir_all(&target_dir) {
+        tracing::warn!(target: "session.capture", "relink: cannot create {}: {}", target_dir.display(), e);
+        return None;
+    }
+    if let Err(link_err) = std::fs::hard_link(&source, &target_path) {
+        match std::fs::copy(&source, &target_path) {
+            Ok(_) => {}
+            Err(copy_err) => {
+                tracing::warn!(
+                    target: "session.capture",
+                    "relink: hard_link ({}) and copy ({}) both failed for {} -> {}",
+                    link_err, copy_err, source.display(), target_path.display()
+                );
+                return None;
+            }
+        }
+    }
+    tracing::info!(
+        target: "session.capture",
+        "relink: recovered stranded transcript {} -> {}",
+        source.display(), target_path.display()
+    );
+    Some(target_path)
+}
+
+/// Resolve the live store root + target encoded dir for `project_path`, then
+/// attempt to relink a stranded `<sid>.jsonl` into it (see
+/// [`relink_stranded_transcript`]). Wrapper that the daemon's resume-fallback
+/// path calls; returns the recovered transcript path or `None`.
+pub(crate) fn recover_stranded_transcript(project_path: &str, sid: &str) -> Option<PathBuf> {
+    let claude_home = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude").ok()?;
+    let projects_root = claude_home.join("projects");
+    let canonical = canonicalize_or_raw(project_path);
+    let target_dir_name = encode_claude_project_path(&canonical.to_string_lossy());
+    relink_stranded_transcript(&projects_root, &target_dir_name, sid)
+}
+
 /// Capture Claude Code session ID from the most recently active project directory,
 /// falling back to `.claude.json` if the dir scan result is stale.
 ///
@@ -3184,6 +3286,109 @@ mod tests {
         assert_eq!(
             encode_claude_project_path("/home/user/my project (copy)"),
             "-home-user-my-project--copy-"
+        );
+    }
+
+    // #132: stranded-transcript relink (renamed-cwd #56 sibling).
+
+    #[test]
+    fn test_relink_stranded_transcript_recovers_from_renamed_cwd() {
+        // Simulate a cwd rename: the live transcript sits under the OLD encoded
+        // dir, but Claude will look in the NEW (target) dir. Relink must surface
+        // it under the target so `--resume <sid>` resolves.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let old_dir = root.join("-Users-foo-oldname");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let stranded = old_dir.join(format!("{sid}.jsonl"));
+        std::fs::write(&stranded, b"{\"type\":\"summary\"}\n").unwrap();
+
+        let target = "-Users-foo-newname";
+        let resolved = relink_stranded_transcript(root, target, sid)
+            .expect("should recover stranded transcript");
+
+        // Lands resolvable in the target dir...
+        assert_eq!(resolved, root.join(target).join(format!("{sid}.jsonl")));
+        assert!(resolved.exists());
+        // ...with identical content (hard link or copy fallback).
+        assert_eq!(
+            std::fs::read(&resolved).unwrap(),
+            std::fs::read(&stranded).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_relink_stranded_transcript_noop_when_already_present() {
+        // Already resolvable in the target dir → no-op (None), so the caller
+        // does NOT loop-relaunch.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let target = "-Users-foo-newname";
+        let target_dir = root.join(target);
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join(format!("{sid}.jsonl")), b"x").unwrap();
+
+        assert!(relink_stranded_transcript(root, target, sid).is_none());
+    }
+
+    #[test]
+    fn test_relink_stranded_transcript_noop_when_never_persisted() {
+        // No transcript anywhere (the wma-Jamf "never persisted" class) → None,
+        // so the caller falls through to Status::Error / fresh-start (do NOT
+        // auto-fork).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("-Users-foo-unrelated")).unwrap();
+        assert!(relink_stranded_transcript(root, "-Users-foo-newname", "no-such-sid").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_recover_stranded_transcript_end_to_end_cwd_rename() {
+        // End-to-end reproduction of the `tie_workdir_to_name` rename strand
+        // through the daemon-facing wrapper: real CLAUDE_CONFIG_DIR resolution
+        // + real-path canonicalization + encoding + relink. The transcript is
+        // written under the OLD cwd's encoded dir, then the cwd is renamed; a
+        // resume against the NEW cwd must surface it under the new encoded dir.
+        let cfg = tempfile::tempdir().unwrap();
+        let projects = cfg.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        // A real workspace whose dir is the NEW (post-rename) cwd. Canonicalize
+        // it the same way the wrapper does, so the encoded dir name matches.
+        let ws = tempfile::tempdir().unwrap();
+        let new_cwd = ws.path().join("workdir-newname");
+        std::fs::create_dir_all(&new_cwd).unwrap();
+        let new_cwd_str = new_cwd.to_string_lossy().to_string();
+        let canon = std::fs::canonicalize(&new_cwd).unwrap();
+        let new_dir_name = encode_claude_project_path(&canon.to_string_lossy());
+
+        // Strand the live transcript under a DIFFERENT (old-cwd) encoded dir.
+        let sid = "deadbeef-0000-1111-2222-333344445555";
+        let old_dir = projects.join(format!("{new_dir_name}-OLDNAME"));
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join(format!("{sid}.jsonl")), b"{\"strand\":1}\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", cfg.path());
+
+        let recovered = recover_stranded_transcript(&new_cwd_str, sid);
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+
+        let path = recovered.expect("wrapper should relink the stranded transcript");
+        assert_eq!(
+            path,
+            projects.join(&new_dir_name).join(format!("{sid}.jsonl"))
+        );
+        assert!(
+            path.exists(),
+            "relinked transcript must be resolvable in the new cwd's dir"
         );
     }
 
