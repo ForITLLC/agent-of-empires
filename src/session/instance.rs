@@ -967,6 +967,25 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resume_probe_failed_sid: Option<String>,
 
+    /// #56 fork-recovery loop guard: the last sid for which a dead resume
+    /// pane was auto-recovered via `--fork-session` because its last output
+    /// was Claude's "currently running as a background agent" refusal (a
+    /// stale bg-agent lock, NOT a broken conversation). Keyed per-sid so a
+    /// second death for the same sid falls through to `Error` instead of
+    /// re-forking forever; a genuinely different sid can still be
+    /// fork-recovered once. Persisted so the guard survives a daemon restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_fork_recovered_sid: Option<String>,
+
+    /// Runtime-only one-shot: when set, the next launch appends
+    /// `--fork-session` so resuming a background-agent-locked sid branches a
+    /// context-preserving copy instead of bouncing off the lock. Set and
+    /// cleared synchronously inside `start_with_resume_fallback` (carried
+    /// across the internal `reconcile_from_disk`); never persisted — a daemon
+    /// restart must never silently fork.
+    #[serde(default, skip_serializing)]
+    pub(crate) fork_next_launch: bool,
+
     /// User intent gating `acquire_session_id`. See `ResumeIntent` for
     /// semantics. Non-`Default` values (`Use`, `Cleared`) are written only
     /// by user-initiated CLI commands; daemon-internal paths demote to
@@ -1211,6 +1230,17 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
         }
         crate::agents::YoloMode::EnvVar(..) | crate::agents::YoloMode::AlwaysYolo => {}
     }
+}
+
+/// True when a dead Claude pane's captured output is the
+/// "currently running as a background agent" resume refusal rather than a
+/// genuine crash. Claude prints this (and suggests `--fork-session`) when a
+/// sid is resumed while it is still registered as a live background agent — a
+/// stale lock, not a broken conversation. Matched case-insensitively on the
+/// stable substring so wrapping/wording drift around it does not defeat it.
+fn pane_shows_background_agent_lock(pane: &str) -> bool {
+    pane.to_lowercase()
+        .contains("running as a background agent")
 }
 
 fn build_resume_flags(tool: &str, session_id: &str, is_existing_session: bool) -> String {
@@ -1640,6 +1670,8 @@ impl Instance {
             omp_capture_generation: None,
             lifecycle_generation: 0,
             resume_probe_failed_sid: None,
+            resume_fork_recovered_sid: None,
+            fork_next_launch: false,
             resume_intent: ResumeIntent::Default,
             force_fresh_next_launch: false,
             source_profile: String::new(),
@@ -1895,6 +1927,15 @@ impl Instance {
         disk.source_profile = std::mem::take(&mut self.source_profile);
         disk.ever_confirmed_present = self.ever_confirmed_present;
         disk.unknown_since = self.unknown_since;
+        // #56: carry the one-shot fork flag (runtime-only, so disk loads it
+        // false) and the fork-recovery guard (set in-memory just before this
+        // reload and only ever written by the daemon-internal recovery path,
+        // never a peer) forward, so `apply_session_flags` sees `fork_next_launch`
+        // on the relaunch and the guard is not wiped before it is persisted.
+        disk.fork_next_launch = self.fork_next_launch;
+        if self.resume_fork_recovered_sid.is_some() {
+            disk.resume_fork_recovered_sid = self.resume_fork_recovered_sid.take();
+        }
         // `before_start_env` is `#[serde(skip)]`, so the disk snapshot always
         // has it empty. Carry the live value forward; otherwise this reload
         // (which runs before every launch) would wipe the host-minted cache and
@@ -3581,6 +3622,16 @@ impl Instance {
         }
         let emitted =
             append_resume_flags(&self.tool, session_id.as_deref(), is_existing, cmd, context);
+        // #56: one-shot fork recovery. When `start_with_resume_fallback`
+        // detected a stale background-agent lock it set `fork_next_launch`;
+        // branch a context-preserving copy off the resumed sid rather than
+        // bouncing off the lock again. Claude-only and only when a `--resume`
+        // was actually emitted (the flag is meaningless without it).
+        if emitted && is_existing && self.fork_next_launch && self.tool == "claude" {
+            cmd.push_str(" --fork-session");
+            tracing::debug!(target: "session.store",
+                "Appended --fork-session for {} (bg-agent-lock fork recovery)", context);
+        }
         is_existing && emitted
     }
 
@@ -6362,6 +6413,61 @@ impl Instance {
         };
         if probe == ProbeResult::Alive {
             return Ok(StartOutcome::Resumed);
+        }
+
+        // #56 durable recovery: a dead Claude resume pane whose last output is
+        // the "currently running as a background agent" refusal is a STALE
+        // bg-agent lock, not a crashed conversation. Claude itself prescribes
+        // the fix (`--fork-session` to branch off a copy). Auto-recover ONCE
+        // per sid — preserving the full conversation, since a fork copies the
+        // transcript — instead of erroring out and waiting for a human retry.
+        // Loop-safe: the per-sid guard means a fork that also dies (or any
+        // second death of the same sid) falls through to the Error path below.
+        if self.tool == "claude"
+            && self.resume_fork_recovered_sid.as_deref() != Some(stale_sid.as_str())
+            && self
+                .tmux_session()
+                .ok()
+                .and_then(|s| s.capture_pane(50).ok())
+                .is_some_and(|pane| pane_shows_background_agent_lock(&pane))
+        {
+            tracing::warn!(
+                target: "session.store",
+                "start: sid {} for {} hit a stale background-agent lock; \
+                 auto-recovering via --fork-session (one-shot, context preserved)",
+                stale_sid,
+                self.id,
+            );
+            self.resume_fork_recovered_sid = Some(stale_sid.clone());
+            self.stop_poller();
+            self.session_id_poller = None;
+            self.kill_clean().with_context(|| {
+                format!("kill_clean before fork-session recovery for {}", self.id)
+            })?;
+            // One-shot fork flag, consumed by `apply_session_flags` on the
+            // relaunch below; carried across the internal `reconcile_from_disk`.
+            self.fork_next_launch = true;
+            let relaunch = self.start_with_size_opts(size, skip_on_launch);
+            self.fork_next_launch = false;
+            let _ = relaunch.with_context(|| format!("fork-session relaunch for {}", self.id))?;
+            // The forked launch mints a NEW sid; drop the now-locked pin so a
+            // later restart resumes the fork (poller-observed) rather than the
+            // locked original, preventing a re-fork loop.
+            if matches!(self.resume_intent, ResumeIntent::Use(ref s) if s == &stale_sid) {
+                self.resume_intent = ResumeIntent::Default;
+            }
+            match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
+                Ok(ProbeResult::Alive) => return Ok(StartOutcome::Resumed),
+                Ok(ProbeResult::Dead) | Err(_) => {
+                    tracing::warn!(
+                        target: "session.store",
+                        "fork-session recovery for {} also failed to settle; \
+                         falling through to Error (guard set, no re-fork)",
+                        self.id,
+                    );
+                    // fall through to the standard resume-failure handling
+                }
+            }
         }
 
         tracing::warn!(
@@ -11440,6 +11546,24 @@ mod tests {
         // `~/.claude`.
         let (session_id, _is_existing) = inst.acquire_session_id();
         assert_eq!(session_id, Some("session-42".to_string()));
+    }
+
+    #[test]
+    fn test_pane_shows_background_agent_lock() {
+        // #56: the real Claude refusal printed into a dead resume pane.
+        let locked = "Session 8441e0af is currently running as a background \
+                      agent (bg). Use `claude agents` to manage it, or add \
+                      --fork-session to branch off a copy.";
+        assert!(pane_shows_background_agent_lock(locked));
+        // Case-insensitive on the stable substring.
+        assert!(pane_shows_background_agent_lock(
+            "...RUNNING AS A BACKGROUND AGENT..."
+        ));
+        // A genuine crash / unrelated output must NOT trigger fork recovery.
+        assert!(!pane_shows_background_agent_lock(
+            "thread 'main' panicked at src/main.rs:1: boom"
+        ));
+        assert!(!pane_shows_background_agent_lock(""));
     }
 
     #[test]

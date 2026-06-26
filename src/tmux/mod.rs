@@ -1846,14 +1846,10 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_basic() {
-<<<<<<< HEAD
-        let output = format!("{P}my_proj_abc12345|0|0|claude|claude\n");
-=======
-        // 6-field format:
-        // name|index|pane_dead|pane_dead_status|pane_dead_signal|command.
-        // A live pane reports an empty pane_dead_status AND pane_dead_signal.
-        let output = format!("{P}my_proj_abc12345|0|0|||claude\n");
->>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
+        // 7-field format: name|index|pane_dead|pane_dead_status|
+        // pane_dead_signal|command|start_command. A live pane reports an
+        // empty pane_dead_status AND pane_dead_signal.
+        let output = format!("{P}my_proj_abc12345|0|0|||claude|claude\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
@@ -1867,8 +1863,8 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_protected_wrapper_shell_is_not_stale() {
         let output = format!(
-            "{P}protected_abc12345|0|0|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
-             {P}interactive_def67890|0|0|sh|sh\n"
+            "{P}protected_abc12345|0|0|||sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
+             {P}interactive_def67890|0|0|||sh|sh\n"
         );
         let map = parse_pane_metadata(&output);
 
@@ -1891,13 +1887,9 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_dead_pane() {
-<<<<<<< HEAD
-        let output = format!("{P}proj_abc12345|0|1|bash|bash\n");
-=======
         // A normally-exited dead pane carries its exit status in
         // pane_dead_status and no signal.
-        let output = format!("{P}proj_abc12345|0|1|137||bash\n");
->>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
+        let output = format!("{P}proj_abc12345|0|1|137||bash|bash\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_dead);
@@ -1911,7 +1903,7 @@ mod tests {
         // pane_dead_status and the signal NAME in pane_dead_signal. The signal
         // must parse to its number (kill = 9); the daemon then surfaces it as
         // the POSIX 128+9 = 137 exit code.
-        let output = format!("{P}proj_abc12345|0|1||kill|sleep\n");
+        let output = format!("{P}proj_abc12345|0|1||kill|sleep|sleep\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_dead);
@@ -1931,14 +1923,9 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_filters_non_aoe_sessions() {
-<<<<<<< HEAD
         let output = format!(
-            "user_session|0|0|bash|bash\n{P}proj_abc12345|0|0|claude|claude\nmy_tmux|0|0|vim|vim\n"
+            "user_session|0|0|||bash|bash\n{P}proj_abc12345|0|0|||claude|claude\nmy_tmux|0|0|||vim|vim\n"
         );
-=======
-        let output =
-            format!("user_session|0|0|||bash\n{P}proj_abc12345|0|0|||claude\nmy_tmux|0|0|||vim\n");
->>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         assert!(map.contains_key(&format!("{P}proj_abc12345")));
@@ -1946,12 +1933,9 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_filters_non_zero_panes() {
-<<<<<<< HEAD
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|1|0|bash|bash\n");
-=======
-        let output = format!("{P}proj_abc12345|0|0|||claude\n{P}proj_abc12345|1|0|||bash\n");
->>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
+        let output = format!(
+            "{P}proj_abc12345|0|0|||claude|claude\n{P}proj_abc12345|1|0|||bash|bash\n"
+        );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -1961,12 +1945,9 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_first_window_wins() {
         // Two windows both have pane 0, first window's data should be kept
-<<<<<<< HEAD
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|0|1|bash|bash\n");
-=======
-        let output = format!("{P}proj_abc12345|0|0|||claude\n{P}proj_abc12345|0|1|0||bash\n");
->>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
+        let output = format!(
+            "{P}proj_abc12345|0|0|||claude|claude\n{P}proj_abc12345|0|1|0||bash|bash\n"
+        );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -1982,24 +1963,16 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_malformed_lines() {
-<<<<<<< HEAD
-        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|claude|claude\n\n");
-=======
-        // "too|few|fields" has 3 fields (< 6) and is dropped; the valid line
-        // carries the full 6.
-        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|||claude\n\n");
->>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
+        // "too|few|fields" has 3 fields (< 7) and is dropped; the valid line
+        // carries the full 7.
+        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|||claude|claude\n\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn test_parse_pane_metadata_empty_command() {
-<<<<<<< HEAD
-        let output = format!("{P}proj_abc12345|0|0||sh\n");
-=======
-        let output = format!("{P}proj_abc12345|0|0|||\n");
->>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
+        let output = format!("{P}proj_abc12345|0|0||||sh\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_current_command.is_none());
@@ -2008,11 +1981,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_multiple_sessions() {
         let output = format!(
-<<<<<<< HEAD
-            "{P}proj_a_abc12345|0|0|claude|claude\n{P}proj_b_def67890|0|0|opencode|opencode\n{P}proj_c_ghi11111|0|1|bash|bash\n"
-=======
-            "{P}proj_a_abc12345|0|0|||claude\n{P}proj_b_def67890|0|0|||opencode\n{P}proj_c_ghi11111|0|1|143||bash\n"
->>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
+            "{P}proj_a_abc12345|0|0|||claude|claude\n{P}proj_b_def67890|0|0|||opencode|opencode\n{P}proj_c_ghi11111|0|1|143||bash|bash\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 3);
