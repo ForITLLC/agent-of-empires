@@ -218,6 +218,16 @@ fn claude_blocking_prompt_rule(
     if claude_has_resume_picker(recent) {
         return Some("resume_picker");
     }
+    // A usage-limit banner or a device-code/login wait must also outrank the
+    // spinner. When a subscription account caps mid-turn the live turn is
+    // severed but the hook stays stuck at `running` and no spinner remains;
+    // when a tool prints a device-code login the session blocks on an
+    // out-of-band browser action. Both otherwise read as Running/Idle and the
+    // operator assumes work is progressing (the bug Ben hit). Surface as
+    // Waiting (tier 0) so they sort to the top for attention.
+    if claude_has_blocking_status_banner(recent) {
+        return Some("blocking_status_banner");
+    }
     None
 }
 
@@ -855,8 +865,92 @@ fn claude_pane_has_resume_picker(raw_content: &str) -> bool {
     claude_has_resume_picker(&recent)
 }
 
+/// Claude Code prints a usage-limit banner when a subscription account hits its
+/// 5-hour or weekly cap mid-turn: the live turn is severed and a "usage limit
+/// reached … resets <time>" line replaces the spinner. No Stop/idle hook fires
+/// when the turn is cut by the limit, so the agent-self-reported status stays
+/// stuck at its last `running` write, and the pane shows no spinner / no "esc to
+/// interrupt" — so without this the daemon masks a capped session as actively
+/// working and the operator assumes work is progressing when nothing is.
+///
+/// Match is *line-anchored*, not a bare substring: a real banner is its OWN line
+/// that begins with the limit phrase ("Claude usage limit reached.", "5-hour
+/// limit reached ∙ resets 3pm"), whereas a pane that merely discusses limits in
+/// prose embeds the phrase mid-sentence ("...forit-main acct usage limit
+/// reached, weekly cap..."). Anchoring on the line start keeps that scrollback
+/// prose from flipping an actively-running session to Waiting. Leading
+/// non-alphanumerics (indent, the `∙`/`>` glyphs) are trimmed before the match.
+fn claude_line_is_limit_banner(line: &str) -> bool {
+    let l = line
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    l.starts_with("claude usage limit reached")
+        || l.starts_with("usage limit reached")
+        || l.starts_with("you've hit your usage limit")
+        || l.starts_with("you've hit your weekly limit")
+        || l.starts_with("you have hit your usage limit")
+        || l.starts_with("you have hit your weekly limit")
+        || l.starts_with("5-hour limit reached")
+        || l.starts_with("weekly limit reached")
+        || l.starts_with("approaching your usage limit")
+        || l.starts_with("upgrade to increase your usage limit")
+}
+
+/// A device-code / login prompt parks the session waiting on an out-of-band
+/// browser auth (Azure AD device-code, GitHub device flow, `gcloud`/`claude`
+/// OAuth) that the daemon can't see and no hook reports, so the session reads
+/// Running/Idle while it is really stuck needing the operator to authenticate.
+/// Ben flagged device-code waits as "incredibly unreliable" to notice. Treat it
+/// as a blocking wait. The URL / one-time-code shapes are distinctive enough
+/// that a prose mention is unlikely; the generic "enter the code" form is
+/// anchored with "to authenticate" to avoid false positives.
+fn claude_has_device_code_prompt(tail_lower: &str) -> bool {
+    tail_lower.contains("microsoft.com/devicelogin")
+        || tail_lower.contains("github.com/login/device")
+        || tail_lower.contains("/login/device")
+        || tail_lower.contains("first copy your one-time code")
+        || tail_lower.contains("to sign in, use a web browser")
+        || (tail_lower.contains("enter the code") && tail_lower.contains("to authenticate"))
+}
+
+/// True when the pane shows a blocking usage-limit banner or a device-code/login
+/// wait — both are states the operator must act on but which the spinner/hook
+/// pipeline would otherwise mask as Running (the "assume it's working" trap Ben
+/// hit). The limit banner is matched line-anchored (see
+/// `claude_line_is_limit_banner`), so it is safe to scan the full recent window.
+/// The device-code shapes are distinctive URLs/codes but are matched as
+/// substrings, so they are restricted to the last few non-empty lines (the
+/// prompt renders at the bottom when live) to keep an older scrollback mention
+/// from firing. Shared by `detect_claude_status` (pane-fallback path) and
+/// `reconcile_claude_hook_status` (hook-Running downgrade).
+fn claude_has_blocking_status_banner(recent: &[&str]) -> bool {
+    if recent.iter().any(|line| claude_line_is_limit_banner(line)) {
+        return true;
+    }
+    let tail_lower = recent
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .copied()
+        .collect::<Vec<&str>>()
+        .join("\n")
+        .to_lowercase();
+    claude_has_device_code_prompt(&tail_lower)
+}
+
+/// Strip ANSI and scan the recent pane lines for a blocking status banner.
+/// Mirrors `claude_pane_has_resume_picker` for callers holding raw
+/// `capture-pane -e` output.
+fn claude_pane_has_blocking_status_banner(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
+    claude_has_blocking_status_banner(&recent)
+}
+
 /// When Claude's status hook reports Running, the pane is consulted to catch
-/// four cases the hook stream can't express on its own:
+/// the blocking states the hook stream can't express on its own:
 ///
 /// 1. A blocking prompt the user must answer: a tool-permission approval prompt
 ///    or an `AskUserQuestion` selection UI. Claude keeps its live spinner
@@ -869,11 +963,15 @@ fn claude_pane_has_resume_picker(raw_content: &str) -> bool {
 ///    input-wait whose recycled pane never relaunched Claude, so no newer hook
 ///    fired and the daemon masks a frozen session as Running. Downgrade to
 ///    Waiting.
-/// 3. An Esc-interrupted turn: cancelling a turn fires no `Stop` and no
+/// 3. A usage-limit banner or device-code/login wait that severs the turn
+///    without firing a Stop hook, leaving the status stuck at `running` with no
+///    spinner. Downgrade to Waiting so the stalled session sorts up for
+///    attention.
+/// 4. An Esc-interrupted turn: cancelling a turn fires no `Stop` and no
 ///    `idle_prompt`, so the status file sticks on `running` indefinitely.
 ///    Downgrade to Idle when the pane shows the interrupt banner and no
 ///    active-turn signal.
-/// 4. A completed turn whose idle hook never fired (the "silent tool stop":
+/// 5. A completed turn whose idle hook never fired (the "silent tool stop":
 ///    a tool result with no following text fires neither `Stop` nor
 ///    `idle_prompt`). The pane parks at the idle ready prompt with no
 ///    active-turn signal, but that is also how a just-started turn looks
@@ -2948,6 +3046,93 @@ enter to select · esc to cancel";
         assert_eq!(detect_claude_status(prose), Status::Running);
         assert_eq!(
             reconcile_claude_hook_status(Status::Running, prose),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_weekly_limit_banner() {
+        // Ben's bug: a subscription account caps mid-turn, the live turn is
+        // severed, and the daemon kept reporting the session as Running ("in
+        // progress") so the operator assumed work was progressing. The cap
+        // banner must outrank any residual spinner/interrupt text and read as
+        // Waiting (tier 0).
+        let content = "\
+  Generating the report…
+
+  Claude usage limit reached. You've hit your weekly limit.
+  Your limit will reset on Jul 1 at 8am.
+  esc to interrupt";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_5_hour_limit_compact_banner() {
+        // The compact "5-hour limit reached ∙ resets <time>" form, whatever the
+        // separator glyph: matched by the (limit reached AND reset) shape.
+        let content = "\
+✶ Working… (12s · ↓ 2.1k tokens)
+  5-hour limit reached ∙ resets 3pm (America/Los_Angeles)";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_device_code_microsoft() {
+        // A device-code login parks the session on an out-of-band browser auth
+        // the daemon can't see — Ben flagged these as "incredibly unreliable"
+        // to notice. Surface as Waiting.
+        let content = "\
+  To sign in, use a web browser to open the page https://microsoft.com/devicelogin
+  and enter the code F7X9K2Q2 to authenticate.";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_device_code_github() {
+        let content = "\
+  ! First copy your one-time code: A1B2-C3D4
+  Press Enter to open github.com/login/device in your browser...";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_on_limit_banner() {
+        // The hook is stuck at `running` (the limit cut the turn before any
+        // Stop/idle hook fired). The reconciler must downgrade to Waiting so
+        // the health view stops masking the capped session as working. ANSI
+        // preserved to exercise the strip path live capture goes through.
+        let pane = "\x1b[2m  Claude usage limit reached. Your limit will reset at 3pm.\x1b[0m";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_on_device_code() {
+        let pane = "  To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code F7X9K2Q2 to authenticate.";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_limit_banner_not_confused_by_scrollback_prose() {
+        // A pane that merely *discusses* usage limits in older scrollback (a
+        // fleet capacity message) but is actively running must stay Running:
+        // the banner scan only looks at the last few non-empty lines, so the
+        // live spinner + interrupt hint at the bottom still win.
+        let content = "\
+  Commander WO: forit-main acct usage limit reached, weekly cap till Jul 1.
+  Repointing the default draw to gna-main for now.
+  Reading config.toml…
+  Patched default_profile.
+✶ Working… (4s · ↓ 88 tokens)
+  esc to interrupt";
+        assert_eq!(detect_claude_status(content), Status::Running);
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, content),
             Status::Running
         );
     }
