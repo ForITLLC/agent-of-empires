@@ -1120,6 +1120,30 @@ pub fn get_process_env_var(pid: u32, key: &str) -> Option<String> {
     parse_env_var_from_ps(&String::from_utf8_lossy(&output.stdout), key)
 }
 
+/// Resolve an environment variable for a pane by reading the pane process AND
+/// its descendant tree, returning the first hit. The pane's own pid is the
+/// agent in the common case (claude is the tmux pane primary), but a shell
+/// wrapper can leave the var only on a child — walking the tree makes the LIVE
+/// read robust the same way the fleet placement-audit's `acct_of` does.
+///
+/// `None` only when neither the pane pid nor any descendant carries the var (or
+/// the process tree is gone). Callers treat `None` as "unverified" — they must
+/// NOT fall back to a stale, spawn-baked label, since that is exactly the value
+/// that diverges from the live binding.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn get_env_var_in_tree(pid: u32, key: &str) -> Option<String> {
+    if let Some(v) = get_process_env_var(pid, key) {
+        return Some(v);
+    }
+    #[cfg(target_os = "linux")]
+    let tree = linux::collect_pid_tree(pid);
+    #[cfg(target_os = "macos")]
+    let tree = macos::collect_pid_tree(pid);
+    tree.into_iter()
+        .filter(|&p| p != pid)
+        .find_map(|p| get_process_env_var(p, key))
+}
+
 #[cfg(test)]
 mod env_parse_tests {
     use super::parse_env_var_from_ps;
@@ -1152,5 +1176,29 @@ mod env_parse_tests {
             parse_env_var_from_ps(out, "CLAUDE_CONFIG_DIR").as_deref(),
             Some("/real/env/forit-main")
         );
+    }
+
+    // A spawned child inherits its environment at EXEC time, which is exactly
+    // what `ps -E` reports (the kernel's saved environ — runtime setenv is NOT
+    // visible to ps, so a self-env test cannot use std::env::set_var). Spawn a
+    // short-lived child WITH the var set and read it back through the real
+    // `ps`-backed tree walk, covering get_env_var_in_tree end-to-end.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn reads_spawned_child_env_via_tree() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .env("AOE_DIVERGENCE_SELFTEST", "live-value-42")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let got = super::get_env_var_in_tree(pid, "AOE_DIVERGENCE_SELFTEST");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(got.as_deref(), Some("live-value-42"));
     }
 }

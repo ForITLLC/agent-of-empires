@@ -55,6 +55,16 @@ pub struct ListArgs {
     /// `GET /api/sessions?state=`.
     #[arg(long, value_enum, default_value_t = StateFilter::All)]
     state: StateFilter,
+
+    /// (JSON only) For each session, read the LIVE `CLAUDE_CONFIG_DIR` from its
+    /// running pane (ground truth) and add `live_config_dir` + `label_diverged`
+    /// fields. `label_diverged` is true when the live account differs from what
+    /// the session's registry profile resolves to — i.e. the registry label is
+    /// LYING about which account the worker actually runs on. Off by default
+    /// because it shells `ps` per session; fleet placement-audit / cap-triage
+    /// pass it to attribute caps by ground truth instead of the stale label.
+    #[arg(long)]
+    check_divergence: bool,
 }
 
 /// Simple string tag describing whether a session is live/archived/trashed,
@@ -106,6 +116,31 @@ struct SessionJson {
     workspace_repos: Vec<WorkspaceRepoJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worktree: Option<WorktreeJson>,
+    /// Populated ONLY with `--check-divergence`. The LIVE `CLAUDE_CONFIG_DIR`
+    /// read from the running pane's process tree (ground truth). `None` when the
+    /// session has no live pane or the env couldn't be read — consumers treat
+    /// `None` as "unverified", NOT as agreement with the label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_config_dir: Option<String>,
+    /// Populated ONLY with `--check-divergence`. `Some(true)` when the live
+    /// account differs from what the registry `profile` resolves to (the label
+    /// is lying); `Some(false)` when they agree; `None` when unverifiable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label_diverged: Option<bool>,
+}
+
+/// Resolve `(live_config_dir, label_diverged)` for one session under a given
+/// registry profile, when `--check-divergence` is requested. Reuses the SAME
+/// divergence definition the `aoe session move` rebind path uses, so "diverged"
+/// means one thing fleet-wide. `live=None` (no live pane / unreadable) yields
+/// `label_diverged=None` — explicitly "unverified", never a false agreement.
+fn divergence_for(inst: &Instance, profile: &str) -> (Option<String>, Option<bool>) {
+    let live = super::session::live_config_dir(inst);
+    let expected = super::session::expected_config_dir(profile);
+    let diverged = live
+        .as_deref()
+        .map(|l| super::session::config_dir_diverged(Some(l), expected.as_deref()));
+    (live, diverged)
 }
 
 #[derive(Serialize)]
@@ -133,7 +168,12 @@ fn worktree_for(inst: &Instance) -> Option<WorktreeJson> {
     })
 }
 
-fn session_json(inst: &Instance, profile: &str) -> SessionJson {
+fn session_json(inst: &Instance, profile: &str, check_divergence: bool) -> SessionJson {
+    let (live_config_dir, label_diverged) = if check_divergence {
+        divergence_for(inst, profile)
+    } else {
+        (None, None)
+    };
     SessionJson {
         id: inst.id.clone(),
         title: inst.title.clone(),
@@ -148,6 +188,8 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
         archived_at: inst.archived_at,
         workspace_repos: workspace_repos_for(inst),
         worktree: worktree_for(inst),
+        live_config_dir,
+        label_diverged,
     }
 }
 
@@ -253,7 +295,7 @@ fn table_shows_state(scope: SessionScope) -> bool {
 pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     let scope: SessionScope = args.state.into();
     if args.all {
-        return run_all_profiles(args.json, scope).await;
+        return run_all_profiles(args.json, scope, args.check_divergence).await;
     }
 
     let storage = Storage::open_unwatched(profile)?;
@@ -271,7 +313,7 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     if args.json {
         let sessions: Vec<SessionJson> = instances
             .iter()
-            .map(|inst| session_json(inst, storage.profile()))
+            .map(|inst| session_json(inst, storage.profile(), args.check_divergence))
             .collect();
         super::output::print_json(&sessions)?;
         return Ok(());
@@ -295,7 +337,7 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
+async fn run_all_profiles(json: bool, scope: SessionScope, check_divergence: bool) -> Result<()> {
     let profiles = crate::session::list_profiles()?;
 
     if profiles.is_empty() {
@@ -312,7 +354,7 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
                         if !SessionScope::matches(Some(scope), inst) {
                             continue;
                         }
-                        all_sessions.push(session_json(inst, profile_name));
+                        all_sessions.push(session_json(inst, profile_name, check_divergence));
                     }
                 }
             }
@@ -381,7 +423,7 @@ mod tests {
     fn session_json_exposes_state_and_trashed_at_for_a_trashed_row() {
         let mut inst = Instance::new("z", "/repo");
         inst.trash();
-        let json = session_json(&inst, "p");
+        let json = session_json(&inst, "p", false);
         assert_eq!(json.state, "trashed");
         assert!(json.trashed_at.is_some());
         assert!(json.archived_at.is_none());
@@ -394,7 +436,7 @@ mod tests {
     fn session_json_exposes_state_and_archived_at_for_an_archived_row() {
         let mut inst = Instance::new("z", "/repo");
         inst.archive();
-        let json = session_json(&inst, "p");
+        let json = session_json(&inst, "p", false);
         assert_eq!(json.state, "archived");
         assert!(json.archived_at.is_some());
         assert!(json.trashed_at.is_none());
@@ -409,7 +451,7 @@ mod tests {
     #[test]
     fn session_json_omits_absent_timestamps_and_keeps_state_alive() {
         let inst = Instance::new("z", "/repo");
-        let json = session_json(&inst, "p");
+        let json = session_json(&inst, "p", false);
         assert_eq!(json.state, "live");
         let serialized = serde_json::to_string(&json).unwrap();
         assert!(!serialized.contains("trashed_at"));

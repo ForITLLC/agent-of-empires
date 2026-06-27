@@ -479,10 +479,18 @@ fn find_session_across_profiles(identifier: &str) -> Result<(String, crate::sess
 /// (`KEY=value` entries). `None` when the list carries no such entry. Symlink
 /// canonicalization is intentionally NOT done here; callers canonicalize the
 /// live and expected paths before comparing so this stays a pure string pluck.
-fn extract_config_dir(environment: &[String]) -> Option<String> {
+pub(crate) fn extract_config_dir(environment: &[String]) -> Option<String> {
     environment
         .iter()
         .find_map(|e| e.strip_prefix("CLAUDE_CONFIG_DIR=").map(|v| v.to_string()))
+}
+
+/// The CLAUDE_CONFIG_DIR a profile's account binding resolves to, or `None`
+/// when the profile pins no explicit config dir (sessions then fall through to
+/// plain `~/.claude`). Shared by the move path and `aoe list --check-divergence`
+/// so both compute "what the registry label CLAIMS" identically.
+pub(crate) fn expected_config_dir(profile: &str) -> Option<String> {
+    extract_config_dir(&crate::session::profile_config::resolve_config_or_warn(profile).environment)
 }
 
 /// Canonicalize a config-dir path through symlinks so a compat-alias dir (e.g.
@@ -500,20 +508,22 @@ fn canon_config_dir(path: &str) -> String {
 /// different (after canonicalization): an unreadable live binding (`None`, e.g.
 /// a stopped session or a pane we can't inspect) fails SAFE to "not diverged",
 /// so the move never forces a spurious restart on a session it can't observe.
-fn config_dir_diverged(live: Option<&str>, expected: Option<&str>) -> bool {
+pub(crate) fn config_dir_diverged(live: Option<&str>, expected: Option<&str>) -> bool {
     match (live, expected) {
         (Some(l), Some(e)) => canon_config_dir(l) != canon_config_dir(e),
         _ => false,
     }
 }
 
-/// Read the LIVE `CLAUDE_CONFIG_DIR` the session's running pane was launched
-/// with, by inspecting its pane process environment. `None` when the session
-/// has no live pane or the env can't be read (caller fails safe to no-divergence).
-fn live_config_dir(inst: &crate::session::Instance) -> Option<String> {
+/// Read the LIVE `CLAUDE_CONFIG_DIR` the session's running pane is bound to, by
+/// inspecting the pane process AND its descendant tree (ground truth — the same
+/// read the fleet placement-audit does). `None` when the session has no live
+/// pane or the env can't be read anywhere in the tree (caller fails safe to
+/// no-divergence / "unverified").
+pub(crate) fn live_config_dir(inst: &crate::session::Instance) -> Option<String> {
     let session = inst.tmux_session().ok()?;
     let pid = crate::process::get_pane_pid(session.name())?;
-    crate::process::get_process_env_var(pid, "CLAUDE_CONFIG_DIR")
+    crate::process::get_env_var_in_tree(pid, "CLAUDE_CONFIG_DIR")
 }
 
 /// Relocate a session's record cross-profile, then re-bind the live account.
@@ -553,9 +563,7 @@ async fn move_session(args: MoveArgs) -> Result<()> {
         // compare the LIVE CLAUDE_CONFIG_DIR against what the target profile
         // resolves; when they diverge, perform the same restart+rebind a
         // cross-profile move would, so a single call rescues it.
-        let expected = extract_config_dir(
-            &crate::session::profile_config::resolve_config_or_warn(&target).environment,
-        );
+        let expected = expected_config_dir(&target);
         let live = live_config_dir(&record);
         if !args.no_restart && config_dir_diverged(live.as_deref(), expected.as_deref()) {
             println!(
