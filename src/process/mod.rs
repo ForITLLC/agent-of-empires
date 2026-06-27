@@ -1082,3 +1082,75 @@ mod tests {
         assert!(output.status.success());
     }
 }
+
+/// Parse a single `KEY=value` entry out of `ps -E` output. The `-E` flag
+/// appends the process environment inline after the command, space-separated,
+/// so each variable shows up as a whitespace-delimited `KEY=value` token. We
+/// match the LAST occurrence: `ps` prints the argv first (which can legitimately
+/// contain `KEY=...` arguments) and the real environment block comes after, so
+/// the final hit is the environment value. Split into a pure function so the
+/// parse is unit-testable without spawning `ps`.
+fn parse_env_var_from_ps(ps_output: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    ps_output
+        .split_whitespace()
+        .filter_map(|tok| tok.strip_prefix(&needle))
+        .next_back()
+        .map(|v| v.to_string())
+}
+
+/// Read a single environment variable from a RUNNING process by parsing
+/// `ps -wwwE -p <pid>`. macOS/Linux. Returns `None` when the variable is
+/// unset, the process is gone, or `ps` can't be inspected.
+///
+/// This observes the LIVE binding a pane was actually launched with, which can
+/// diverge from what the session's profile would resolve, e.g. a pane respawned
+/// out-of-band (a `cx-restart` baking a pinned `CLAUDE_CONFIG_DIR`, or a
+/// `--fork-session` recovery) runs under a different account than its registry
+/// label implies. The session-move path uses it to detect that divergence.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn get_process_env_var(pid: u32, key: &str) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-wwwE", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_env_var_from_ps(&String::from_utf8_lossy(&output.stdout), key)
+}
+
+#[cfg(test)]
+mod env_parse_tests {
+    use super::parse_env_var_from_ps;
+
+    #[test]
+    fn extracts_config_dir_from_ps_environment_block() {
+        // `ps -E` appends the env after the command, space-separated.
+        let out = "  PID TTY      TIME CMD\n\
+                   50524 ??   0:12.34 claude --resume abc --fork-session \
+                   PATH=/usr/bin CLAUDE_CONFIG_DIR=/Users/me/.claude-accounts/forit-backup TERM=xterm\n";
+        assert_eq!(
+            super::parse_env_var_from_ps(out, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/Users/me/.claude-accounts/forit-backup")
+        );
+    }
+
+    #[test]
+    fn missing_var_is_none() {
+        let out = "  PID TTY TIME CMD\n50524 ?? 0:00 claude PATH=/usr/bin\n";
+        assert_eq!(parse_env_var_from_ps(out, "CLAUDE_CONFIG_DIR"), None);
+    }
+
+    #[test]
+    fn prefers_environment_value_over_an_argv_lookalike() {
+        // A `KEY=...` that appears as a command ARG must not shadow the real
+        // environment value, which `ps -E` prints last.
+        let out = "50524 ?? 0:00 mytool --set CLAUDE_CONFIG_DIR=/argv/decoy \
+                   CLAUDE_CONFIG_DIR=/real/env/forit-main\n";
+        assert_eq!(
+            parse_env_var_from_ps(out, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/real/env/forit-main")
+        );
+    }
+}

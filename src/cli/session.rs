@@ -475,6 +475,47 @@ fn find_session_across_profiles(identifier: &str) -> Result<(String, crate::sess
     }
 }
 
+/// Pull the `CLAUDE_CONFIG_DIR` value out of a resolved host-environment list
+/// (`KEY=value` entries). `None` when the list carries no such entry. Symlink
+/// canonicalization is intentionally NOT done here; callers canonicalize the
+/// live and expected paths before comparing so this stays a pure string pluck.
+fn extract_config_dir(environment: &[String]) -> Option<String> {
+    environment
+        .iter()
+        .find_map(|e| e.strip_prefix("CLAUDE_CONFIG_DIR=").map(|v| v.to_string()))
+}
+
+/// Canonicalize a config-dir path through symlinks so a compat-alias dir (e.g.
+/// `.claude-accounts/pivot-main` -> `gna-main`) compares equal to its real
+/// target and never reads as a spurious divergence. Fail-soft to the raw string
+/// when the path can't be resolved (missing dir / not a symlink both no-op).
+fn canon_config_dir(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Decide whether a session's LIVE account binding has diverged from what its
+/// target profile would assign. Divergence requires BOTH sides known AND
+/// different (after canonicalization): an unreadable live binding (`None`, e.g.
+/// a stopped session or a pane we can't inspect) fails SAFE to "not diverged",
+/// so the move never forces a spurious restart on a session it can't observe.
+fn config_dir_diverged(live: Option<&str>, expected: Option<&str>) -> bool {
+    match (live, expected) {
+        (Some(l), Some(e)) => canon_config_dir(l) != canon_config_dir(e),
+        _ => false,
+    }
+}
+
+/// Read the LIVE `CLAUDE_CONFIG_DIR` the session's running pane was launched
+/// with, by inspecting its pane process environment. `None` when the session
+/// has no live pane or the env can't be read (caller fails safe to no-divergence).
+fn live_config_dir(inst: &crate::session::Instance) -> Option<String> {
+    let session = inst.tmux_session().ok()?;
+    let pid = crate::process::get_pane_pid(session.name())?;
+    crate::process::get_process_env_var(pid, "CLAUDE_CONFIG_DIR")
+}
+
 /// Relocate a session's record cross-profile, then re-bind the live account.
 ///
 /// Profile is resolved from the session itself (via
@@ -502,6 +543,36 @@ async fn move_session(args: MoveArgs) -> Result<()> {
     let title = record.title.clone();
 
     if owner == target {
+        // The registry label already equals the target, but the session can
+        // STILL be stranded: a pane respawned out-of-band (a `cx-restart` that
+        // baked a pinned `CLAUDE_CONFIG_DIR`, or a `--fork-session` recovery)
+        // runs under a DIFFERENT live account than the label implies. The old
+        // code no-op'd here ("already in profile; nothing to move"), leaving
+        // such a label-matches-but-live-diverged session UN-relocatable on a
+        // capped account, the exact bug that forced a two-hop workaround. So
+        // compare the LIVE CLAUDE_CONFIG_DIR against what the target profile
+        // resolves; when they diverge, perform the same restart+rebind a
+        // cross-profile move would, so a single call rescues it.
+        let expected = extract_config_dir(
+            &crate::session::profile_config::resolve_config_or_warn(&target).environment,
+        );
+        let live = live_config_dir(&record);
+        if !args.no_restart && config_dir_diverged(live.as_deref(), expected.as_deref()) {
+            println!(
+                "Session '{}' ({}) label is already '{}', but the LIVE account diverged \
+                 (live={}, profile resolves={}); restarting to rebind.",
+                title,
+                id,
+                target,
+                live.as_deref().unwrap_or("?"),
+                expected.as_deref().unwrap_or("?"),
+            );
+            // `source_profile` already equals `target` here, so the restart
+            // path re-resolves CLAUDE_CONFIG_DIR from it and relaunches the
+            // pane on the correct account, clearing the out-of-band override.
+            restart_session(&target, SessionIdArgs { identifier: id }).await?;
+            return Ok(());
+        }
         println!(
             "Session '{}' ({}) is already in profile '{}'; nothing to move.",
             title, id, target
@@ -3084,6 +3155,56 @@ mod move_lookup_tests {
 
         // No match anywhere -> error.
         assert!(find_session_across_profiles("nope-nope-nope").is_err());
+    }
+}
+
+#[cfg(test)]
+mod move_divergence_tests {
+    use super::{config_dir_diverged, extract_config_dir};
+
+    const FORIT_MAIN: &str = "/Users/me/.claude-accounts/forit-main";
+    const FORIT_BACKUP: &str = "/Users/me/.claude-accounts/forit-backup";
+
+    #[test]
+    fn extract_config_dir_plucks_the_value() {
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            format!("CLAUDE_CONFIG_DIR={FORIT_MAIN}"),
+            "TERM=xterm".to_string(),
+        ];
+        assert_eq!(extract_config_dir(&env).as_deref(), Some(FORIT_MAIN));
+        assert_eq!(extract_config_dir(&["PATH=/usr/bin".to_string()]), None);
+    }
+
+    // THE BUG: registry label == target (`forit-main`), but the live pane is
+    // bound to a diverged, weekly-capped account (`forit-backup`). The old
+    // `owner == target` no-op left this un-relocatable. The divergence check
+    // must report it diverged so a single `move <id> forit-main` triggers the
+    // restart+rebind instead of "nothing to move". (con-assistant / for-maint.)
+    #[test]
+    fn diverged_live_account_is_detected() {
+        // These paths don't exist on disk, so canonicalize fails-soft to the
+        // raw strings and the comparison is on the literal values.
+        assert!(
+            config_dir_diverged(Some(FORIT_BACKUP), Some(FORIT_MAIN)),
+            "live forit-backup vs profile forit-main must read as diverged"
+        );
+    }
+
+    #[test]
+    fn matching_live_account_is_not_diverged() {
+        assert!(
+            !config_dir_diverged(Some(FORIT_MAIN), Some(FORIT_MAIN)),
+            "live == expected must be a genuine no-op"
+        );
+    }
+
+    #[test]
+    fn unreadable_live_binding_fails_safe_to_no_divergence() {
+        // Stopped session / un-inspectable pane => no spurious restart.
+        assert!(!config_dir_diverged(None, Some(FORIT_MAIN)));
+        assert!(!config_dir_diverged(Some(FORIT_BACKUP), None));
+        assert!(!config_dir_diverged(None, None));
     }
 }
 
