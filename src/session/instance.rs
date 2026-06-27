@@ -12975,7 +12975,16 @@ mod tests {
             let persisted_marker = fallback_source
                 .find("self.mark_resume_probe_failed(profile, &stale_sid)")
                 .unwrap();
-            let cleanup = fallback_source.find("self.kill_clean_locked()").unwrap();
+            // Target the resume-FAILURE path's kill_clean specifically. The #56
+            // (bg-lock fork-session) and #132 (stranded-transcript relink)
+            // recovery branches each kill_clean() BEFORE relaunching — those are
+            // pre-relaunch teardowns in early-return branches, not the failure
+            // cleanup. The invariant under test is that the failure MARKERS are
+            // written before THIS path tears the pane down, so anchor on the
+            // standard path's distinctive with_context message.
+            let cleanup = fallback_source
+                .find("kill_clean before resume fallback")
+                .unwrap();
 
             assert!(local_marker < cleanup);
             assert!(persisted_marker < cleanup);

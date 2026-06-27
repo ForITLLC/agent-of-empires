@@ -126,7 +126,12 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
 async fn config_watch_keys_distinguish_global_from_profile_named_global() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
-    let profile_name = "<global>";
+    // Fork delta: the stray-profile create-guard (validate_new_profile_name,
+    // ea4a79a2) forbids angle brackets, so the upstream `<global>` sentinel can
+    // no longer be vivified. The literal word `global` is a charset-valid name
+    // that exercises the same distinction — a profile NAMED global vs the
+    // ConfigWatchKey::Global config key — even more directly.
+    let profile_name = "global";
     let _storage = Storage::new_unwatched(profile_name).unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
     let view = HomeView::new(
