@@ -858,7 +858,11 @@ fn claude_has_resume_picker(recent: &[&str]) -> bool {
 /// Strip ANSI and scan the recent pane lines for the resume picker. Shares the
 /// recent-window shape with `detect_claude_status`; mirrors
 /// `claude_pane_has_approval_prompt` for callers holding raw `capture-pane -e`.
-fn claude_pane_has_resume_picker(raw_content: &str) -> bool {
+/// `pub(crate)` so the restart wake worker can detect the resume-from-summary
+/// picker a cross-account relocation lands on and dismiss it before a wake
+/// message would otherwise type harmlessly into the menu (see
+/// `session::restart::classify_wake_pane`).
+pub(crate) fn claude_pane_has_resume_picker(raw_content: &str) -> bool {
     let clean = strip_ansi(raw_content);
     let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
     let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
