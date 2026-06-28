@@ -543,10 +543,25 @@ pub(crate) fn claude_pane_is_ambiguous_typed_prompt(raw_content: &str) -> bool {
 fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
     let has_question = recent_lower.contains("do you want to")
         || recent_lower.contains("would you like to proceed");
-    has_question
-        && recent
-            .iter()
-            .any(|line| claude_line_is_numbered_choice(line))
+    // The numbered MENU of a live approval prompt always renders in the BOTTOM
+    // region of the pane (question + menu + footer sit together at the cursor).
+    // Restricting the numbered-choice match to the last few non-empty lines keeps
+    // a numbered list buried in SCROLLBACK from being mistaken for a live menu —
+    // e.g. the no-priority-question hook's DENIED message ("1. Test or verify it
+    // yourself? 2. Google it? 3. Check memory?") or any quoted/printed list —
+    // while an active turn ("✳ Orchestrating…", "esc to interrupt") renders below
+    // it. Without this, an actively-running orchestrator whose scrollback contains
+    // such a list is mis-flagged Waiting and floats to the top of Attention as if
+    // it needs the operator (gna-finance false-urgent, 2026-06-27). The question
+    // phrase is still matched across the full window (it may scroll a line or two
+    // above a verbose menu), but the menu itself must be live.
+    const LIVE_TAIL: usize = 12;
+    let menu_in_live_region = recent
+        .iter()
+        .rev()
+        .take(LIVE_TAIL)
+        .any(|line| claude_line_is_numbered_choice(line));
+    has_question && menu_in_live_region
 }
 
 /// The first-run folder-trust prompt: `Accessing workspace:` over
@@ -2983,6 +2998,71 @@ enter to select · esc to cancel";
 ✶ Working… (4s · ↓ 88 tokens)
   esc to interrupt";
         assert_eq!(detect_claude_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_claude_status_running_despite_scrollback_question_and_numbered_list() {
+        // gna-finance false-urgent regression (2026-06-27): an actively
+        // orchestrating session whose SCROLLBACK contains BOTH a "do you want
+        // to proceed?" phrase (assistant prose) AND a numbered list (the
+        // no-priority-question hook's DENIED "1. Test it 2. Google it 3. Check
+        // memory" message) must NOT be mistaken for a live approval prompt. The
+        // live bottom region shows an active spinner + "esc to interrupt", so
+        // the verdict is Running, not Waiting. The numbered list sits well above
+        // the live tail; only a menu in the bottom region counts as live.
+        let content = "\
+  I've made no changes — read-only so far. How do you want to proceed?
+  ⎿  Error: DENIED: Before asking the user, try to answer this yourself.
+       1. Test or verify it yourself? (run a command, read a file)
+       2. Google it? (mcp__fastmcp-gateway__google_search)
+       3. Check memory? (openmemory_search_memory)
+⏺ The hook is right — I can advance this myself. Let me drill the runs.
+⏺ Agent(Drill remaining in-retention runs)
+  ⎿  Agent(Map runs batch 02)
+     Initializing…
+     … +13 tool uses
+⏺ Calling fastmcp-gateway…
+✳ Orchestrating… (38m 17s · ↓ 40.6k tokens)
+  ⎿  Tip: Use /clear to start fresh when switching topics
+
+  ❯ why does the support get the notification on the duplicate vendor?
+  ⏵⏵ bypass permissions on · 2 shells · esc to interrupt · ← for agents · ↓ to manage
+  ⏺ main
+  ◯ general-purpose (+1)  Drill remaining in-retention runs                    waiting";
+        assert_eq!(detect_claude_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_running_despite_scrollback_numbered_list() {
+        // Same gna-finance shape on the hook-reconcile path: hook says Running,
+        // scrollback has the DENIED numbered list + "do you want to proceed",
+        // live bottom shows the active turn. The numbered list sits well above
+        // the live tail (as in the real pane, ~25 lines up). Must STAY Running.
+        let pane = "\
+  How do you want to proceed?
+       1. Test or verify it yourself?
+       2. Google it?
+       3. Check memory?
+       4. Read the code to figure it out?
+       5. Try it and see what happens?
+⏺ The hook is right — I can advance this myself. Let me drill the runs.
+⏺ Agent(Drill remaining in-retention runs)
+  ⎿  Agent(Map runs batch 02)
+     Initializing…
+     Agent(Map runs batch 03)
+     Initializing…
+     Agent(Map runs batch 04)
+     Initializing…
+     … +13 tool uses
+⏺ Calling fastmcp-gateway…
+✳ Orchestrating… (38m 17s · ↓ 40.6k tokens)
+  ⎿  Tip: Use /clear to start fresh when switching topics
+  ❯ why does the support get the notification on the duplicate vendor?
+  ⏵⏵ bypass permissions on · 2 shells · esc to interrupt · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Running
+        );
     }
 
     #[test]
