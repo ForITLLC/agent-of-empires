@@ -74,6 +74,32 @@ fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
     })
 }
 
+/// Whether a subcommand resolves sessions under `--profile` and would thus
+/// auto-vivify the profile directory via `Storage::new`. Profile-management
+/// and profile-agnostic commands return false so a stray `-p` on them is a
+/// no-op rather than a hard error. Used to scope the #148 auto-mint guard.
+fn command_consumes_profile(command: &Option<Commands>) -> bool {
+    match command {
+        Some(
+            Commands::Add(_)
+            | Commands::List(_)
+            | Commands::Remove(_)
+            | Commands::Restore(_)
+            | Commands::Send(_)
+            | Commands::Status(_)
+            | Commands::Session { .. }
+            | Commands::Group { .. }
+            | Commands::Project { .. }
+            | Commands::Worktree { .. },
+        ) => true,
+        // The bare TUI (no subcommand) launches under `--profile` too.
+        None => true,
+        #[cfg(feature = "serve")]
+        Some(Commands::Serve(_)) => true,
+        _ => false,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Hidden internal helper for the VT live-preview path (`[tmux] vt_live`,
@@ -419,6 +445,17 @@ async fn run(
     let profile_explicit = cli.profile.is_some();
     let profile = cli.profile.unwrap_or_default();
 
+    // Auto-mint guard (#148): an explicit `-p`/`--profile` naming a profile
+    // that does not exist must NOT silently vivify a stray directory deep in
+    // `Storage::new` -> `get_profile_dir`. Only profile-consuming subcommands
+    // are checked; `profile`/`plugin`/`killall`/`url`/`acp` ignore the value,
+    // and an empty (default) profile resolves normally. Mirrors the daemon
+    // create-session existence check so CLI and API agree there is no
+    // implicitly-valid profile name.
+    if profile_explicit && command_consumes_profile(&cli.command) {
+        agent_of_empires::session::require_known_profile(&profile)?;
+    }
+
     // TUI mode handles migrations with a spinner; CLI runs them silently
     if cli.command.is_some() {
         migrations::run_migrations()?;
@@ -498,4 +535,19 @@ async fn run(
     };
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_consumes_profile_classifies_known_arms() {
+        // Profile-agnostic / profile-management arms must NOT trip the guard.
+        assert!(!command_consumes_profile(&Some(Commands::Profile {
+            command: None
+        })));
+        // The bare TUI launches under --profile and IS guarded.
+        assert!(command_consumes_profile(&None));
+    }
 }

@@ -430,6 +430,37 @@ pub fn list_profiles() -> Result<Vec<String>> {
     list_profile_names_in(&profiles_dir)
 }
 
+/// Refuse an explicit `-p`/`--profile` that names a profile which does not
+/// exist (#148). Without this, a typo or a session-title-shaped string passed
+/// as `--profile` travels CLI -> `Storage::new` -> [`get_profile_dir`] and
+/// silently vivifies a stray profile directory. The daemon create-session
+/// endpoint already enforces the same check; this is the CLI-side counterpart,
+/// so both surfaces agree that there is no implicitly-valid profile name.
+///
+/// Allowed without a directory check:
+/// - an empty `profile` (default resolution / bootstrap handle their own
+///   creation downstream), and
+/// - a genuine first run where `profiles/` is still empty (nothing to guard
+///   yet, and the first session must be creatable).
+///
+/// Profiles are created only via the explicit `aoe profile create <name>`
+/// path. Charset validation of new names still lives in [`get_profile_dir`].
+pub fn require_known_profile(profile: &str) -> Result<()> {
+    if profile.is_empty() {
+        return Ok(());
+    }
+    let known = list_profiles()?;
+    if known.is_empty() || known.iter().any(|p| p == profile) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Profile '{profile}' does not exist. Create it explicitly with \
+         `aoe profile create {profile}`; a bare -p/--profile will not mint one \
+         (guards against stray profiles from typos or session titles). \
+         Run `aoe profile list` to see existing profiles."
+    );
+}
+
 #[cfg(test)]
 pub(crate) static FAIL_NEXT_LIST_PROFILES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1613,6 +1644,41 @@ mod tests {
         // A valid name on the same path still vivifies normally.
         let good = get_profile_dir("forit-work").expect("valid name must create dir");
         assert!(good.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_require_known_profile_rejects_unknown_when_registry_nonempty() {
+        // #148 CLI-boundary guard: an explicit -p naming a profile that does
+        // not exist is refused, and the refusal does NOT create any directory.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("forit-main")).unwrap();
+
+        let err =
+            require_known_profile("per-macbook").expect_err("unknown profile must be refused");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.join("profiles").join("per-macbook").exists(),
+            "guard must not vivify the unknown profile"
+        );
+
+        // An existing profile and the empty (default) name both pass.
+        require_known_profile("forit-main").expect("existing profile must be allowed");
+        require_known_profile("").expect("empty/default profile must be allowed");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_require_known_profile_allows_first_run_empty_registry() {
+        // Genuine first run: profiles/ is empty, so there is no stray to guard
+        // against yet and the first session must be creatable.
+        let _temp = isolate_app_dir();
+        require_known_profile("main")
+            .expect("first-run profile must be allowed when registry empty");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
