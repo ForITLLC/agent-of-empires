@@ -222,6 +222,49 @@ pub(crate) fn recover_stranded_transcript(project_path: &str, sid: &str) -> Opti
     relink_stranded_transcript(&projects_root, &target_dir_name, sid)
 }
 
+/// Pure check: does `<sid>.jsonl` exist under `target_dir_name` or any other
+/// encoded dir in `projects_root`? Separated from the live-store resolution so
+/// it is unit-testable hermetically against a tempdir.
+pub(crate) fn transcript_exists_in_root(
+    projects_root: &Path,
+    target_dir_name: &str,
+    sid: &str,
+) -> bool {
+    let file_name = format!("{sid}.jsonl");
+    if projects_root
+        .join(target_dir_name)
+        .join(&file_name)
+        .is_file()
+    {
+        return true;
+    }
+    let Ok(entries) = resilient_read_dir(projects_root) else {
+        return false;
+    };
+    for entry in entries {
+        let dir = entry.path();
+        if dir.is_dir() && dir.join(&file_name).is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if `<sid>.jsonl` exists under ANY encoded project dir in the live Claude
+/// store. The resume-fallback cascade (#135) uses this to distinguish the "fork
+/// child never persisted" class (recorded sid has no transcript anywhere) from a
+/// recoverable fork parent (its transcript is still on disk). Resolution mirrors
+/// [`recover_stranded_transcript`] so both see the same store.
+pub(crate) fn transcript_exists_anywhere(project_path: &str, sid: &str) -> bool {
+    let Ok(claude_home) = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude") else {
+        return false;
+    };
+    let projects_root = claude_home.join("projects");
+    let canonical = canonicalize_or_raw(project_path);
+    let target_dir_name = encode_claude_project_path(&canonical.to_string_lossy());
+    transcript_exists_in_root(&projects_root, &target_dir_name, sid)
+}
+
 /// Capture Claude Code session ID from the most recently active project directory,
 /// falling back to `.claude.json` if the dir scan result is stale.
 ///
@@ -3342,6 +3385,47 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("-Users-foo-unrelated")).unwrap();
         assert!(relink_stranded_transcript(root, "-Users-foo-newname", "no-such-sid").is_none());
+    }
+
+    #[test]
+    fn test_transcript_exists_in_root_target_dir() {
+        // #135: a transcript present in the target (Claude-looked-at) dir counts.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sid = "a02000a4-1111-2222-3333-444455556666";
+        let target = "-Users-foo-proj";
+        let dir = root.join(target);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{sid}.jsonl")), b"{}\n").unwrap();
+        assert!(transcript_exists_in_root(root, target, sid));
+    }
+
+    #[test]
+    fn test_transcript_exists_in_root_other_dir() {
+        // Present under a DIFFERENT encoded dir (stranded) still counts as
+        // "exists somewhere" — so the #135 fork-parent arm only fires when the
+        // sid is persisted NOWHERE.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sid = "a02000a4-1111-2222-3333-444455556666";
+        let other = root.join("-Users-foo-oldname");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(format!("{sid}.jsonl")), b"{}\n").unwrap();
+        assert!(transcript_exists_in_root(root, "-Users-foo-newname", sid));
+    }
+
+    #[test]
+    fn test_transcript_exists_in_root_never_persisted() {
+        // The never-persisted child class: nowhere on disk → false, which is the
+        // precondition the #135 arm requires before re-pinning to the parent.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("-Users-foo-proj")).unwrap();
+        assert!(!transcript_exists_in_root(
+            root,
+            "-Users-foo-proj",
+            "9177cd1c-7bba-479f-93de-348d9c72273e"
+        ));
     }
 
     #[test]

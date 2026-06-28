@@ -990,6 +990,22 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resume_relink_recovered_sid: Option<String>,
 
+    /// WO #135 fork-parent-recovery loop guard (sibling of #56/#132): the last
+    /// sid for which a dead resume pane was auto-recovered by re-pinning resume
+    /// to its fork PARENT. A session launched `--resume <parent> --fork-session`
+    /// records the fork CHILD sid as `agent_session_id`, but if Claude died
+    /// before persisting the child transcript that sid has NO transcript anywhere
+    /// (the "never persisted" class #132's relink cannot help). On every restart,
+    /// and on a profile-move (which restarts under the new account), resuming the
+    /// child deterministically fails and the session strands in resume_failed.
+    /// When the child was never persisted but the fork parent's transcript still
+    /// exists, recovery re-pins resume to the parent (the conversation the fork
+    /// branched from, so context is preserved). Keyed per-sid so a re-pin that
+    /// still dies falls through to `Error` instead of looping. Persisted so the
+    /// guard survives a daemon restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_fork_parent_recovered_sid: Option<String>,
+
     /// Runtime-only one-shot: when set, the next launch appends
     /// `--fork-session` so resuming a background-agent-locked sid branches a
     /// context-preserving copy instead of bouncing off the lock. Set and
@@ -1254,6 +1270,69 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
 fn pane_shows_background_agent_lock(pane: &str) -> bool {
     pane.to_lowercase()
         .contains("running as a background agent")
+}
+
+/// Strip any `--fork-session` and `--resume <sid>` / `--resume=<sid>` pair from
+/// an extra-args string, preserving every other token and their order. Used by
+/// the #135 fork-parent recovery: once resume is re-pinned to the parent via
+/// `resume_intent`, the stale `--resume <parent> --fork-session` left in
+/// extra_args is redundant AND harmful, because re-appending it on every
+/// relaunch would re-fork the parent, minting a fresh (and possibly never
+/// persisted) child each restart. Pure/free so it is unit-testable.
+fn strip_fork_resume(extra: &str) -> String {
+    let toks: Vec<&str> = extra.split_whitespace().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        if t == "--fork-session" {
+            i += 1;
+            continue;
+        }
+        if t == "--resume" {
+            i += 2; // drop the flag and its value
+            continue;
+        }
+        if t.starts_with("--resume=") {
+            i += 1;
+            continue;
+        }
+        out.push(t);
+        i += 1;
+    }
+    out.join(" ")
+}
+
+/// When `extra` encodes a `--fork-session` launch, return the sid that
+/// `--resume <sid>` (or `--resume=<sid>`) forked FROM: the fork PARENT, the
+/// conversation the child branched off. Returns None when there is no
+/// `--fork-session`, or no valid `--resume <sid>` accompanies it. Pure/free so
+/// it is unit-testable; `fork_parent_from_extra_args` delegates here.
+fn fork_parent_from_args(extra: &str) -> Option<String> {
+    let toks: Vec<&str> = extra.split_whitespace().collect();
+    if !toks.contains(&"--fork-session") {
+        return None;
+    }
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        if t == "--resume" {
+            if let Some(sid) = toks.get(i + 1) {
+                if crate::session::is_valid_session_id(sid) {
+                    return Some((*sid).to_string());
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(sid) = t.strip_prefix("--resume=") {
+            if crate::session::is_valid_session_id(sid) {
+                return Some(sid.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn build_resume_flags(tool: &str, session_id: &str, is_existing_session: bool) -> String {
@@ -1685,6 +1764,7 @@ impl Instance {
             resume_probe_failed_sid: None,
             resume_fork_recovered_sid: None,
             resume_relink_recovered_sid: None,
+            resume_fork_parent_recovered_sid: None,
             fork_next_launch: false,
             resume_intent: ResumeIntent::Default,
             force_fresh_next_launch: false,
@@ -1956,6 +2036,13 @@ impl Instance {
         // a peer. Carry it forward so it is not wiped before it is persisted.
         if self.resume_relink_recovered_sid.is_some() {
             disk.resume_relink_recovered_sid = self.resume_relink_recovered_sid.take();
+        }
+        // #135: same carry for the fork-parent-recovery guard. Set in-memory
+        // just before the relaunch reload in `start_with_resume_fallback`,
+        // written only by the daemon-internal fork-parent recovery path, never a
+        // peer. Carry it forward so it is not wiped before it is persisted.
+        if self.resume_fork_parent_recovered_sid.is_some() {
+            disk.resume_fork_parent_recovered_sid = self.resume_fork_parent_recovered_sid.take();
         }
         // `before_start_env` is `#[serde(skip)]`, so the disk snapshot always
         // has it empty. Carry the live value forward; otherwise this reload
@@ -3661,6 +3748,16 @@ impl Instance {
             return true;
         }
         self.has_command_override()
+    }
+
+    /// When `extra_args` encodes a `--fork-session` launch, return the sid that
+    /// `--resume <sid>` (or `--resume=<sid>`) forked FROM: the fork PARENT, the
+    /// conversation the child branched off. Used by the resume-fallback cascade
+    /// (#135) to recover a fork child whose own transcript was never persisted.
+    /// Returns None when extra_args carries no `--fork-session`, or no valid
+    /// `--resume <sid>` accompanies it.
+    fn fork_parent_from_extra_args(&self) -> Option<String> {
+        fork_parent_from_args(&self.extra_args)
     }
 
     /// True only when the launch command differs from the agent's default
@@ -6544,6 +6641,70 @@ impl Instance {
             }
         }
 
+        // #135 durable recovery: the "fork-child-never-persisted" class, the
+        // failure mode #132's relink cannot touch. A session launched
+        // `--resume <parent> --fork-session` records the fork CHILD sid as
+        // `agent_session_id`, but if Claude died before persisting the child
+        // transcript that sid has NO transcript anywhere, so `--resume <child>`
+        // deterministically crashes the pane on every restart, AND on every
+        // profile-move (which restarts under the new account) — stranding the
+        // session in resume_failed (Commander WO recurrence #135). When the
+        // failed sid was never persisted but the fork PARENT (`--resume <P>` in
+        // extra_args) still has its transcript, re-pin resume to the parent and
+        // relaunch: the parent IS the conversation the fork branched from, so
+        // context is preserved. The stale fork directive is stripped from
+        // extra_args first, so the relaunch is a clean direct resume of the
+        // parent rather than a re-fork that would mint another never-persisted
+        // child. One-shot per sid (persisted guard); if the parent resume also
+        // dies we fall through to Error with no loop.
+        if self.tool == "claude"
+            && self.resume_fork_parent_recovered_sid.as_deref() != Some(stale_sid.as_str())
+            && !crate::session::capture::transcript_exists_anywhere(&self.project_path, &stale_sid)
+        {
+            if let Some(parent) = self.fork_parent_from_extra_args() {
+                if parent != stale_sid
+                    && crate::session::capture::transcript_exists_anywhere(
+                        &self.project_path,
+                        &parent,
+                    )
+                {
+                    tracing::warn!(
+                        target: "session.store",
+                        "start: sid {} for {} was never persisted (fork child died \
+                         before first transcript write); re-pinning resume to fork \
+                         parent {} and retrying (one-shot, context preserved)",
+                        stale_sid,
+                        self.id,
+                        parent,
+                    );
+                    self.resume_fork_parent_recovered_sid = Some(stale_sid.clone());
+                    self.extra_args = strip_fork_resume(&self.extra_args);
+                    self.resume_intent = ResumeIntent::Use(parent.clone());
+                    self.agent_session_id = Some(parent.clone());
+                    self.stop_poller();
+                    self.session_id_poller = None;
+                    self.kill_clean().with_context(|| {
+                        format!("kill_clean before fork-parent recovery for {}", self.id)
+                    })?;
+                    let _ = self
+                        .start_with_size_opts(size, skip_on_launch)
+                        .with_context(|| format!("fork-parent relaunch for {}", self.id))?;
+                    match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
+                        Ok(ProbeResult::Alive) => return Ok(StartOutcome::Resumed),
+                        Ok(ProbeResult::Dead) | Err(_) => {
+                            tracing::warn!(
+                                target: "session.store",
+                                "fork-parent recovery for {} also failed to settle; \
+                                 falling through to Error (guard set, no retry)",
+                                self.id,
+                            );
+                            // fall through to the standard resume-failure handling
+                        }
+                    }
+                }
+            }
+        }
+
         tracing::warn!(
             target: "session.store",
             "start: resume with sid {} for session {} crashed pane within probe; \
@@ -8114,6 +8275,62 @@ mod tests {
         assert!(!is_valid_session_color("blue"));
         assert!(!is_valid_session_color(""));
         assert!(!is_valid_session_color("Red"));
+    }
+
+    // A representative real fork sid (uuid form is_valid_session_id accepts).
+    const PARENT_SID: &str = "a02000a4-1111-2222-3333-444455556666";
+    const CHILD_SID: &str = "9177cd1c-7bba-479f-93de-348d9c72273e";
+
+    #[test]
+    fn fork_parent_from_args_extracts_resume_parent() {
+        let extra = format!("--resume {PARENT_SID} --fork-session");
+        assert_eq!(fork_parent_from_args(&extra).as_deref(), Some(PARENT_SID));
+        // `--resume=<sid>` equals form, fork flag before resume.
+        let eq = format!("--fork-session --resume={PARENT_SID}");
+        assert_eq!(fork_parent_from_args(&eq).as_deref(), Some(PARENT_SID));
+    }
+
+    #[test]
+    fn fork_parent_from_args_none_without_fork_flag() {
+        // A plain resume (no fork) must NOT be treated as a fork parent, or the
+        // #135 arm would hijack ordinary resume failures.
+        let extra = format!("--resume {PARENT_SID}");
+        assert_eq!(fork_parent_from_args(&extra), None);
+    }
+
+    #[test]
+    fn fork_parent_from_args_none_for_invalid_or_missing_sid() {
+        assert_eq!(fork_parent_from_args("--fork-session"), None);
+        // `bad!sid` fails is_valid_session_id (special char) → no parent.
+        assert_eq!(
+            fork_parent_from_args("--resume bad!sid --fork-session"),
+            None
+        );
+        assert_eq!(fork_parent_from_args(""), None);
+    }
+
+    #[test]
+    fn strip_fork_resume_removes_fork_and_resume_preserves_rest() {
+        let extra = format!("--model opus --resume {PARENT_SID} --fork-session --verbose");
+        assert_eq!(strip_fork_resume(&extra), "--model opus --verbose");
+        // equals form + no other tokens collapses to empty.
+        let eq = format!("--fork-session --resume={PARENT_SID}");
+        assert_eq!(strip_fork_resume(&eq), "");
+    }
+
+    #[test]
+    fn strip_fork_resume_is_noop_without_fork_tokens() {
+        let extra = "--model opus --verbose";
+        assert_eq!(strip_fork_resume(extra), extra);
+    }
+
+    #[test]
+    fn fork_parent_differs_from_never_persisted_child() {
+        // Guard invariant: the recovered parent is not the dead child sid, so
+        // the #135 arm's `parent != stale_sid` check can fire.
+        let extra = format!("--resume {PARENT_SID} --fork-session");
+        let parent = fork_parent_from_args(&extra).unwrap();
+        assert_ne!(parent, CHILD_SID);
     }
 
     #[test]
