@@ -20,6 +20,23 @@ use super::dir_guard;
 /// Maximum age before a sidecar `session_id` file is considered stale.
 pub(crate) const SESSION_ID_SIDECAR_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
+/// Maximum age of a `running` status file before it is treated as stale.
+///
+/// The hook writes `running` on PreToolUse and only resets it to `idle` on
+/// Stop/SubagentStop. If Stop never fires (kill -9, crash, compaction mid-tool,
+/// or a hook error) the file stays `running` forever, so the FleetView would
+/// pin a blue "active" bar on a session that is actually idle. Past this age we
+/// stop trusting a `running` value and return `None`, letting callers fall back
+/// to live pane-content detection — which still reports Running for a genuine
+/// long tool call (the pane shows the running spinner) but Idle for a parked
+/// prompt. This self-heals a missed Stop WITHOUT false-idling a busy session,
+/// and is hook-independent (the renderer recovers even if the hook never runs).
+/// Only `running` is aged; the other states are stable terminal values whose
+/// last write remains authoritative. An active session keeps this fresh because
+/// every PreToolUse rewrites the file, and the attention hook stamps it each
+/// tick — so 60s comfortably exceeds the inter-tool gap of a working turn.
+pub(crate) const HOOK_RUNNING_STALE_MAX_AGE: Duration = Duration::from_secs(60);
+
 /// Cap used when reading a status file. The legitimate values are short
 /// tokens; an attacker-planted larger payload is irrelevant either way.
 const STATUS_FILE_READ_CAP: usize = 64;
@@ -44,7 +61,28 @@ pub fn hook_status_dir(instance_id: &str) -> Result<PathBuf> {
 pub fn read_hook_status(instance_id: &str) -> Option<Status> {
     let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
     let bytes = dir_guard::read_file_at(dir.as_fd(), "status", STATUS_FILE_READ_CAP).ok()??;
-    parse_status(&bytes)
+    let status = parse_status(&bytes)?;
+
+    // Staleness self-heal: a `running` value is only trustworthy while the hook
+    // keeps heartbeating it. If Stop never fired (kill -9/crash/compaction/hook
+    // error) the file is pinned at `running` — past HOOK_RUNNING_STALE_MAX_AGE
+    // we drop it (return None) so callers fall back to live pane-content
+    // detection instead of pinning a blue bar on an idle session. Fail-safe: a
+    // stat error or future-dated mtime keeps the current value (no flicker).
+    if status == Status::Running {
+        if let Ok(Some(meta)) = dir_guard::metadata_at(dir.as_fd(), "status") {
+            let stale = meta
+                .modified()
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok())
+                .map(|age| age > HOOK_RUNNING_STALE_MAX_AGE)
+                .unwrap_or(false);
+            if stale {
+                return None;
+            }
+        }
+    }
+    Some(status)
 }
 
 /// Time since the hook status file was last written, i.e. how long the current
@@ -157,6 +195,61 @@ mod tests {
         let (_g, _, _tmp) = BaseGuard::ready();
         write_status_via_guard("read_running", "running");
         assert_eq!(read_hook_status("read_running"), Some(Status::Running));
+    }
+
+    /// Age a file in the instance dir to `now - offset` (mirrors the
+    /// session_id stale-file test).
+    fn age_status_file(base: &std::path::Path, instance_id: &str, offset: Duration) {
+        let stale = std::time::SystemTime::now() - offset;
+        std::fs::File::options()
+            .write(true)
+            .open(base.join(instance_id).join("status"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_running_status_drops_when_stale() {
+        // WO #159: a `running` file pinned by a missed Stop (kill -9/crash)
+        // self-heals — past HOOK_RUNNING_STALE_MAX_AGE the reader returns None so
+        // callers fall back to live content detection instead of pinning blue.
+        let (_g, base, _tmp) = BaseGuard::ready();
+        write_status_via_guard("read_running_stale", "running");
+        age_status_file(
+            &base,
+            "read_running_stale",
+            HOOK_RUNNING_STALE_MAX_AGE + Duration::from_secs(30),
+        );
+        assert_eq!(read_hook_status("read_running_stale"), None);
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_running_status_fresh_stays_running() {
+        // A freshly-heartbeated `running` (active work) is trusted → stays blue.
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_status_via_guard("read_running_fresh", "running");
+        assert_eq!(
+            read_hook_status("read_running_fresh"),
+            Some(Status::Running)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_waiting_status_survives_stale_mtime() {
+        // Only `running` is aged; a stable `waiting` value remains authoritative
+        // no matter how old the file is (it is not the stuck-blue failure mode).
+        let (_g, base, _tmp) = BaseGuard::ready();
+        write_status_via_guard("read_waiting_old", "waiting");
+        age_status_file(
+            &base,
+            "read_waiting_old",
+            HOOK_RUNNING_STALE_MAX_AGE + Duration::from_secs(600),
+        );
+        assert_eq!(read_hook_status("read_waiting_old"), Some(Status::Waiting));
     }
 
     #[test]
