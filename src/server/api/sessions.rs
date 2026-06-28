@@ -40,6 +40,19 @@ pub struct SessionResponse {
     /// A deliberate Stop keeps `status: "Stopped"` and reports `false` here.
     /// See #2250.
     pub dormant: bool,
+    /// Truthful tmux-pane liveness, overlaid in `list_sessions` from a single
+    /// batched pane scrape. `Some(true)`: a live pane backs this session.
+    /// `Some(false)`: the pane is dead or absent. This is the stranded case
+    /// the status poller cannot reflect; archived rows short-circuit the
+    /// re-probe (#2206), so the frozen registry `status` can read Idle while
+    /// `/output` answers 409. `None` for structured/acp sessions, which are
+    /// not tmux-backed (use `acp_worker_state` for those). Lets a fleet
+    /// caller separate a pushable idle worker from a dead pane in one list
+    /// read, with no per-session probe. When `Some(false)` and the registry
+    /// status looked alive, the reported `status` is projected to `Stopped`
+    /// so the wire value matches reality.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_alive: Option<bool>,
     pub yolo_mode: bool,
     pub created_at: String,
     pub last_accessed_at: Option<String>,
@@ -391,6 +404,9 @@ impl SessionResponse {
             tool: inst.tool.clone(),
             status: inst.status.wire_str().to_string(),
             dormant: inst.is_shown_dormant(),
+            // Overlaid in list_sessions from a batched pane scrape; single
+            // session responses carry no liveness signal.
+            pane_alive: None,
             yolo_mode: inst.yolo_mode,
             created_at: inst.created_at.to_rfc3339(),
             last_accessed_at: inst.last_accessed_at.map(|t| t.to_rfc3339()),
@@ -672,11 +688,38 @@ pub struct ListSessionsQuery {
     pub state: Option<crate::session::SessionScope>,
 }
 
+/// Project a wire status that reflects pane reality. The status poller leaves
+/// archived rows frozen at their pre-archive value (it deliberately skips the
+/// tmux re-probe so archive/unarchive is status-preserving, #2206), so a
+/// stranded session can advertise a looks-alive `status` while its pane is
+/// gone. When the pane is verifiably dead and the registry status is one a
+/// live worker would hold, report `Stopped` instead. Returns `None` (no
+/// override) for a live pane or a status that already reflects a non-running
+/// state, so `inst.status` is never mutated and unarchive stays faithful.
+fn dead_pane_status_override(status: &str, pane_alive: bool) -> Option<&'static str> {
+    if !pane_alive && matches!(status, "Idle" | "Running" | "Waiting" | "Unknown") {
+        Some("Stopped")
+    } else {
+        None
+    }
+}
+
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
 ) -> Json<SessionsEnvelope> {
     let instances = state.instances.read().await;
+    // One batched tmux scrape per request yields truthful pane liveness with
+    // no per-session probe fan-out, the same single call the status poller
+    // uses. Empty on a tmux error, which reads as "no live panes": every
+    // tmux-backed row then reports pane_alive=false, the safe direction (a
+    // transient scrape failure cannot paint a dead pane as alive).
+    let pane_meta = tokio::task::spawn_blocking(|| {
+        crate::tmux::refresh_session_cache();
+        crate::tmux::batch_pane_metadata().unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     // Snapshot the supervisor's worker lifecycle map once per request
     // rather than locking it per row. See #1088.
@@ -749,6 +792,24 @@ pub async fn list_sessions(
     // cache, halving the disk reads the 3s sidebar poll does when the same
     // pair appears in more than one row. See #2603.
     let mut session_cfg_cache: HashMap<(String, String), SessionConfig> = HashMap::new();
+
+    // Overlay truthful pane liveness from the batched scrape. Structured/acp
+    // rows are not tmux-backed, so they keep `pane_alive = None` and are never
+    // re-statused here (their lifecycle shows in `acp_worker_state`). For a
+    // tmux-backed row, a missing or dead pane means the session is not
+    // running; project a frozen looks-alive status to `Stopped` so the wire
+    // value matches `/output`'s 409 reality.
+    for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+        if inst.is_structured() {
+            continue;
+        }
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let alive = pane_meta.get(&name).is_some_and(|m| !m.pane_dead);
+        if let Some(projected) = dead_pane_status_override(&resp.status, alive) {
+            resp.status = projected.to_string();
+        }
+        resp.pane_alive = Some(alive);
+    }
 
     // Overlay custom-agent ACP capability (built-ins were resolved in the
     // constructor). Distinct `(profile, project_path)` pairs each resolve
@@ -8308,6 +8369,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dead_pane_projects_looks_alive_status_to_stopped() {
+        // A dead pane under a status a live worker would hold => Stopped.
+        for s in ["Idle", "Running", "Waiting", "Unknown"] {
+            assert_eq!(dead_pane_status_override(s, false), Some("Stopped"), "{s}");
+        }
+        // A live pane is never re-statused, whatever the registry says.
+        for s in ["Idle", "Running", "Waiting", "Unknown"] {
+            assert_eq!(dead_pane_status_override(s, true), None, "{s}");
+        }
+        // Already non-running / transitional states are left untouched even
+        // with a dead pane, so we never paint over Error/Starting/etc.
+        for s in ["Stopped", "Error", "Starting", "Creating", "Deleting"] {
+            assert_eq!(dead_pane_status_override(s, false), None, "{s}");
+        }
+    }
+
     fn make_test_instance() -> Instance {
         let mut inst = Instance::new("test-session", "/tmp/test-project");
         inst.tool = "claude".to_string();
@@ -11723,6 +11801,7 @@ mod workspace_ordering_tests {
             archived_at: None,
             snoozed_until: None,
             unread: false,
+            pane_alive: None,
         }
     }
 
