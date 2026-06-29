@@ -735,7 +735,26 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
 }
 
 async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    // WO #194-1 (registry-split): a plain `aoe session unarchive <id>` (no
+    // `-p`, so `profile` is empty) must resolve the id in the profile that
+    // ACTUALLY owns it, not just the globally-resolved default. Before this,
+    // a session archived under a non-default profile (e.g. the fleet sweep
+    // archived sessions owned by `forit-backup` while the Commander ran under
+    // `aoe-wmw`) failed with "Session not found" even though the daemon listed
+    // it as archived. Mirrors restart_session's #99 cross-profile resolution;
+    // an explicit `-p <profile>` still overrides.
+    let owning_profile = if profile.is_empty() {
+        match find_session_across_profiles(&args.identifier) {
+            Ok((p, _)) => p,
+            // Not found in any profile: fall back to the resolved default so
+            // the normal "session missing" error surfaces from resolve_session
+            // below rather than a confusing lookup error.
+            Err(_) => crate::session::config::effective_profile(profile),
+        }
+    } else {
+        profile.to_string()
+    };
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let inst = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unarchive();
@@ -3163,6 +3182,107 @@ mod move_lookup_tests {
 
         // No match anywhere -> error.
         assert!(find_session_across_profiles("nope-nope-nope").is_err());
+    }
+}
+
+#[cfg(test)]
+mod unarchive_cross_profile_tests {
+    // WO #194-1 (registry-split): a plain `aoe session unarchive <id>` (no
+    // `-p`, so `profile` is empty) was loading ONLY the resolved default
+    // profile's storage, so an id owned by a different profile failed with
+    // "Session not found" even though the daemon listed it as archived. The
+    // fix mirrors restart_session's #99 cross-profile owner resolution.
+    use super::{unarchive_session, SessionIdArgs};
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    fn seed_archived(profile: &str, id: &str, title: &str, path: &str) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new(id, path);
+        inst.id = id.to_string();
+        inst.title = title.to_string();
+        inst.source_profile = profile.to_string();
+        inst.archive();
+        assert!(inst.is_archived(), "seed must start archived");
+        let on_disk = inst.clone();
+        storage
+            .update(|i, _g| {
+                i.push(on_disk.clone());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn is_archived_in(profile: &str, id: &str) -> bool {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let instances = storage.load().unwrap();
+        instances
+            .iter()
+            .find(|i| i.id == id)
+            .expect("seeded session must still exist")
+            .is_archived()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unarchive_resolves_owning_profile_without_dash_p() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+        // A DECOY profile that sorts first becomes the resolved default
+        // (resolve_default_profile -> list_profiles().next()) and does NOT own
+        // the target id. This recreates the real registry-split: the caller's
+        // default profile (forit-main) is not the one that owns the archived
+        // session (forit-backup). Without it the lone seeded profile would BE
+        // the default and the bug would never surface.
+        seed_archived("aaa-decoy-default", "0000aaaa", "decoy", "/tmp/decoy");
+
+        // The session lives ARCHIVED in a different, non-default profile.
+        seed_archived("zzz-owner", "cccc3333", "for-Stuck", "/tmp/stuck");
+        assert!(is_archived_in("zzz-owner", "cccc3333"));
+
+        // Plain `aoe session unarchive cccc3333` (no -p => empty profile) must
+        // resolve the id in its owning profile and clear archived_at THERE,
+        // not bail "Session not found" against the empty default profile.
+        unarchive_session(
+            "",
+            SessionIdArgs {
+                identifier: "cccc3333".to_string(),
+            },
+        )
+        .await
+        .expect("unarchive must resolve the id across profiles");
+
+        assert!(
+            !is_archived_in("zzz-owner", "cccc3333"),
+            "session should be unarchived in its owning profile"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_dash_p_still_targets_that_profile() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+        seed_archived("unarch-explicit", "dddd4444", "for-Pin", "/tmp/pin");
+
+        // An explicit `-p <owner>` still resolves directly in that profile.
+        unarchive_session(
+            "unarch-explicit",
+            SessionIdArgs {
+                identifier: "dddd4444".to_string(),
+            },
+        )
+        .await
+        .expect("explicit -p unarchive must succeed");
+
+        assert!(!is_archived_in("unarch-explicit", "dddd4444"));
     }
 }
 
