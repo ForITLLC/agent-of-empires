@@ -260,6 +260,109 @@ mod tests {
     use ratatui::style::Color;
     use std::io::Write;
 
+    /// HSV hue in degrees [0,360) for a truecolor `Color::Rgb`, or `None` for
+    /// an achromatic (gray) color that has no hue. Builtin themes loaded with
+    /// `palette_mode = false` are always `Color::Rgb`.
+    fn hue_deg(c: Color) -> Option<f32> {
+        let (r, g, b) = match c {
+            Color::Rgb(r, g, b) => (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
+            other => panic!("expected truecolor Color::Rgb, got {other:?}"),
+        };
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let delta = max - min;
+        if delta < 1e-6 {
+            return None; // gray: no hue
+        }
+        let mut h = if max == r {
+            60.0 * (((g - b) / delta).rem_euclid(6.0))
+        } else if max == g {
+            60.0 * ((b - r) / delta + 2.0)
+        } else {
+            60.0 * ((r - g) / delta + 4.0)
+        };
+        if h < 0.0 {
+            h += 360.0;
+        }
+        Some(h)
+    }
+
+    /// Whether a color reads as BLUE. `terminal_active` (the active type-in
+    /// pane border) and `terminal_border` are SEMANTIC interactive-state
+    /// colors; DESIGN.md fixes interactive states to teal and its
+    /// anti-patterns forbid blue accents for interactive states. Blue is the
+    /// hue sector [195, 270); teal/cyan/green (every kept builtin sits at or
+    /// below 191) is the allowed ramp. Achromatic grays have no hue and are
+    /// not "blue" for this check (the navy `border`/`background` keys are out
+    /// of scope; only the two interactive keys are guarded).
+    fn is_blue(c: Color) -> bool {
+        match hue_deg(c) {
+            Some(h) => (195.0..270.0).contains(&h),
+            None => false,
+        }
+    }
+
+    /// Lock the blue classifier against the exact pre-fix offenders and the
+    /// teal/cyan values we keep, so a future refactor of the predicate cannot
+    /// silently start passing blue (or rejecting legitimate teal).
+    #[test]
+    fn is_blue_classifier_matches_design_intent() {
+        let rgb = |h: u32| Color::Rgb((h >> 16) as u8, (h >> 8) as u8, h as u8);
+        // Blues the guard MUST catch (the builtin offenders before this fix).
+        for hex in [
+            0x1e66f5u32,
+            0x04a5e5,
+            0x82aaff,
+            0x4682b4,
+            0x7aa2f7,
+            0x3d59a1,
+        ] {
+            assert!(is_blue(rgb(hex)), "{hex:#08x} must classify as blue");
+        }
+        // Teal/cyan/green the guard MUST allow: the design teal, the per-theme
+        // teals we move to, and the cyan-flavored themes we intentionally keep.
+        for hex in [
+            0x0d9488u32,
+            0x179299,
+            0x73daca,
+            0x84ffff,
+            0x8be9fd,
+            0x9ccfd8,
+        ] {
+            assert!(!is_blue(rgb(hex)), "{hex:#08x} must NOT classify as blue");
+        }
+    }
+
+    /// Recurrence guard for the "type-in bar is blue" bug: NO builtin theme
+    /// may paint the active type-in border (`terminal_active`) or the pane
+    /// border (`terminal_border`) a blue hue. This bakes the DESIGN.md "no
+    /// blue for interactive states / interactive == teal" decision into CI so
+    /// a future theme edit cannot reintroduce the blue bar.
+    #[test]
+    fn builtin_interactive_borders_are_never_blue() {
+        let mut offenders = Vec::new();
+        for name in builtin_theme_names() {
+            let theme = load_theme_with_mode(name, false); // truecolor -> Color::Rgb
+            for (key, color) in [
+                ("terminal_active", theme.terminal_active),
+                ("terminal_border", theme.terminal_border),
+            ] {
+                if is_blue(color) {
+                    offenders.push(format!(
+                        "{name}.{key} = {color:?} (hue {:.0}deg) is blue",
+                        hue_deg(color).unwrap_or(0.0)
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "interactive border colors must sit on the teal/green ramp, never \
+             blue (DESIGN.md: no blue accents for interactive states):\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     #[test]
     fn load_theme_with_mode_palette_yields_indexed() {
         let theme = load_theme_with_mode("empire", true);
