@@ -116,6 +116,16 @@ pub enum SessionCommands {
     /// `sessions.json` and then `aoe -p <target> session restart <id>`.
     /// Idempotent: a no-op when the session is already in the target.
     Move(MoveArgs),
+
+    /// Rewrite the `--model` a session launches with, in ONE step: patch the
+    /// session RECORD's `extra_args` (and the structured-view `agent_model`
+    /// field) in whatever profile currently owns it, then restart so the live
+    /// agent relaunches under the new model. Mirrors `session move`, but the
+    /// binding it changes is the model rather than the account profile.
+    /// Idempotent: a no-op (no restart) when the record already launches the
+    /// requested model. Pass an empty model (`""`) to CLEAR the pin and fall
+    /// back to the account's default model.
+    SetModel(SetModelArgs),
 }
 
 #[derive(Args)]
@@ -215,6 +225,25 @@ pub struct MoveArgs {
     /// Relocate the record only; skip the live restart/re-bind. Useful when
     /// the session is stopped or you want to stage the move and restart
     /// later. The new account binding then takes effect on the next start.
+    #[arg(long = "no-restart")]
+    pub no_restart: bool,
+}
+
+#[derive(Args)]
+pub struct SetModelArgs {
+    /// Session ID or title to retarget. Looked up across ALL profiles, so no
+    /// `-p` is needed (the lookup always finds the session in whatever profile
+    /// owns it, exactly like `session move`).
+    pub identifier: String,
+
+    /// Model to launch with, forwarded to the agent as `--model <model>` (e.g.
+    /// `claude-opus-4-8`, `claude-fable-5`, `opus`, `sonnet`). Pass an empty
+    /// string (`""`) to CLEAR the pin and let the account default apply.
+    pub model: String,
+
+    /// Rewrite the record only; skip the live restart. The new model then
+    /// takes effect on the session's next start. Useful for a stopped session
+    /// or to stage the change.
     #[arg(long = "no-restart")]
     pub no_restart: bool,
 }
@@ -428,7 +457,116 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::ListTrash => list_trash(profile).await,
         SessionCommands::EmptyTrash => empty_trash(profile).await,
         SessionCommands::Move(args) => move_session(args).await,
+        SessionCommands::SetModel(args) => set_model_session(args).await,
     }
+}
+
+/// Rewrite an `extra_args` string so the agent launches with `--model
+/// <model>`. Any existing `--model <val>` / `--model=<val>` pair is stripped
+/// first (so repeated calls stay idempotent and never accumulate duplicate
+/// flags), then the new flag is appended when `model` is non-empty. An empty
+/// `model` clears the pin (strip only). Pure and free so it is unit-testable;
+/// `set_model_session` delegates here.
+fn apply_model_arg(extra: &str, model: &str) -> String {
+    let toks: Vec<&str> = extra.split_whitespace().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(toks.len() + 2);
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        if t == "--model" {
+            i += 2; // drop the flag and its value
+            continue;
+        }
+        if t.starts_with("--model=") {
+            i += 1;
+            continue;
+        }
+        out.push(t);
+        i += 1;
+    }
+    let mut result = out.join(" ");
+    let model = model.trim();
+    if !model.is_empty() {
+        if !result.is_empty() {
+            result.push(' ');
+        }
+        result.push_str("--model ");
+        result.push_str(model);
+    }
+    result
+}
+
+/// Retarget a session's launch model cross-profile, then restart to re-bind.
+///
+/// Profile is resolved from the session itself (via
+/// [`find_session_across_profiles`]), NOT from the caller's `-p`, so the
+/// command works the same no matter which profile the CLI defaulted to.
+/// Idempotent: when the record already launches the requested model (both the
+/// `extra_args` `--model` token and the structured-view `agent_model` field
+/// already match), it is a no-op and no restart fires.
+async fn set_model_session(args: SetModelArgs) -> Result<()> {
+    let model = args.model.trim().to_string();
+
+    let (owner, record) = find_session_across_profiles(&args.identifier)?;
+    let id = record.id.clone();
+    let title = record.title.clone();
+
+    let old_extra = record.extra_args.clone();
+    let new_extra = apply_model_arg(&old_extra, &model);
+    let new_agent_model = if model.is_empty() {
+        None
+    } else {
+        Some(model.clone())
+    };
+
+    // Idempotency: both surfaces already at the requested model -> nothing to
+    // do, and (crucially) no needless restart of a live session.
+    if new_extra == old_extra && record.agent_model == new_agent_model {
+        let shown = if model.is_empty() { "default" } else { &model };
+        println!(
+            "Session '{}' ({}) already launches model '{}'; nothing to change.",
+            title, id, shown
+        );
+        return Ok(());
+    }
+
+    let storage = Storage::new_unwatched(&owner)?;
+    let landed = storage.update(|instances, _groups| {
+        if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
+            stored.extra_args = new_extra.clone();
+            stored.agent_model = new_agent_model.clone();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })?;
+    if !landed {
+        bail!(
+            "Session {} ({}) was removed from profile '{}' before set-model could land",
+            title,
+            id,
+            owner
+        );
+    }
+
+    let shown = if model.is_empty() {
+        "default (cleared)"
+    } else {
+        &model
+    };
+    println!(
+        "✓ Set model for '{}' ({}) in profile '{}': '{}'.",
+        title, id, owner, shown
+    );
+
+    if args.no_restart {
+        println!("  (--no-restart) new model takes effect on the session's next start.");
+        return Ok(());
+    }
+
+    println!("  Restarting to relaunch under the new model...");
+    restart_session(&owner, SessionIdArgs { identifier: id }).await?;
+    Ok(())
 }
 
 /// Locate the single session matching `identifier` (exact id, id-prefix, or
@@ -3010,6 +3148,93 @@ mod restart_args_tests {
             result.is_err(),
             "passing both branch and --clear should error"
         );
+    }
+
+    #[test]
+    fn set_model_parses_identifier_and_model() {
+        let cli = Cli::try_parse_from(["aoe", "set-model", "claude-3", "claude-fable-5"])
+            .expect("set-model must parse");
+        match cli.cmd {
+            SessionCommands::SetModel(args) => {
+                assert_eq!(args.identifier, "claude-3");
+                assert_eq!(args.model, "claude-fable-5");
+                assert!(!args.no_restart);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn set_model_no_restart_flag_parses() {
+        let cli = Cli::try_parse_from(["aoe", "set-model", "claude-3", "opus", "--no-restart"])
+            .expect("set-model --no-restart must parse");
+        match cli.cmd {
+            SessionCommands::SetModel(args) => {
+                assert!(args.no_restart);
+                assert_eq!(args.model, "opus");
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn set_model_empty_model_clears() {
+        // Empty-string model is the documented CLEAR path; it must parse as a
+        // positional (not be swallowed / error).
+        let cli = Cli::try_parse_from(["aoe", "set-model", "claude-3", ""])
+            .expect("set-model with empty model must parse");
+        match cli.cmd {
+            SessionCommands::SetModel(args) => {
+                assert_eq!(args.identifier, "claude-3");
+                assert!(args.model.is_empty());
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod apply_model_arg_tests {
+    use super::apply_model_arg;
+
+    #[test]
+    fn appends_when_no_existing_model() {
+        assert_eq!(apply_model_arg("", "opus"), "--model opus");
+        assert_eq!(
+            apply_model_arg("--verbose", "claude-fable-5"),
+            "--verbose --model claude-fable-5"
+        );
+    }
+
+    #[test]
+    fn replaces_existing_space_form_in_place_preserving_other_args() {
+        // Existing `--model X` is stripped, new one appended at the end; other
+        // flags are preserved and never duplicated.
+        assert_eq!(
+            apply_model_arg("--model sonnet --verbose", "opus"),
+            "--verbose --model opus"
+        );
+    }
+
+    #[test]
+    fn replaces_existing_equals_form() {
+        assert_eq!(
+            apply_model_arg("--model=sonnet --verbose", "opus"),
+            "--verbose --model opus"
+        );
+    }
+
+    #[test]
+    fn empty_model_clears_the_pin() {
+        assert_eq!(apply_model_arg("--model opus --verbose", ""), "--verbose");
+        assert_eq!(apply_model_arg("--model=opus", ""), "");
+        assert_eq!(apply_model_arg("", ""), "");
+    }
+
+    #[test]
+    fn idempotent_on_repeat() {
+        let once = apply_model_arg("--verbose", "opus");
+        assert_eq!(apply_model_arg(&once, "opus"), once);
     }
 }
 
