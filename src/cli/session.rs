@@ -523,15 +523,22 @@ async fn set_model_session(args: SetModelArgs) -> Result<()> {
 
     let old_extra = record.extra_args.clone();
     let new_extra = apply_model_arg(&old_extra, &model);
+    // The structured-view `agent_model` field only exists on serve builds;
+    // non-serve builds sync the `extra_args` `--model` token alone.
+    #[cfg(feature = "serve")]
     let new_agent_model = if model.is_empty() {
         None
     } else {
         Some(model.clone())
     };
+    #[cfg(feature = "serve")]
+    let agent_model_unchanged = record.agent_model == new_agent_model;
+    #[cfg(not(feature = "serve"))]
+    let agent_model_unchanged = true;
 
     // Idempotency: both surfaces already at the requested model -> nothing to
     // do, and (crucially) no needless restart of a live session.
-    if new_extra == old_extra && record.agent_model == new_agent_model {
+    if new_extra == old_extra && agent_model_unchanged {
         let shown = if model.is_empty() { "default" } else { &model };
         println!(
             "Session '{}' ({}) already launches model '{}'; nothing to change.",
@@ -544,7 +551,10 @@ async fn set_model_session(args: SetModelArgs) -> Result<()> {
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.extra_args = new_extra.clone();
-            stored.agent_model = new_agent_model.clone();
+            #[cfg(feature = "serve")]
+            {
+                stored.agent_model = new_agent_model.clone();
+            }
             Ok(true)
         } else {
             Ok(false)
