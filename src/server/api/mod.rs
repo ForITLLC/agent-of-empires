@@ -64,9 +64,10 @@ pub use sessions::{
     search_sessions, send_message, serve_session_artifact, session_diff_file, session_diff_files,
     session_file, set_mcp_surface, set_session_goal, set_worktree_name, start_session,
     stop_session, summarize_session, trash_session, update_session_archive, update_session_color,
-    update_session_diff_base, update_session_group, McpSurfaceBadge,
+    update_session_diff_base, update_session_group,
     update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
-    update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
+    update_workspace_ordering, CleanupDefaults, McpSurfaceBadge, OutputQuery, SendMessageRequest,
+    SessionResponse,
 };
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,

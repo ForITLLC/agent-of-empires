@@ -8455,12 +8455,9 @@ mod tests {
         #[tokio::test]
         async fn post_invalid_status_is_400() {
             let state = crate::server::test_support::build_test_app_state(vec![]);
-            let resp = set_mcp_surface(
-                State(state),
-                Ok(Json(badge_body("degraded-ish", vec![]))),
-            )
-            .await
-            .into_response();
+            let resp = set_mcp_surface(State(state), Ok(Json(badge_body("degraded-ish", vec![]))))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         }
 
@@ -8505,8 +8502,16 @@ mod tests {
             )
             .await
             .into_response();
+<<<<<<< HEAD
             let Json(envelope) = list_sessions(State(state), axum::extract::Query(ListSessionsQuery { state: None })).await;
             assert!(envelope.mcp_surface.is_none(), "healthy must clear envelope badge");
+=======
+            let Json(envelope) = list_sessions(State(state)).await;
+            assert!(
+                envelope.mcp_surface.is_none(),
+                "healthy must clear envelope badge"
+            );
+>>>>>>> 68937723 (style(server): rustfmt fixup for mcp-surface badge code (ead7772a))
         }
     }
 
