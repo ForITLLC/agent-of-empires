@@ -603,6 +603,12 @@ fn truncate_title(s: &str, max: usize) -> String {
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     pub workspace_ordering: Vec<String>,
+    /// Fleet-wide MCP gateway surface badge (per-dev WO 6137C598 B2). Set by
+    /// external monitors via `POST /api/mcp-surface` when the fastmcp gateway
+    /// is truncated or unreachable; absent while healthy, so the field only
+    /// serializes during a degradation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_surface: Option<McpSurfaceBadge>,
 }
 
 /// Process-wide built-in ACP registry, built once. Used to compute
@@ -994,9 +1000,12 @@ pub async fn list_sessions(
             Vec::new()
         });
 
+    let mcp_surface = state.mcp_surface.read().expect("mcp_surface lock").clone();
+
     Json(SessionsEnvelope {
         sessions,
         workspace_ordering,
+        mcp_surface,
     })
 }
 
@@ -2842,6 +2851,98 @@ pub async fn set_session_goal(
     (
         StatusCode::OK,
         Json(serde_json::json!({ "id": inst.id, "goal": inst.goal })),
+    )
+        .into_response()
+}
+
+// --- Fleet MCP-surface badge (per-dev WO 6137C598 B2) ---
+//
+// The fastmcp gateway fronts every fleet session's MCP tools; a gateway that
+// is alive but TRUNCATED (an expected tool family unmounted) silently strips
+// capabilities from every session at once. External monitors (the gateway
+// surface watchdog and the per-session probe hook) classify the surface and
+// POST it here; the badge then rides on the `/api/sessions` envelope so any
+// fleet view can render MCP-DEGRADED without a second round-trip. "healthy"
+// clears the badge. In-memory only by design: the watchdog re-posts every
+// tick, so a daemon restart re-converges within a minute and staleness never
+// needs disk persistence.
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct McpSurfaceBadge {
+    /// "truncated" or "unreachable"; a "healthy" post clears the badge
+    /// instead of storing one.
+    pub status: String,
+    /// Which monitor reported it, e.g. "watchdog" or "probe-hook".
+    pub source: String,
+    /// Expected tool families absent from the gateway's tools/list.
+    pub missing: Vec<String>,
+    pub detail: String,
+    /// Server-stamped unix seconds; the poster's clock is not trusted.
+    pub updated_at: i64,
+}
+
+#[derive(Deserialize)]
+pub struct McpSurfaceBody {
+    pub status: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub missing: Option<Vec<String>>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+pub async fn get_mcp_surface(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let badge = state.mcp_surface.read().expect("mcp_surface lock").clone();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "mcp_surface": badge })),
+    )
+}
+
+pub async fn set_mcp_surface(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<McpSurfaceBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    let badge = match body.status.as_str() {
+        "healthy" => None,
+        "truncated" | "unreachable" => Some(McpSurfaceBadge {
+            status: body.status,
+            source: body.source.unwrap_or_else(|| "unknown".to_string()),
+            missing: body.missing.unwrap_or_default(),
+            detail: body.detail.unwrap_or_default(),
+            updated_at: chrono::Utc::now().timestamp(),
+        }),
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "message": format!(
+                        "invalid status {other:?}: expected healthy | truncated | unreachable"
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
+    *state.mcp_surface.write().expect("mcp_surface lock") = badge.clone();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "mcp_surface": badge })),
     )
         .into_response()
 }
@@ -8271,6 +8372,141 @@ mod tests {
                 "definitely-not-a-real-tool",
                 None,
             ));
+        }
+    }
+
+    // Fleet MCP-surface badge (per-dev WO 6137C598 B2): the gateway watchdog
+    // and the per-session probe hook POST the classified gateway surface to
+    // /api/mcp-surface so the sessions list can carry an MCP-DEGRADED badge.
+    // healthy clears the badge; truncated / unreachable set it.
+    #[cfg(feature = "serve")]
+    mod mcp_surface {
+        use super::*;
+        use axum::body::to_bytes;
+        use serial_test::serial;
+
+        fn badge_body(status: &str, missing: Vec<&str>) -> McpSurfaceBody {
+            McpSurfaceBody {
+                status: status.to_string(),
+                source: Some("watchdog".to_string()),
+                missing: Some(missing.into_iter().map(str::to_string).collect()),
+                detail: Some("action=kickstart".to_string()),
+            }
+        }
+
+        async fn resp_json(resp: axum::response::Response) -> serde_json::Value {
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        #[tokio::test]
+        async fn post_truncated_sets_badge_and_get_returns_it() {
+            let state = crate::server::test_support::build_test_app_state(vec![]);
+            let resp = set_mcp_surface(
+                State(state.clone()),
+                Ok(Json(badge_body("truncated", vec!["productivity"]))),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = resp_json(get_mcp_surface(State(state)).await.into_response()).await;
+            let badge = &got["mcp_surface"];
+            assert_eq!(badge["status"], "truncated");
+            assert_eq!(badge["source"], "watchdog");
+            assert_eq!(badge["missing"][0], "productivity");
+            assert_eq!(badge["detail"], "action=kickstart");
+            assert!(badge["updated_at"].as_i64().unwrap() > 0);
+        }
+
+        #[tokio::test]
+        async fn post_unreachable_sets_badge() {
+            let state = crate::server::test_support::build_test_app_state(vec![]);
+            let resp = set_mcp_surface(
+                State(state.clone()),
+                Ok(Json(badge_body("unreachable", vec![]))),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = resp_json(get_mcp_surface(State(state)).await.into_response()).await;
+            assert_eq!(got["mcp_surface"]["status"], "unreachable");
+        }
+
+        #[tokio::test]
+        async fn post_healthy_clears_badge() {
+            let state = crate::server::test_support::build_test_app_state(vec![]);
+            let _ = set_mcp_surface(
+                State(state.clone()),
+                Ok(Json(badge_body("truncated", vec!["productivity"]))),
+            )
+            .await
+            .into_response();
+            let resp = set_mcp_surface(
+                State(state.clone()),
+                Ok(Json(badge_body("healthy", vec![]))),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = resp_json(get_mcp_surface(State(state)).await.into_response()).await;
+            assert!(got["mcp_surface"].is_null(), "healthy must clear: {got}");
+        }
+
+        #[tokio::test]
+        async fn post_invalid_status_is_400() {
+            let state = crate::server::test_support::build_test_app_state(vec![]);
+            let resp = set_mcp_surface(
+                State(state),
+                Ok(Json(badge_body("degraded-ish", vec![]))),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn read_only_daemon_rejects_post() {
+            let mut state = crate::server::test_support::build_test_app_state(vec![]);
+            Arc::get_mut(&mut state).expect("unique arc").read_only = true;
+            let resp = set_mcp_surface(
+                State(state),
+                Ok(Json(badge_body("truncated", vec!["productivity"]))),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn sessions_envelope_carries_badge() {
+            // list_sessions reads tmux + claude settings from HOME; isolate it
+            // the same way the artifact_route tests do.
+            let tmp = tempfile::tempdir().expect("temp home");
+            std::env::set_var("HOME", tmp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+
+            let state = crate::server::test_support::build_test_app_state(vec![]);
+            let _ = set_mcp_surface(
+                State(state.clone()),
+                Ok(Json(badge_body("truncated", vec!["productivity"]))),
+            )
+            .await
+            .into_response();
+            let Json(envelope) = list_sessions(State(state.clone()), axum::extract::Query(ListSessionsQuery { state: None })).await;
+            let badge = envelope.mcp_surface.expect("badge set on envelope");
+            assert_eq!(badge.status, "truncated");
+            assert_eq!(badge.missing, vec!["productivity".to_string()]);
+
+            let _ = set_mcp_surface(
+                State(state.clone()),
+                Ok(Json(badge_body("healthy", vec![]))),
+            )
+            .await
+            .into_response();
+            let Json(envelope) = list_sessions(State(state), axum::extract::Query(ListSessionsQuery { state: None })).await;
+            assert!(envelope.mcp_surface.is_none(), "healthy must clear envelope badge");
         }
     }
 

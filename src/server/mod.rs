@@ -433,6 +433,12 @@ pub struct AppState {
     /// each tmux scrape when `old != new`. Keep the Sender around even
     /// when no receivers exist so callers can emit without checking.
     pub status_tx: broadcast::Sender<StatusChange>,
+    /// Fleet-wide MCP gateway surface badge (per-dev WO 6137C598 B2). Written
+    /// by `POST /api/mcp-surface` from external monitors when the fastmcp
+    /// gateway is truncated or unreachable; `None` while healthy. In-memory
+    /// only: the watchdog re-posts every tick, so a restart re-converges
+    /// within a minute. Synchronous lock; critical sections are a clone.
+    pub mcp_surface: std::sync::RwLock<Option<api::McpSurfaceBadge>>,
     /// Web Push state: VAPID keypair, subscription store, VAPID subject.
     /// None when `web.notifications_enabled` is false at startup (the
     /// feature is fully off and endpoints return 404).
@@ -1234,6 +1240,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
+        mcp_surface: std::sync::RwLock::new(None),
         #[cfg(feature = "serve")]
         acp_events_tx: acp_events_tx.clone(),
         #[cfg(feature = "serve")]
@@ -1704,6 +1711,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Static segment; registered before /api/sessions/{id} so the
         // literal "search" never resolves as a session id. See #2515.
         .route("/api/sessions/search", get(api::search_sessions))
+        // Fleet MCP-surface badge, written by the external gateway monitors
+        // (per-dev WO 6137C598 B2).
+        .route(
+            "/api/mcp-surface",
+            get(api::get_mcp_surface).post(api::set_mcp_surface),
+        )
         .route("/api/recent-projects", get(api::get_recent_projects))
         .route(
             "/api/workspace-ordering",
@@ -6372,6 +6385,7 @@ pub mod test_support {
             changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             remote_owner_cache: RwLock::new(HashMap::new()),
             status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
+            mcp_surface: std::sync::RwLock::new(None),
             acp_events_tx,
             acp_event_store: event_store,
             acp_control_cache,
