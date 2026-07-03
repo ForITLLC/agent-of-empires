@@ -653,14 +653,14 @@ impl Session {
             return;
         }
         for (opt, val) in [("automatic-rename", "off"), ("allow-rename", "off")] {
-            let _ = Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["set-option", "-w", "-t", &self.name, opt, val])
                 .output();
         }
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["rename-window", "-t", &self.name, title])
             .output();
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["select-pane", "-t", &self.name, "-T", title])
             .output();
     }
