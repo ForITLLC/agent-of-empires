@@ -37,6 +37,13 @@ pub(crate) const SESSION_ID_SIDECAR_MAX_AGE: Duration = Duration::from_secs(5 * 
 /// tick — so 60s comfortably exceeds the inter-tool gap of a working turn.
 pub(crate) const HOOK_RUNNING_STALE_MAX_AGE: Duration = Duration::from_secs(60);
 
+/// Cap for an urgent flag that carries no `urgent_expires_at` stamp. Every
+/// first-party writer stamps an expiry (15 min default, 60 min ceiling), so an
+/// unstamped flag is foreign or hand-written. The reader ages it out at the
+/// writers' default TTL, measured from the file mtime, so a bare flag can
+/// never pin a row red forever.
+pub(crate) const URGENT_NO_EXPIRY_MAX_AGE: Duration = Duration::from_secs(900);
+
 /// Cap used when reading a status file. The legitimate values are short
 /// tokens; an attacker-planted larger payload is irrelevant either way.
 const STATUS_FILE_READ_CAP: usize = 64;
@@ -164,6 +171,20 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
         if now > exp {
             return false;
         }
+    } else if let Ok(Some(meta)) = dir_guard::metadata_at(dir.as_fd(), "attention.json") {
+        // No expiry stamp: age the flag out at the writers' default TTL so a
+        // bare `urgent: true` can never pin a row red forever. Fail-safe
+        // mirrors read_hook_status: a stat error or future-dated mtime keeps
+        // the flag live (no flicker on clock skew).
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .map(|age| age > URGENT_NO_EXPIRY_MAX_AGE)
+            .unwrap_or(false);
+        if stale {
+            return false;
+        }
     }
     true
 }
@@ -199,11 +220,11 @@ mod tests {
 
     /// Age a file in the instance dir to `now - offset` (mirrors the
     /// session_id stale-file test).
-    fn age_status_file(base: &std::path::Path, instance_id: &str, offset: Duration) {
+    fn age_hook_file(base: &std::path::Path, instance_id: &str, name: &str, offset: Duration) {
         let stale = std::time::SystemTime::now() - offset;
         std::fs::File::options()
             .write(true)
-            .open(base.join(instance_id).join("status"))
+            .open(base.join(instance_id).join(name))
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(stale))
             .unwrap();
@@ -217,9 +238,10 @@ mod tests {
         // callers fall back to live content detection instead of pinning blue.
         let (_g, base, _tmp) = BaseGuard::ready();
         write_status_via_guard("read_running_stale", "running");
-        age_status_file(
+        age_hook_file(
             &base,
             "read_running_stale",
+            "status",
             HOOK_RUNNING_STALE_MAX_AGE + Duration::from_secs(30),
         );
         assert_eq!(read_hook_status("read_running_stale"), None);
@@ -244,9 +266,10 @@ mod tests {
         // no matter how old the file is (it is not the stuck-blue failure mode).
         let (_g, base, _tmp) = BaseGuard::ready();
         write_status_via_guard("read_waiting_old", "waiting");
-        age_status_file(
+        age_hook_file(
             &base,
             "read_waiting_old",
+            "status",
             HOOK_RUNNING_STALE_MAX_AGE + Duration::from_secs(600),
         );
         assert_eq!(read_hook_status("read_waiting_old"), Some(Status::Waiting));
@@ -407,6 +430,24 @@ mod tests {
         let body = format!(r#"{{"urgent":true,"urgent_expires_at":{}}}"#, future);
         write_attention_json("urgent_future", &body);
         assert!(read_hook_urgent("urgent_future"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_hook_urgent_false_when_no_expiry_and_stale() {
+        // Every first-party writer stamps `urgent_expires_at`, so an
+        // unstamped urgent flag is a foreign or hand-written file. The reader
+        // caps it at the writers' default TTL (measured from file mtime) so a
+        // flag with no expiry can never pin a row red forever.
+        let (_g, base, _tmp) = BaseGuard::ready();
+        write_attention_json("urgent_unstamped_stale", r#"{"urgent":true}"#);
+        age_hook_file(
+            &base,
+            "urgent_unstamped_stale",
+            "attention.json",
+            URGENT_NO_EXPIRY_MAX_AGE + Duration::from_secs(5),
+        );
+        assert!(!read_hook_urgent("urgent_unstamped_stale"));
     }
 
     fn write_session_id_sidecar(instance_id: &str, content: &str) {
