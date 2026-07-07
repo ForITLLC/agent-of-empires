@@ -14,6 +14,7 @@ pub mod callback;
 pub mod live_ws;
 pub mod login;
 mod pane;
+pub(crate) mod pane_watchdog;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
@@ -1300,6 +1301,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // status seeding plus the synchronous recovery marking (so that first tick's
     // session counts reflect the restored state rather than a half-loaded one).
     spawn_serve_snapshot_loop(state.clone());
+
+    // Pane-content watchdog (INC-2026-07-06): detects cap/device-code/ACTION
+    // REQUIRED states that render only as pane text, relocates capped pool
+    // sessions, escalates the rest. Read-only daemons must not move sessions
+    // or fire wakes, so it is gated like the other mutating loops.
+    if !state.read_only {
+        pane_watchdog::spawn_pane_watchdog(state.clone());
+    }
 
     // GC the recently_restarted suppression map periodically; the TTL
     // check on read filters but does not remove entries. Without this,
