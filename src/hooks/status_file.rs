@@ -189,6 +189,45 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
     true
 }
 
+/// Merge a pane-watchdog urgent flag into the instance's `attention.json`
+/// without disturbing hook-written fields (tier/reason/tool survive; only
+/// the `urgent_*` family is stamped). The watchdog re-detects every tick,
+/// so a still-blocked pane keeps its flag fresh and `urgent_expires_at`
+/// clears the row after recovery. A corrupt or non-object file is replaced
+/// wholesale — the urgent flag must not be lost to junk on disk.
+pub fn merge_watchdog_urgent(
+    instance_id: &str,
+    reason: &str,
+    kind: &str,
+    ttl: Duration,
+) -> Result<()> {
+    let dir = dir_guard::open_instance_dir(instance_id)?;
+    let mut value = dir_guard::read_file_at(dir.as_fd(), "attention.json", ATTENTION_FILE_READ_CAP)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let obj = value.as_object_mut().expect("filtered to object above");
+    obj.insert("urgent".into(), true.into());
+    obj.insert(
+        "urgent_reason".into(),
+        reason.chars().take(280).collect::<String>().into(),
+    );
+    obj.insert("urgent_kind".into(), kind.into());
+    obj.insert("urgent_source".into(), "pane-watchdog".into());
+    obj.insert("urgent_set_at".into(), now.into());
+    obj.insert(
+        "urgent_expires_at".into(),
+        (now + ttl.as_secs() as i64).into(),
+    );
+    dir_guard::write_atomic(dir.as_fd(), "attention.json", value.to_string().as_bytes())
+}
+
 /// Remove the hook status directory for a given instance (cleanup on stop/delete).
 /// Symlink-safe via `dir_guard::remove_instance_dir` (`unlinkat` walk).
 pub fn cleanup_hook_status_dir(instance_id: &str) {
@@ -381,6 +420,79 @@ mod tests {
     fn write_attention_json(instance_id: &str, body: &str) {
         let dir = dir_guard::open_instance_dir(instance_id).unwrap();
         dir_guard::write_short(dir.as_fd(), "attention.json", body.as_bytes()).unwrap();
+    }
+
+    fn read_attention_value(instance_id: &str) -> serde_json::Value {
+        let dir = dir_guard::open_instance_dir_read_only(instance_id)
+            .unwrap()
+            .unwrap();
+        let bytes = dir_guard::read_file_at(dir.as_fd(), "attention.json", ATTENTION_FILE_READ_CAP)
+            .unwrap()
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_merge_watchdog_urgent_creates_file_and_reads_urgent() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        merge_watchdog_urgent(
+            "wd_urgent_new",
+            "capped: usage limit reached",
+            "cap",
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        assert!(read_hook_urgent("wd_urgent_new"));
+        let v = read_attention_value("wd_urgent_new");
+        assert_eq!(v["urgent_kind"], "cap");
+        assert_eq!(v["urgent_source"], "pane-watchdog");
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_merge_watchdog_urgent_preserves_hook_fields() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_attention_json(
+            "wd_urgent_merge",
+            r#"{"tier":5,"reason":"tool_invoke","tool":"Bash"}"#,
+        );
+        merge_watchdog_urgent(
+            "wd_urgent_merge",
+            "waiting on a device-code sign-in",
+            "auth",
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let v = read_attention_value("wd_urgent_merge");
+        assert_eq!(v["tier"], 5);
+        assert_eq!(v["reason"], "tool_invoke");
+        assert_eq!(v["urgent"], true);
+        assert_eq!(v["urgent_kind"], "auth");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let exp = v["urgent_expires_at"].as_i64().unwrap();
+        assert!(exp > now + 3000 && exp <= now + 3601, "expiry {exp} vs now {now}");
+        assert!(read_hook_urgent("wd_urgent_merge"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_merge_watchdog_urgent_recovers_from_corrupt_json() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_attention_json("wd_urgent_corrupt", "{ this is not json");
+        merge_watchdog_urgent("wd_urgent_corrupt", "capped", "cap", Duration::from_secs(60))
+            .unwrap();
+        assert!(read_hook_urgent("wd_urgent_corrupt"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_merge_watchdog_urgent_rejects_bad_instance_id() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert!(merge_watchdog_urgent("../etc", "x", "cap", Duration::from_secs(60)).is_err());
     }
 
     #[test]

@@ -30,6 +30,8 @@ pub(crate) enum PaneSignal {
     Capped,
     /// A device-code / browser-auth login prompt at the bottom of the pane.
     DeviceCode,
+    /// A live 529 server-overload error banner at the pane edge.
+    Overloaded,
     /// A worker's `ACTION REQUIRED` gate line.
     ActionRequired,
 }
@@ -37,14 +39,10 @@ pub(crate) enum PaneSignal {
 /// Cap-banner prefixes, matched line-anchored after enumerator/selector
 /// stripping and lowercasing. Prefix (not substring) matching is what keeps
 /// scrollback prose that merely *mentions* a limit from firing.
-const CAP_PREFIXES: [&str; 16] = [
+const CAP_PREFIXES: [&str; 12] = [
     "claude usage limit reached",
     "usage limit reached",
     "session limit reached",
-    "you've hit your usage limit",
-    "you've hit your weekly limit",
-    "you have hit your usage limit",
-    "you have hit your weekly limit",
     "5-hour limit reached",
     "weekly limit reached",
     "stop and wait for limit",
@@ -83,11 +81,59 @@ fn is_cap_line(line: &str) -> bool {
         return false;
     }
     let norm = normalize_cap_line(line);
-    CAP_PREFIXES.iter().any(|p| norm.starts_with(p))
+    if CAP_PREFIXES.iter().any(|p| norm.starts_with(p)) {
+        return true;
+    }
+    // Generalized personal-cap sentence: "You've hit/reached your <X> limit"
+    // where <X> varies freely (usage, weekly, monthly spend, "Fable 5",
+    // "Opus 4.8", …) — new model names must not need a battery edit. Still
+    // line-anchored (prefix) and still requires the word "limit", so prose
+    // like "you've reached your goal" never fires.
+    ["you've hit your", "you have hit your", "you've reached your", "you have reached your"]
+        .iter()
+        .any(|p| norm.starts_with(p))
+        && norm.contains("limit")
+}
+
+/// A 529 server-overload line: the JSON error type, or a word-boundary
+/// `529` either directly after an "API Error" banner or within 40 chars of
+/// "overload". Plain prose about overload and bare numbers never fire.
+/// Non-ASCII pane decoration (`⎿`, `·`) is squashed to spaces up front so
+/// byte offsets are safe.
+fn is_overload_line(line: &str) -> bool {
+    let lower: String = line
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii() { c } else { ' ' })
+        .collect();
+    if lower.contains("overloaded_error") {
+        return true;
+    }
+    let bytes = lower.as_bytes();
+    let mut start = 0;
+    while let Some(i) = lower[start..].find("529") {
+        let idx = start + i;
+        let end = idx + 3;
+        let boundary = (idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric())
+            && (end >= bytes.len() || !bytes[end].is_ascii_alphanumeric());
+        if boundary {
+            let prefix = lower[..idx].trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+            if prefix.ends_with("api error") {
+                return true;
+            }
+            let lo = idx.saturating_sub(40);
+            let hi = (end + 40).min(lower.len());
+            if lower[lo..hi].contains("overload") {
+                return true;
+            }
+        }
+        start = end;
+    }
+    false
 }
 
 /// Classify a raw `capture-pane` tail. Returns the highest-priority signal
-/// (Capped > DeviceCode > ActionRequired) or None for a healthy pane.
+/// (Capped > DeviceCode > Overloaded > ActionRequired) or None for a healthy pane.
 pub(crate) fn classify_pane_tail(raw: &str) -> Option<PaneSignal> {
     let stripped = crate::tmux::utils::strip_ansi(raw);
     let lines: Vec<&str> = stripped
@@ -112,6 +158,12 @@ pub(crate) fn classify_pane_tail(raw: &str) -> Option<PaneSignal> {
         || (recent.contains("enter the code") && recent.contains("to authenticate"));
     if device {
         return Some(PaneSignal::DeviceCode);
+    }
+
+    // Overload only counts at the live edge too: a recovered 529 buried in
+    // scrollback is a finished retry flow, not a blocked session.
+    if tail(8).iter().any(|l| is_overload_line(l)) {
+        return Some(PaneSignal::Overloaded);
     }
 
     let action_required = tail(15).iter().any(|l| {
@@ -263,6 +315,15 @@ impl Watchdog {
         self.persist_cap_state();
 
         for scan in scans {
+            // Mirror the observed block into the instance's attention.json so
+            // the TUI/FleetView red row reflects pane truth without any
+            // agent-side text scanning (the watchdog is the SOLE text
+            // authority for urgency). Every tick refreshes the TTL while the
+            // pane stays blocked; expiry clears it after recovery. Runs
+            // BEFORE the action cooldown — the row must stay red even when
+            // the escalation is rate-limited.
+            mirror_urgent(&scan);
+
             if let Some(last) = self.last_session_action.get(&scan.id) {
                 if now.duration_since(*last) < ACTION_COOLDOWN {
                     continue;
@@ -282,6 +343,10 @@ impl Watchdog {
                     )
                     .await;
                 }
+                // Transient server-side overload: red row only (mirrored
+                // above); relocation/wake would thrash on a condition that
+                // clears itself.
+                PaneSignal::Overloaded => {}
                 PaneSignal::ActionRequired => {
                     self.last_session_action.insert(scan.id.clone(), now);
                     wake(
@@ -383,6 +448,36 @@ impl Watchdog {
         if let Err(e) = std::fs::write(&path, json.to_string()) {
             tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "cap state write failed");
         }
+    }
+}
+
+/// Urgent-flag TTLs for the attention.json mirror. Cap/auth match the
+/// hook writers' 60-min ceiling (the watchdog re-stamps every tick while
+/// blocked); overload is transient so it ages out fast after recovery.
+const URGENT_TTL_BLOCKED: Duration = Duration::from_secs(60 * 60);
+const URGENT_TTL_OVERLOAD: Duration = Duration::from_secs(5 * 60);
+
+/// Mirror a pane signal into the instance's hook attention.json (red row in
+/// the TUI). Fail-open: an unwritable status dir logs and skips.
+fn mirror_urgent(scan: &PaneScan) {
+    let (kind, ttl, what) = match scan.signal {
+        PaneSignal::Capped => ("cap", URGENT_TTL_BLOCKED, "usage/session cap banner"),
+        PaneSignal::DeviceCode => ("auth", URGENT_TTL_BLOCKED, "device-code sign-in prompt"),
+        PaneSignal::Overloaded => ("overload", URGENT_TTL_OVERLOAD, "529 server overload"),
+        // ACTION REQUIRED gates flow through the wake channel; the row-level
+        // attention state for them stays owned by the worker's stop-hook.
+        PaneSignal::ActionRequired => return,
+    };
+    let reason = format!("pane-watchdog: {} on '{}'", what, scan.title);
+    if let Err(e) =
+        crate::hooks::merge_watchdog_urgent(&scan.id, &reason, kind, ttl)
+    {
+        tracing::warn!(
+            target: "server.pane_watchdog",
+            session = %scan.id,
+            error = %e,
+            "urgent mirror write failed"
+        );
     }
 }
 
@@ -510,6 +605,21 @@ Your limit will reset at 8pm.
         assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
     }
 
+    #[test]
+    fn cap_monthly_spend_limit_banner() {
+        // Fable credit-out variant #1 (WO d6bcae49 / #102): monthly SPEND cap.
+        let pane = "You've hit your monthly spend limit. Increase your limit in settings.\n";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
+    }
+
+    #[test]
+    fn cap_reached_model_limit_banner() {
+        // Fable credit-out variant #3: per-MODEL cap — the model name varies
+        // ("Fable 5", "Opus 4.8", …), so the rule must generalize.
+        let pane = "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\n";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
+    }
+
     // ── classify: cap NOISE must not fire ──────────────────────────────
 
     #[test]
@@ -526,6 +636,13 @@ Fable responses use up to 50% of your plan's weekly usage limit.
     #[test]
     fn noise_transient_rate_limit_429_is_not_cap() {
         let pane = "  ⎿  API Error (not your usage limit) · Rate limited — retrying in 8s\n";
+        assert_eq!(classify_pane_tail(pane), None);
+    }
+
+    #[test]
+    fn noise_reached_your_goal_prose_is_not_cap() {
+        // "reached your …" prose without a limit/cap subject must not fire.
+        let pane = "You've reached your goal for today; wrapping up the audit.\n";
         assert_eq!(classify_pane_tail(pane), None);
     }
 
@@ -569,6 +686,57 @@ and enter the code H7Q2K9F4P to authenticate.
             pane.push_str(&format!("subsequent output line {i}\n"));
         }
         assert_eq!(classify_pane_tail(&pane), None);
+    }
+
+    // ── classify: server overload (529) ────────────────────────────────
+
+    #[test]
+    fn overload_canonical_api_error_529_banner() {
+        let pane = "  ⎿  API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Overloaded));
+    }
+
+    #[test]
+    fn overload_529_parenthesized_with_retry_tail() {
+        let pane = "API Error (529 Overloaded) · Retrying in 4 seconds… (attempt 3/10)\n";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Overloaded));
+    }
+
+    #[test]
+    fn overload_raw_overloaded_error_type() {
+        let pane = "  ⎿  {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Overloaded));
+    }
+
+    #[test]
+    fn overload_prose_mention_is_none() {
+        // Prose about overload with no 529 / error-type shape never fires.
+        let pane = "the api felt overloaded yesterday but recovered fine\n> │\n";
+        assert_eq!(classify_pane_tail(pane), None);
+    }
+
+    #[test]
+    fn overload_bare_529_number_is_none() {
+        // A bare number is not an API error ("Processed 529 rows").
+        let pane = "Processed 529 rows in 1.2s\n";
+        assert_eq!(classify_pane_tail(pane), None);
+    }
+
+    #[test]
+    fn overload_deep_in_scrollback_is_none() {
+        // A recovered 529 buried under later output is a finished retry flow.
+        let mut pane =
+            String::from("API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n");
+        for i in 0..20 {
+            pane.push_str(&format!("subsequent output line {i}\n"));
+        }
+        assert_eq!(classify_pane_tail(&pane), None);
+    }
+
+    #[test]
+    fn cap_wins_over_overload() {
+        let pane = "API Error: 529 Overloaded\nSession limit reached ∙ resets 11pm\n";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
     }
 
     // ── classify: ACTION REQUIRED ───────────────────────────────────────
