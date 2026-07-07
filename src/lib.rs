@@ -21,6 +21,7 @@ pub mod github;
 pub mod hooks;
 pub mod logging;
 pub mod migrations;
+pub mod pane_rules;
 pub mod plugin;
 pub mod process;
 #[cfg(feature = "serve")]

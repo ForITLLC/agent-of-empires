@@ -75,6 +75,10 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AgentRuntimeConfig>,
 
+    /// Pane watchdog: scan interval and configurable pane-text rules.
+    #[serde(default)]
+    pub watchdog: crate::pane_rules::WatchdogConfig,
+
     /// Environment variables injected into the host command line for every
     /// session spawned at global scope. Entries are `KEY=value`, `KEY=$VAR`
     /// (read VAR from the host env), `KEY=$$literal` (escape a `$`), or

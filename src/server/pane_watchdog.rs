@@ -6,10 +6,11 @@
 //! REQUIRED` gate line, and device-code login prompts. All three reported
 //! `Idle` while ~20 capped sessions and a gated worker sat undetected for
 //! hours. This module is the daemon-side backstop: a supervised interval
-//! task captures every registered session's pane tail, classifies it with a
-//! noise-hardened regex battery, auto-relocates capped pool sessions down
-//! the account draw order, and escalates everything else to the
-//! AoE-Commander through the urgent-wake channel.
+//! task captures every registered session's pane tail, classifies it with
+//! the configurable rule engine in [`crate::pane_rules`] (built-in battery
+//! plus `[[watchdog.rules]]` config entries), auto-relocates capped pool
+//! sessions down the account draw order, and escalates everything else to
+//! the AoE-Commander through the urgent-wake channel.
 //!
 //! Everything here is fail-open: a capture error, a failed move, or an
 //! unwritable state file logs and skips; the daemon never crashes or stalls
@@ -17,10 +18,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::file_watch::FileWatchService;
+use crate::pane_rules::{self, CompiledRule};
 
 /// What a pane tail says the session is blocked on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,145 +38,28 @@ pub(crate) enum PaneSignal {
     ActionRequired,
 }
 
-/// Cap-banner prefixes, matched line-anchored after enumerator/selector
-/// stripping and lowercasing. Prefix (not substring) matching is what keeps
-/// scrollback prose that merely *mentions* a limit from firing.
-const CAP_PREFIXES: [&str; 12] = [
-    "claude usage limit reached",
-    "usage limit reached",
-    "session limit reached",
-    "5-hour limit reached",
-    "weekly limit reached",
-    "stop and wait for limit",
-    "switch to usage credits",
-    "switch to team plan",
-    "out of usage credits",
-    "you're out of usage credits",
-    "you are out of usage credits",
-    "your limit will reset",
-];
-
-/// Lines carrying these substrings are never a cap, whatever else they say:
-/// the transient server-side 429 banner and the Fable promo blurb both talk
-/// about usage limits without the account being capped.
-const CAP_NEGATIVE_GUARDS: [&str; 2] = ["not your usage limit", "up to 50% of"];
-
-/// Normalize one pane line for cap matching: drop the selector glyph and
-/// other leading decoration, then a `1.` / `2)` option enumerator (digits
-/// followed by `.` or `)` only, so `5-hour limit reached` survives), then
-/// lowercase.
-fn normalize_cap_line(line: &str) -> String {
-    let trimmed = line.trim_start_matches(|c: char| !c.is_alphanumeric());
-    let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
-    let rest = &trimmed[digits..];
-    let deenumerated = if digits > 0 && (rest.starts_with('.') || rest.starts_with(')')) {
-        rest[1..].trim_start()
-    } else {
-        trimmed
-    };
-    deenumerated.to_lowercase()
+/// Map a rule's `kind` string (config-facing) to the watchdog's action
+/// signal. Unknown kinds are rejected at spawn time.
+fn kind_to_signal(kind: &str) -> Option<PaneSignal> {
+    match kind {
+        "cap" => Some(PaneSignal::Capped),
+        "auth" => Some(PaneSignal::DeviceCode),
+        "overload" => Some(PaneSignal::Overloaded),
+        "action" => Some(PaneSignal::ActionRequired),
+        _ => None,
+    }
 }
 
-fn is_cap_line(line: &str) -> bool {
-    let lower = line.to_lowercase();
-    if CAP_NEGATIVE_GUARDS.iter().any(|g| lower.contains(g)) {
-        return false;
-    }
-    let norm = normalize_cap_line(line);
-    if CAP_PREFIXES.iter().any(|p| norm.starts_with(p)) {
-        return true;
-    }
-    // Generalized personal-cap sentence: "You've hit/reached your <X> limit"
-    // where <X> varies freely (usage, weekly, monthly spend, "Fable 5",
-    // "Opus 4.8", …) — new model names must not need a battery edit. Still
-    // line-anchored (prefix) and still requires the word "limit", so prose
-    // like "you've reached your goal" never fires.
-    ["you've hit your", "you have hit your", "you've reached your", "you have reached your"]
-        .iter()
-        .any(|p| norm.starts_with(p))
-        && norm.contains("limit")
-}
+/// The built-in battery, compiled once. Classification for callers outside
+/// the watchdog loop goes through this set, never through user config.
+static DEFAULT_COMPILED: LazyLock<Vec<CompiledRule>> =
+    LazyLock::new(|| pane_rules::compile(&pane_rules::default_rules()));
 
-/// A 529 server-overload line: the JSON error type, or a word-boundary
-/// `529` either directly after an "API Error" banner or within 40 chars of
-/// "overload". Plain prose about overload and bare numbers never fire.
-/// Non-ASCII pane decoration (`⎿`, `·`) is squashed to spaces up front so
-/// byte offsets are safe.
-fn is_overload_line(line: &str) -> bool {
-    let lower: String = line
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii() { c } else { ' ' })
-        .collect();
-    if lower.contains("overloaded_error") {
-        return true;
-    }
-    let bytes = lower.as_bytes();
-    let mut start = 0;
-    while let Some(i) = lower[start..].find("529") {
-        let idx = start + i;
-        let end = idx + 3;
-        let boundary = (idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric())
-            && (end >= bytes.len() || !bytes[end].is_ascii_alphanumeric());
-        if boundary {
-            let prefix = lower[..idx].trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
-            if prefix.ends_with("api error") {
-                return true;
-            }
-            let lo = idx.saturating_sub(40);
-            let hi = (end + 40).min(lower.len());
-            if lower[lo..hi].contains("overload") {
-                return true;
-            }
-        }
-        start = end;
-    }
-    false
-}
-
-/// Classify a raw `capture-pane` tail. Returns the highest-priority signal
-/// (Capped > DeviceCode > Overloaded > ActionRequired) or None for a healthy pane.
+/// Classify a raw `capture-pane` tail against the built-in rules. Returns
+/// the highest-priority signal (Capped > DeviceCode > Overloaded >
+/// ActionRequired) or None for a healthy pane.
 pub(crate) fn classify_pane_tail(raw: &str) -> Option<PaneSignal> {
-    let stripped = crate::tmux::utils::strip_ansi(raw);
-    let lines: Vec<&str> = stripped
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-
-    let tail = |n: usize| &lines[lines.len().saturating_sub(n)..];
-
-    if tail(30).iter().any(|l| is_cap_line(l)) {
-        return Some(PaneSignal::Capped);
-    }
-
-    // Device-code prompts only count while they are still at the live edge of
-    // the pane; a devicelogin URL buried under later output is a finished flow.
-    let recent = tail(8).join("\n").to_lowercase();
-    let device = recent.contains("microsoft.com/devicelogin")
-        || recent.contains("/login/device")
-        || recent.contains("first copy your one-time code")
-        || recent.contains("to sign in, use a web browser")
-        || (recent.contains("enter the code") && recent.contains("to authenticate"));
-    if device {
-        return Some(PaneSignal::DeviceCode);
-    }
-
-    // Overload only counts at the live edge too: a recovered 529 buried in
-    // scrollback is a finished retry flow, not a blocked session.
-    if tail(8).iter().any(|l| is_overload_line(l)) {
-        return Some(PaneSignal::Overloaded);
-    }
-
-    let action_required = tail(15).iter().any(|l| {
-        l.trim_start_matches(|c: char| !c.is_alphanumeric())
-            .starts_with("ACTION REQUIRED")
-    });
-    if action_required {
-        return Some(PaneSignal::ActionRequired);
-    }
-
-    None
+    pane_rules::classify(raw, &DEFAULT_COMPILED).and_then(|r| kind_to_signal(&r.kind))
 }
 
 /// The hard account draw order for cap relocation. Sessions on profiles
@@ -209,27 +94,45 @@ const CAP_TTL: Duration = Duration::from_secs(60 * 60);
 const ACTION_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
 /// Spawn the supervised watchdog interval task. No-op when disabled by env
-/// or when the daemon is read-only (moving sessions and firing wakes are
-/// writes in spirit).
+/// or config. Env overrides win over the `[watchdog]` config section, which
+/// wins over the built-in interval/rule defaults.
 pub(crate) fn spawn_pane_watchdog(state: Arc<super::AppState>) {
-    if std::env::var("AOE_PANE_WATCHDOG_DISABLE").as_deref() == Ok("1") {
+    let cfg = crate::session::Config::load_or_warn().watchdog;
+    if std::env::var("AOE_PANE_WATCHDOG_DISABLE").as_deref() == Ok("1") || cfg.disabled {
         tracing::info!(
             target: "server.pane_watchdog",
-            "pane watchdog disabled via AOE_PANE_WATCHDOG_DISABLE=1"
+            "pane watchdog disabled (AOE_PANE_WATCHDOG_DISABLE=1 or [watchdog] disabled=true)"
         );
         return;
     }
     let secs = std::env::var("AOE_PANE_WATCHDOG_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
+        .or(cfg.interval_secs)
         .filter(|s| *s >= 10)
         .unwrap_or(180);
+    let rules: Vec<CompiledRule> = pane_rules::compile(&cfg.effective_rules())
+        .into_iter()
+        .filter(|r| {
+            let known = kind_to_signal(&r.kind).is_some();
+            if !known {
+                tracing::warn!(
+                    target: "server.pane_watchdog",
+                    rule = %r.name,
+                    kind = %r.kind,
+                    "unknown rule kind; rule skipped (known: cap, auth, overload, action)"
+                );
+            }
+            known
+        })
+        .collect();
+    let rules = Arc::new(rules);
     let shutdown = state.shutdown.clone();
     crate::task_util::spawn_supervised(
         "server.pane_watchdog",
         crate::task_util::PanicPolicy::Log,
         async move {
-            let mut watchdog = Watchdog::default();
+            let mut watchdog = Watchdog::new(rules);
             let mut interval = tokio::time::interval(Duration::from_secs(secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Consume the immediate first tick so startup recovery settles
@@ -254,7 +157,7 @@ struct PaneScan {
 
 /// Capture and classify every registered non-structured session's pane tail.
 /// Blocking (tmux subprocesses + storage reads); run under `spawn_blocking`.
-fn scan_panes(file_watch: &Arc<FileWatchService>) -> Vec<PaneScan> {
+fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec<PaneScan> {
     let instances = match super::load_all_instances(file_watch) {
         Ok(i) => i,
         Err(e) => {
@@ -271,7 +174,8 @@ fn scan_panes(file_watch: &Arc<FileWatchService>) -> Vec<PaneScan> {
                 return None;
             }
             let content = sess.capture_pane(60).ok()?;
-            let signal = classify_pane_tail(&content)?;
+            let signal =
+                pane_rules::classify(&content, rules).and_then(|r| kind_to_signal(&r.kind))?;
             Some(PaneScan {
                 id: inst.id.clone(),
                 title: inst.title.clone(),
@@ -282,8 +186,10 @@ fn scan_panes(file_watch: &Arc<FileWatchService>) -> Vec<PaneScan> {
         .collect()
 }
 
-#[derive(Default)]
 struct Watchdog {
+    /// The compiled effective rule set (defaults + config), fixed for the
+    /// daemon's lifetime.
+    rules: Arc<Vec<CompiledRule>>,
     /// Profiles observed capped, with when. Entries expire after [`CAP_TTL`]
     /// so a reset account re-enters the relocation pool without a restart.
     capped_profiles: HashMap<String, Instant>,
@@ -294,9 +200,21 @@ struct Watchdog {
 }
 
 impl Watchdog {
+    fn new(rules: Arc<Vec<CompiledRule>>) -> Self {
+        Self {
+            rules,
+            capped_profiles: HashMap::new(),
+            last_session_action: HashMap::new(),
+            last_all_capped_wake: None,
+        }
+    }
+
     async fn tick(&mut self, state: &Arc<super::AppState>) {
         let file_watch = state.file_watch.clone();
-        let scans = match tokio::task::spawn_blocking(move || scan_panes(&file_watch)).await {
+        let rules = self.rules.clone();
+        let scans = match tokio::task::spawn_blocking(move || scan_panes(&file_watch, &rules))
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target: "server.pane_watchdog", error = %e, "pane scan task failed");
