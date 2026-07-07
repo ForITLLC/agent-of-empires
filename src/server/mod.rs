@@ -13,6 +13,7 @@ pub mod auth;
 pub mod callback;
 pub mod live_ws;
 pub mod login;
+mod charter_drift;
 mod pane;
 pub(crate) mod pane_watchdog;
 pub mod push;

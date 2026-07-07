@@ -10,7 +10,10 @@
 //! the configurable rule engine in [`crate::pane_rules`] (built-in battery
 //! plus `[[watchdog.rules]]` config entries), auto-relocates capped pool
 //! sessions down the account draw order, and escalates everything else to
-//! the AoE-Commander through the urgent-wake channel.
+//! the AoE-Commander through the urgent-wake channel. The same scan also
+//! checks every pane against its session's charter
+//! ([`super::charter_drift`]) and escalates out-of-scope work through the
+//! same channel.
 //!
 //! Everything here is fail-open: a capture error, a failed move, or an
 //! unwritable state file logs and skips; the daemon never crashes or stalls
@@ -23,6 +26,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::file_watch::FileWatchService;
 use crate::pane_rules::{self, CompiledRule};
+
+use super::charter_drift::{self, DriftHit};
 
 /// What a pane tail says the session is blocked on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +98,10 @@ const CAP_TTL: Duration = Duration::from_secs(60 * 60);
 /// pane that stays blocked does not generate an action every tick.
 const ACTION_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
+/// Floor between charter-drift escalations for the same (session, observed)
+/// pair. Drift is advisory, not operator-blocking, so it re-fires slowly.
+const DRIFT_COOLDOWN: Duration = Duration::from_secs(2 * 60 * 60);
+
 /// Spawn the supervised watchdog interval task. No-op when disabled by env
 /// or config. Env overrides win over the `[watchdog]` config section, which
 /// wins over the built-in interval/rule defaults.
@@ -152,7 +161,8 @@ struct PaneScan {
     id: String,
     title: String,
     profile: String,
-    signal: PaneSignal,
+    signal: Option<PaneSignal>,
+    drift: Option<DriftHit>,
 }
 
 /// Capture and classify every registered non-structured session's pane tail.
@@ -175,12 +185,17 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
             }
             let content = sess.capture_pane(60).ok()?;
             let signal =
-                pane_rules::classify(&content, rules).and_then(|r| kind_to_signal(&r.kind))?;
+                pane_rules::classify(&content, rules).and_then(|r| kind_to_signal(&r.kind));
+            let drift = charter_drift::detect(&inst.title, &inst.project_path, &content);
+            if signal.is_none() && drift.is_none() {
+                return None;
+            }
             Some(PaneScan {
                 id: inst.id.clone(),
                 title: inst.title.clone(),
                 profile: inst.source_profile.clone(),
                 signal,
+                drift,
             })
         })
         .collect()
@@ -197,6 +212,9 @@ struct Watchdog {
     last_session_action: HashMap<String, Instant>,
     /// Last ALL-CAPPED escalation, rate-limited to once per [`CAP_TTL`].
     last_all_capped_wake: Option<Instant>,
+    /// Last charter-drift escalation per (session id, observed target)
+    /// ([`DRIFT_COOLDOWN`]).
+    last_drift_wake: HashMap<(String, String), Instant>,
 }
 
 impl Watchdog {
@@ -206,6 +224,7 @@ impl Watchdog {
             capped_profiles: HashMap::new(),
             last_session_action: HashMap::new(),
             last_all_capped_wake: None,
+            last_drift_wake: HashMap::new(),
         }
     }
 
@@ -225,14 +244,20 @@ impl Watchdog {
         let now = Instant::now();
         self.capped_profiles
             .retain(|_, seen| now.duration_since(*seen) < CAP_TTL);
+        self.last_drift_wake
+            .retain(|_, fired| now.duration_since(*fired) < DRIFT_COOLDOWN);
         for scan in &scans {
-            if scan.signal == PaneSignal::Capped {
+            if scan.signal == Some(PaneSignal::Capped) {
                 self.capped_profiles.insert(scan.profile.clone(), now);
             }
         }
         self.persist_cap_state();
 
         for scan in scans {
+            if let Some(hit) = scan.drift.clone() {
+                self.handle_drift(&scan, &hit, now).await;
+            }
+            let Some(signal) = scan.signal else { continue };
             // Mirror the observed block into the instance's attention.json so
             // the TUI/FleetView red row reflects pane truth without any
             // agent-side text scanning (the watchdog is the SOLE text
@@ -240,14 +265,14 @@ impl Watchdog {
             // pane stays blocked; expiry clears it after recovery. Runs
             // BEFORE the action cooldown — the row must stay red even when
             // the escalation is rate-limited.
-            mirror_urgent(&scan);
+            mirror_urgent(&scan, signal);
 
             if let Some(last) = self.last_session_action.get(&scan.id) {
                 if now.duration_since(*last) < ACTION_COOLDOWN {
                     continue;
                 }
             }
-            match scan.signal {
+            match signal {
                 PaneSignal::Capped => self.handle_capped(&scan, now).await,
                 PaneSignal::DeviceCode => {
                     self.last_session_action.insert(scan.id.clone(), now);
@@ -279,6 +304,30 @@ impl Watchdog {
                 }
             }
         }
+    }
+
+    /// Escalate a scope/charter drift: the session's pane shows sustained
+    /// work on another product's repo or appliance host. Advisory only, so
+    /// no relocation and no attention-row mirror; the Commander decides.
+    async fn handle_drift(&mut self, scan: &PaneScan, hit: &DriftHit, now: Instant) {
+        let key = (scan.id.clone(), hit.observed.clone());
+        if self
+            .last_drift_wake
+            .get(&key)
+            .is_some_and(|fired| now.duration_since(*fired) < DRIFT_COOLDOWN)
+        {
+            return;
+        }
+        self.last_drift_wake.insert(key, now);
+        wake(
+            "charter-drift",
+            &scan.id,
+            format!(
+                "session '{}' ({}) is out of charter: chartered as {} but touching {}",
+                scan.title, scan.id, hit.charter, hit.observed
+            ),
+        )
+        .await;
     }
 
     async fn handle_capped(&mut self, scan: &PaneScan, now: Instant) {
@@ -377,8 +426,8 @@ const URGENT_TTL_OVERLOAD: Duration = Duration::from_secs(5 * 60);
 
 /// Mirror a pane signal into the instance's hook attention.json (red row in
 /// the TUI). Fail-open: an unwritable status dir logs and skips.
-fn mirror_urgent(scan: &PaneScan) {
-    let (kind, ttl, what) = match scan.signal {
+fn mirror_urgent(scan: &PaneScan, signal: PaneSignal) {
+    let (kind, ttl, what) = match signal {
         PaneSignal::Capped => ("cap", URGENT_TTL_BLOCKED, "usage/session cap banner"),
         PaneSignal::DeviceCode => ("auth", URGENT_TTL_BLOCKED, "device-code sign-in prompt"),
         PaneSignal::Overloaded => ("overload", URGENT_TTL_OVERLOAD, "529 server overload"),
