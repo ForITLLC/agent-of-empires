@@ -197,11 +197,11 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             }
         }
 
-        // Record + worktree preserved on the trash path (restorable), so this
-        // audits as the non-destructive removal event.
+        // The record survives (trashed), but the ledger must still explain
+        // why the session vanished from the active list (WO #126).
         audit::record(
-            audit::Event::Archive,
-            "cli-remove",
+            audit::Event::Trash,
+            "cli-remove-hard",
             &inst,
             storage.profile(),
             false,

@@ -70,9 +70,14 @@ pub enum Event {
     Archive,
     /// Record restored from the archived state (`aoe restore` / `unarchive`).
     Unarchive,
+    /// Record preserved but marked trashed (`--hard` with `delete_to_trash`
+    /// enabled, the default): tmux torn down, worktree relocated to the trash
+    /// holding area. Restorable via `aoe session restore`; purged via
+    /// `aoe rm --purge`.
+    Trash,
     /// Record dropped from `sessions.json` with on-disk artifacts preserved
-    /// (the legacy no-flag `remove` behaviour; reachable only via `--hard`
-    /// without `--delete-worktree`).
+    /// (the legacy no-flag `remove` behaviour; reachable via `--hard --purge`
+    /// without `--delete-worktree`, or `--hard` with `delete_to_trash` off).
     Remove,
     /// Record dropped AND on-disk artifacts (worktree/branch/container)
     /// deleted per flags — the destructive, non-restorable path (`--hard`).
