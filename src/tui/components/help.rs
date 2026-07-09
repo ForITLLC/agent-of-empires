@@ -155,20 +155,29 @@ struct HelpSection {
 
 /// The status-color legend: one hue, one meaning. Pulls live theme colors so
 /// the swatches always match what the session list actually paints (and a
-/// custom theme legends itself correctly). Mirrors `Theme::status_color`, which
-/// was collapsed to 3 hues: Waiting + Error share the attention color, and all
-/// the dormant/transient states share the neutral. Unread stays as the one
-/// opt-in decoration hue layered on top.
+/// custom theme legends itself correctly). Mirrors `Theme::status_color`:
+/// Running is green (working); Waiting/Idle/Error share the amber attention
+/// hue (a session that needs you but is not an emergency); the dormant and
+/// transient states share the neutral. RED is NOT a base status color — it is
+/// reserved for the urgent `!` decoration (device-code / cap) layered on top,
+/// alongside Unread as the finished-unseen opt-in hue.
 fn status_legend(theme: &Theme) -> HelpSection {
     HelpSection {
         title: "Status colors",
         rows: Vec::new(),
         legend: Some(vec![
-            (theme.error, "Waiting / Error — needs you (act)".to_string()),
+            (
+                theme.waiting,
+                "Waiting / Idle / Error — needs you (act)".to_string(),
+            ),
             (theme.running, "Running — working".to_string()),
             (
                 theme.dimmed,
-                "Resting — Idle / Stopped / Unknown / Starting".to_string(),
+                "Resting — Stopped / Unknown / Starting".to_string(),
+            ),
+            (
+                theme.error,
+                "Urgent — device-code / cap (act now)".to_string(),
             ),
             (theme.unread, "Unread — finished, unseen".to_string()),
         ]),

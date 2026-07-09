@@ -258,19 +258,22 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// The base status -> color mapping, collapsed to the MINIMUM meaningful
-    /// palette (Ben's UX ask, 2026-06-24): the attention view should read at a
-    /// glance as "anything in the attention hue = act, everything else = leave
-    /// alone." Three colors, each one idea:
-    /// - `error` (red): NEEDS THE HUMAN — Waiting and Error merge into one
-    ///   "act now" hue. A session blocked for input and a crashed one both want
-    ///   Ben's hands, so they share the loudest color; the glyph still tells
-    ///   them apart.
+    /// The base status -> color mapping, three hues, each one idea (Ben's UX
+    /// ask, 2026-07-09: "Idle should be fucking orange. Red is for urgent
+    /// only."):
     /// - `running` (green): actively working — do nothing, don't interrupt.
-    /// - `dimmed` (slate): everything dormant or self-resolving — Idle,
-    ///   Unknown, Stopped, and the transient Starting/Creating/Deleting states
-    ///   all collapse to one neutral. Disambiguated by glyph (and, for Idle, a
-    ///   fresh-idle spinner), not by hue.
+    /// - `waiting` (amber/orange): ALIVE AND WANTS YOUR EYES — a session blocked
+    ///   for input (Waiting), gone quiet (Idle), or crashed (Error) all share
+    ///   one warm hue. Notable, but NOT a red alert; the glyph tells them apart
+    ///   (and Idle keeps its fresh-idle spinner).
+    /// - `dimmed` (slate): dormant or self-resolving — Unknown, Stopped, and the
+    ///   transient Starting/Creating/Deleting states recede.
+    ///
+    /// RED (`error`) IS RESERVED FOR URGENT ONLY: no base status paints it. The
+    /// urgent hue belongs solely to the blinking `! ` decoration in
+    /// `home/render.rs`, raised when a session carries the urgent flag
+    /// (device-code / cap / genuinely needs Ben NOW). Letting a resting idle row
+    /// borrow red would drown the one signal that means "drop everything."
     ///
     /// The single source of truth shared by the session list
     /// (`home/render.rs`) and the preview info pane (`components/preview.rs`) so
@@ -279,10 +282,9 @@ impl Theme {
     /// status, and are not the concern of this function.
     pub fn status_color(&self, status: Status) -> Color {
         match status {
-            Status::Waiting | Status::Error => self.error,
             Status::Running => self.running,
-            Status::Idle
-            | Status::Unknown
+            Status::Waiting | Status::Idle | Status::Error => self.waiting,
+            Status::Unknown
             | Status::Stopped
             | Status::Starting
             | Status::Creating
@@ -557,67 +559,83 @@ mod tests {
     }
 
     #[test]
-    fn status_color_collapses_to_three_hues() {
-        // Ben's UX ask (2026-06-24): the attention view must read at a glance —
-        // ONE loud hue means "needs the human", everything else recedes.
+    fn status_color_maps_each_state_to_its_semantic_hue() {
+        // Ben's UX ask (2026-07-09, verbatim): "Idle should be fucking orange.
+        // Red is for urgent only." Red (`error`) is the URGENT decoration's hue
+        // ALONE — the blinking `! ` row painted in `home/render.rs` when a
+        // session carries the urgent flag (device-code / cap / genuinely needs
+        // Ben NOW). No BASE status may borrow it, or a resting idle row reads as
+        // a red alert and the one signal that means "drop everything" is lost.
+        //
         // `status_color` is the single chokepoint both the session list
         // (`home/render.rs`) and the preview info pane (`components/preview.rs`)
         // route through, so pinning its FULL mapping here guards every render
-        // path at once and is the deterministic, exact-color stand-in for a
-        // live-TUI render check (no terminal down-conversion, every arm hit).
+        // path at once, deterministically (no terminal down-conversion).
         //
-        // Each built-in theme must collapse the 9 Status variants onto exactly
-        // three of its OWN colors: `error` (act now), `running` (working),
-        // `dimmed` (dormant/transient). The retired per-tier hues —
-        // `waiting`/`fresh_idle`/`transition` — must never paint a row again.
+        // Base map (every built-in theme, onto its OWN colors):
+        //   Running                -> `running` (green): actively working.
+        //   Waiting | Idle | Error -> `waiting` (amber): alive and wants your
+        //          eyes — blocked for input, gone quiet, or crashed — but NOT a
+        //          red alert. Disambiguated by glyph, not by hue.
+        //   Unknown | Stopped | Starting | Creating | Deleting -> `dimmed`
+        //          (slate): dormant or self-resolving; recedes.
         use Status::*;
         const ALL: [Status; 9] = [
             Running, Waiting, Idle, Unknown, Stopped, Error, Starting, Deleting, Creating,
         ];
         for name in builtin_theme_names() {
             let theme = load_theme(name);
-            // The explicit merge: a session blocked for input and a crashed one
-            // both want Ben's hands, so they share the loudest hue.
-            for s in [Waiting, Error] {
-                assert_eq!(
-                    theme.status_color(s),
-                    theme.error,
-                    "{name}: {s:?} must paint with the attention hue (Waiting+Error merge)"
-                );
-            }
             assert_eq!(
                 theme.status_color(Running),
                 theme.running,
                 "{name}: Running keeps the working hue"
             );
-            // Everything dormant or self-resolving collapses to one neutral.
-            for s in [Idle, Unknown, Stopped, Starting, Deleting, Creating] {
+            // Alive-and-wants-you: blocked for input, gone idle, or crashed all
+            // share the amber attention hue — notable, but never the urgent red.
+            for s in [Waiting, Idle, Error] {
+                assert_eq!(
+                    theme.status_color(s),
+                    theme.waiting,
+                    "{name}: {s:?} must paint the amber attention hue (orange, not red)"
+                );
+            }
+            // Dormant / transient collapses to the shared neutral.
+            for s in [Unknown, Stopped, Starting, Deleting, Creating] {
                 assert_eq!(
                     theme.status_color(s),
                     theme.dimmed,
                     "{name}: {s:?} must collapse to the shared neutral (dimmed)"
                 );
             }
-            // No status may reach for any OTHER theme field — in particular the
-            // retired tier hues.
+            // RED IS FOR URGENT ONLY: no base status may paint `error`, and
+            // every base status stays inside the 3-hue base set.
             for s in ALL {
                 let c = theme.status_color(s);
+                assert_ne!(
+                    c, theme.error,
+                    "{name}: {s:?} painted the urgent red — red is reserved for the urgent `!` decoration"
+                );
                 assert!(
-                    c == theme.error || c == theme.running || c == theme.dimmed,
-                    "{name}: {s:?} painted {c:?}, outside the 3-hue set"
+                    c == theme.running || c == theme.waiting || c == theme.dimmed,
+                    "{name}: {s:?} painted {c:?}, outside the base 3-hue set"
                 );
             }
         }
-        // The canonical palette must be a REAL three colors (none tied), so the
-        // collapse still distinguishes act / working / resting at a glance.
+        // The canonical palette's three base hues must be genuinely distinct so
+        // working / wants-you / resting still read apart at a glance, and the
+        // urgent red must differ from all three.
         let empire = load_theme("empire");
-        let mut hues: Vec<Color> = ALL.iter().map(|s| empire.status_color(*s)).collect();
-        hues.sort_by_key(|c| format!("{c:?}"));
-        hues.dedup();
+        let mut base = vec![empire.running, empire.waiting, empire.dimmed];
+        base.sort_by_key(|c| format!("{c:?}"));
+        base.dedup();
         assert_eq!(
-            hues.len(),
+            base.len(),
             3,
-            "empire status palette must be exactly 3 distinct hues, got {hues:?}"
+            "empire base status palette must be exactly 3 distinct hues, got {base:?}"
+        );
+        assert!(
+            ![empire.running, empire.waiting, empire.dimmed].contains(&empire.error),
+            "empire urgent red must be distinct from every base status hue"
         );
     }
 }
