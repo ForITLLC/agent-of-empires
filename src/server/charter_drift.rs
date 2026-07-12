@@ -51,6 +51,29 @@ const TAIL_LINES: usize = 30;
 static REPO_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"GitProjects/([A-Za-z0-9._-]+)").expect("static regex"));
 
+/// Compaction / hook-plumbing that Claude Code injects into EVERY session's
+/// pane by design. A `/compact` block prints each PreCompact/PostToolUse hook's
+/// script path, and those hooks live under `.../claude-hooks/...` (the per-dev
+/// repo), so the block names per-dev on every session regardless of its actual
+/// charter, plus the "Compacted", "Skills restored", and "Referenced file"
+/// markers. None of it is the session's own work, so it must never count toward
+/// drift. Matching on the `/claude-hooks/` path segment (not a repo name) is the
+/// discriminator: it catches both `per-dev/claude-hooks/` and the legacy
+/// `personal-dev/claude-hooks/` regardless of which profile printed it.
+static HOOK_PLUMBING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)/claude-hooks/|(?:PreCompact|PostToolUse|PreToolUse|Stop)\s*\[|Compacted \(|Skills restored|Referenced file",
+    )
+    .expect("static regex")
+});
+
+/// True when a pane line is Claude Code compaction/hook plumbing rather than the
+/// session's actual work. Such lines name the hooks repo on every session by
+/// design and are excluded from the charter-drift scan.
+fn is_hook_plumbing(line: &str) -> bool {
+    HOOK_PLUMBING.is_match(line)
+}
+
 /// A confirmed drift: what the session is chartered for and what it is
 /// actually touching.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +111,7 @@ pub(crate) fn detect(title: &str, project_path: &str, pane: &str) -> Option<Drif
     let lines: Vec<&str> = stripped
         .lines()
         .map(str::trim_end)
-        .filter(|l| !l.trim().is_empty())
+        .filter(|l| !l.trim().is_empty() && !is_hook_plumbing(l))
         .collect();
     let tail = &lines[lines.len().saturating_sub(TAIL_LINES)..];
 
@@ -264,6 +287,66 @@ diff ~/GitProjects/for-Directory/a.ts ~/GitProjects/for-Directory/b.ts ~/GitProj
             ),
             None
         );
+    }
+
+    // ── compaction / hook plumbing is not the session's work ────────────
+
+    #[test]
+    fn compaction_hook_plumbing_does_not_trip_drift() {
+        // Verbatim shape of a `/compact` block: Claude Code prints each
+        // PreCompact hook's script path, which lives under
+        // `.../per-dev/claude-hooks/...` and so names the per-dev repo on
+        // EVERY session by design. Three such lines used to hit
+        // REPO_MIN_LINES and falsely flag a non-per-dev session (live case:
+        // per-finance, cwd per-Finance, doing nothing off-charter).
+        let pane = "\
+⏺ Done. Health check only, as ordered.
+❯ /compact
+  ⎿  Compacted (ctrl+o to see full summary)
+     PreCompact [/Users/ben/GitProjects/per-dev/claude-hooks/claude-attention-signal-hook.py PreCompact] completed successfully
+     PreCompact [/Users/ben/GitProjects/per-dev/claude-hooks/claude-precompact-size-enforce-hook.py PreCompact] completed successfully
+     PreCompact [/Users/ben/GitProjects/per-dev/claude-hooks/claude-compact-reinject-hook.py PreCompact] completed successfully
+  ⎿  Referenced file ../../.claude/CLAUDE.md
+  ⎿  Skills restored (superpowers:verification-before-completion)
+";
+        assert_eq!(
+            detect("per-finance", "/Users/ben/GitProjects/per-Finance", pane),
+            None
+        );
+    }
+
+    #[test]
+    fn real_drift_still_fires_despite_a_compaction_block() {
+        // The plumbing exclusion must not blind us to genuine drift that
+        // happens to share the tail with a compaction block.
+        let pane = "\
+⏺ Read(~/GitProjects/for-Directory/src/api/people.ts)
+⏺ Edit(~/GitProjects/for-Directory/src/api/people.ts)
+⏺ Bash(cd ~/GitProjects/for-Directory && npm test)
+❯ /compact
+  ⎿  Compacted (ctrl+o to see full summary)
+     PreCompact [/Users/ben/GitProjects/per-dev/claude-hooks/claude-attention-signal-hook.py PreCompact] completed successfully
+";
+        let hit = detect("for-Forms", "/Users/ben/GitProjects/for-Forms", pane)
+            .expect("real for-Directory work must still fire");
+        assert!(hit.observed.contains("repo for-Directory"), "{hit:?}");
+        assert!(!hit.observed.contains("per-dev"), "plumbing must not win: {hit:?}");
+    }
+
+    #[test]
+    fn is_hook_plumbing_flags_plumbing_and_spares_work() {
+        assert!(is_hook_plumbing(
+            "PreCompact [/Users/ben/GitProjects/per-dev/claude-hooks/x.py PreCompact] completed successfully"
+        ));
+        assert!(is_hook_plumbing(
+            "PostToolUse [/Users/ben/GitProjects/personal-dev/claude-hooks/y.py PostToolUse] completed"
+        ));
+        assert!(is_hook_plumbing("  ⎿  Compacted (ctrl+o to see full summary)"));
+        assert!(is_hook_plumbing("  ⎿  Skills restored (superpowers:verification-before-completion)"));
+        assert!(is_hook_plumbing("  ⎿  Referenced file ../../.claude/CLAUDE.md"));
+        // real work lines must NOT be treated as plumbing
+        assert!(!is_hook_plumbing("⏺ Edit(~/GitProjects/for-Directory/src/api/people.ts)"));
+        assert!(!is_hook_plumbing("⏺ Bash(cd ~/GitProjects/for-Support && npm test)"));
     }
 
     // ── exemptions ──────────────────────────────────────────────────────
