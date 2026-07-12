@@ -281,7 +281,15 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             // Case-sensitive by design: a worker's gate line is upper-case;
             // "no action required here" prose must not fire.
             pattern: r"^ACTION REQUIRED".into(),
-            negative: Vec::new(),
+            // A NEGATED payload voids the gate: "ACTION REQUIRED: none — cert
+            // registered ..." is a self-cleared recap, not a live gate (the
+            // for-Migrator 93e985ee false wake, WO e2846188). Suppress when a
+            // negation token immediately follows the phrase (after optional
+            // :/dash/whitespace). Checked against the raw line, so it is left
+            // un-anchored to tolerate leading decoration.
+            negative: vec![
+                r"(?i)ACTION REQUIRED[:\s—–-]*(?:none|nothing|n/?a|cleared)\b".into(),
+            ],
             tail_lines: 15,
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -406,6 +414,41 @@ mod tests {
         assert_eq!(compiled[1].kind, "auth");
         assert_eq!(compiled[2].kind, "overload");
         assert_eq!(compiled[3].kind, "action");
+    }
+
+    #[test]
+    fn action_required_negated_payload_does_not_fire() {
+        // WO Commander e2846188 (extends #179/#192/#230): for-Migrator 93e985ee
+        // got a false action-required wake whose SOLE matching line was a
+        // self-cleared recap: "ACTION REQUIRED: none — cert registered ...".
+        // A negation token immediately following the phrase voids the gate.
+        let compiled = compile(&default_rules());
+        assert!(
+            classify(
+                "ACTION REQUIRED: none — cert registered, deploy verified, stop\n",
+                &compiled,
+            )
+            .is_none(),
+            "the for-Migrator self-cleared recap must produce zero gate signal",
+        );
+        for line in [
+            "ACTION REQUIRED: none\n",
+            "ACTION REQUIRED — n/a\n",
+            "ACTION REQUIRED: na\n",
+            "ACTION REQUIRED: cleared\n",
+            "ACTION REQUIRED: nothing pending\n",
+        ] {
+            assert!(
+                classify(line, &compiled).is_none(),
+                "negated payload must not fire: {line:?}",
+            );
+        }
+        // A genuinely actionable gate STILL fires.
+        assert_eq!(
+            classify("ACTION REQUIRED: reply send to approve the merge\n", &compiled)
+                .map(|m| m.name.as_str()),
+            Some("action-required"),
+        );
     }
 
     #[test]
