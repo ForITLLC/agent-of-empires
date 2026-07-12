@@ -247,7 +247,7 @@ pub fn classify_fp<'a>(raw: &str, rules: &'a [CompiledRule]) -> Option<(&'a Comp
                 }
                 rule.pattern
                     .find(&text)
-                    .map(|m| (rule, fingerprint(m.as_str())))
+                    .map(|m| (rule, gate_fingerprint(rule, m.as_str())))
             }
             RuleScope::Line => window.iter().find_map(|line| {
                 if rule.negative.iter().any(|g| g.is_match(line)) {
@@ -260,7 +260,7 @@ pub fn classify_fp<'a>(raw: &str, rules: &'a [CompiledRule]) -> Option<(&'a Comp
                 };
                 rule.pattern
                     .is_match(candidate)
-                    .then(|| (rule, fingerprint(candidate)))
+                    .then(|| (rule, gate_fingerprint(rule, candidate)))
             }),
         }
     })
@@ -273,6 +273,63 @@ fn fingerprint(s: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// Route the fingerprint by rule kind. `action` gates re-word their prose every
+/// tick ("#18 remains parked …" → "#18 needs only your authorization …"), so a
+/// raw full-line fingerprint sees a NEW gate each cycle and re-wakes the
+/// Commander even though the gate is unchanged (WO d6bcae49, for-AVHR
+/// 0a3ac9fc). For action gates the STABLE identity is the set of ticket/probe/WO
+/// refs it cites (#N), not the churning prose — so key on that. All other kinds
+/// keep the full-line fingerprint. Combined with the per-session map key in the
+/// watchdog, this makes an unchanged-but-reworded held gate stay suppressed for
+/// its TTL while a genuinely different ref set still wakes immediately.
+fn gate_fingerprint(rule: &CompiledRule, candidate: &str) -> String {
+    if rule.kind == "action" {
+        action_gate_fingerprint(candidate)
+    } else {
+        fingerprint(candidate)
+    }
+}
+
+/// Extract the gate-identity fingerprint from an ACTION REQUIRED line: the
+/// sorted, de-duplicated set of `#<digits>` refs it cites, order-independent
+/// ("#18 and #24" == "#24 then #18"). Pure byte scan — no per-call regex. If the
+/// line cites no `#N` ref, fall back to the full-line prose fingerprint so two
+/// unrelated id-less gates stay distinct rather than over-collapsing.
+fn action_gate_fingerprint(candidate: &str) -> String {
+    let bytes = candidate.as_bytes();
+    let mut refs: Vec<u64> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'#' {
+            let mut j = i + 1;
+            let mut n: u64 = 0;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                n = n
+                    .saturating_mul(10)
+                    .saturating_add((bytes[j] - b'0') as u64);
+                j += 1;
+            }
+            if j > i + 1 {
+                refs.push(n);
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if refs.is_empty() {
+        return fingerprint(candidate);
+    }
+    refs.sort_unstable();
+    refs.dedup();
+    let joined = refs
+        .iter()
+        .map(|n| format!("#{n}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("action-gate:{joined}")
 }
 
 /// The built-in rule set: the operator-blocking states the watchdog shipped
@@ -594,6 +651,84 @@ mod tests {
         assert_eq!(
             rule.name, fp_rule.name,
             "both must pick the same winning rule"
+        );
+    }
+
+    // ── WO d6bcae49: reworded held gate defeats the content dampener ──────
+    // The for-AVHR (0a3ac9fc) #18 cutover gate stayed parked-on-Ben and
+    // unchanged, yet the worker reworded its ACTION REQUIRED line each cycle
+    // ("#18 remains parked on your authorization" vs "#18 needs only your
+    // authorization"). The old full-line fingerprint flipped on every reword,
+    // so the dampener saw a NEW gate and re-woke the Commander 4+ times in
+    // ~30 min. An ACTION REQUIRED line is identified by the ticket/probe/WO
+    // refs it cites (#N), not by the churning prose around them.
+
+    #[test]
+    fn action_gate_fingerprint_is_stable_across_reworded_held_gate() {
+        let compiled = compile(&default_rules());
+        let pane_a = "ACTION REQUIRED (Ben): #18 remains parked on your authorization \
+                      to execute the cutover\n> \n";
+        let pane_b = "ACTION REQUIRED (Ben): #18 needs only your authorization — nothing \
+                      else blocks the cutover\n> \n";
+        let (_, fp_a) = classify_fp(pane_a, &compiled).expect("gate a matches");
+        let (_, fp_b) = classify_fp(pane_b, &compiled).expect("gate b matches");
+        assert_eq!(
+            fp_a, fp_b,
+            "the SAME #18 gate reworded must fingerprint identically so a parked \
+             gate stops re-paging the Commander for its TTL"
+        );
+    }
+
+    #[test]
+    fn action_gate_fingerprint_differs_for_a_different_ticket() {
+        // A genuinely different gate (#24 vs #18) MUST still wake immediately.
+        let compiled = compile(&default_rules());
+        let (_, fp18) =
+            classify_fp("ACTION REQUIRED (Ben): #18 parked on you\n", &compiled).expect("gate #18");
+        let (_, fp24) =
+            classify_fp("ACTION REQUIRED (Ben): #24 parked on you\n", &compiled).expect("gate #24");
+        assert_ne!(
+            fp18, fp24,
+            "different ticket refs are different gates and must re-wake"
+        );
+    }
+
+    #[test]
+    fn action_gate_fingerprint_keys_on_ref_set_not_ref_order() {
+        // Same gate citing the same two refs, listed in either order or with
+        // reworded prose, is one fingerprint.
+        let compiled = compile(&default_rules());
+        let (_, fp1) = classify_fp(
+            "ACTION REQUIRED: #18 and #24 both await your ok\n",
+            &compiled,
+        )
+        .expect("gate 1");
+        let (_, fp2) = classify_fp(
+            "ACTION REQUIRED: #24 then #18 still need sign-off\n",
+            &compiled,
+        )
+        .expect("gate 2");
+        assert_eq!(fp1, fp2, "ref SET, not order or prose, identifies the gate");
+    }
+
+    #[test]
+    fn action_gate_without_ref_falls_back_to_full_line_fingerprint() {
+        // No #N cited → keep the prose fingerprint (unchanged behavior), so an
+        // id-less gate is not over-collapsed with an unrelated id-less gate.
+        let compiled = compile(&default_rules());
+        let (_, fp1) = classify_fp(
+            "ACTION REQUIRED: reply send to release the outward email\n",
+            &compiled,
+        )
+        .expect("gate 1");
+        let (_, fp2) = classify_fp(
+            "ACTION REQUIRED: approve the Ramp virtual-card charge\n",
+            &compiled,
+        )
+        .expect("gate 2");
+        assert_ne!(
+            fp1, fp2,
+            "distinct id-less gates must stay distinct (full-line fallback)"
         );
     }
 }
