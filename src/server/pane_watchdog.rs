@@ -467,10 +467,75 @@ async fn aoe_command(args: &[&str]) -> anyhow::Result<()> {
     }
 }
 
+/// Like [`aoe_command`] but returns captured stdout, for read subcommands
+/// (`list --all --json`) whose output the caller must parse.
+async fn aoe_output(args: &[&str]) -> anyhow::Result<String> {
+    let exe = std::env::current_exe()?;
+    let out = tokio::process::Command::new(exe)
+        .args(args)
+        .output()
+        .await?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        anyhow::bail!(
+            "exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+    }
+}
+
+/// The fleet manager session's title. It runs under an AOE *account* profile
+/// (aoe-wmw / aoe-fiw), never the daemon's default profile, so a plain
+/// `aoe send AoE-Commander` resolves in the wrong profile and 404s. Every
+/// escalation must resolve it cross-profile first.
+const COMMANDER_TITLE: &str = "AoE-Commander";
+
+/// The AoE-Commander's session id and the profile that owns it, needed to
+/// target a cross-profile `aoe send -p <profile> <id>`.
+struct CommanderTarget {
+    id: String,
+    profile: String,
+}
+
+/// Parse `aoe list --all --json` for the AoE-Commander's id and owning
+/// profile. Pure, so the resolution is unit-tested without a live daemon.
+/// Accepts either a bare array (the current CLI shape) or a `{"sessions":[…]}`
+/// wrapper.
+fn parse_commander_target(json: &str) -> Option<CommanderTarget> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let rows = value
+        .as_array()
+        .or_else(|| value.get("sessions").and_then(|s| s.as_array()))?;
+    rows.iter().find_map(|r| {
+        if r.get("title").and_then(|t| t.as_str()) != Some(COMMANDER_TITLE) {
+            return None;
+        }
+        let id = r.get("id").and_then(|v| v.as_str())?.to_string();
+        let profile = r.get("profile").and_then(|v| v.as_str())?.to_string();
+        Some(CommanderTarget { id, profile })
+    })
+}
+
+/// Resolve the AoE-Commander across all profiles. `None` on any failure
+/// (daemon-safe: fail-open, the caller just logs a skipped escalation).
+async fn resolve_commander() -> Option<CommanderTarget> {
+    match aoe_output(&["list", "--all", "--json"]).await {
+        Ok(out) => parse_commander_target(&out),
+        Err(e) => {
+            tracing::warn!(target: "server.pane_watchdog", error = %e, "commander resolve failed: aoe list --all --json");
+            None
+        }
+    }
+}
+
 /// Escalate through the operator's urgent-wake channel: the first
 /// non-comment line of `~/.claude-urgent-wake-command` (override via
 /// `URGENT_WAKE_COMMAND_FILE`) run through `bash -lc` with the context in
-/// env vars. Falls back to messaging the AoE-Commander session directly.
+/// env vars. Falls back to messaging the AoE-Commander session directly
+/// (resolved cross-profile, since it never runs under the daemon's default
+/// profile).
 async fn wake(kind: &str, session: &str, reason: String) {
     let message = format!("URGENT [pane-watchdog] {kind}: {reason}");
     tracing::warn!(target: "server.pane_watchdog", kind, session, %reason, "escalating");
@@ -513,8 +578,24 @@ async fn wake(kind: &str, session: &str, reason: String) {
         }
     }
 
-    if let Err(e) = aoe_command(&["send", "AoE-Commander", &message]).await {
-        tracing::warn!(target: "server.pane_watchdog", error = %e, "fallback Commander send failed");
+    match resolve_commander().await {
+        Some(cmd) => {
+            if let Err(e) = aoe_command(&["send", "-p", &cmd.profile, &cmd.id, &message]).await {
+                tracing::warn!(
+                    target: "server.pane_watchdog",
+                    error = %e,
+                    profile = %cmd.profile,
+                    id = %cmd.id,
+                    "fallback Commander send failed"
+                );
+            }
+        }
+        None => {
+            tracing::warn!(
+                target: "server.pane_watchdog",
+                "fallback Commander send skipped: AoE-Commander not found across profiles"
+            );
+        }
     }
 }
 
@@ -524,6 +605,57 @@ mod tests {
 
     fn caps(profiles: &[&str]) -> HashSet<String> {
         profiles.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── commander resolution: cross-profile Commander wake target ───────
+
+    #[test]
+    fn commander_resolves_from_bare_array() {
+        // The real `aoe list --all --json` shape: a bare array where the
+        // Commander sits on an AOE account profile, not the daemon default.
+        let json = r#"[
+            {"id":"aaaa1111","title":"for-Accountant","profile":"forit-main"},
+            {"id":"e284618842464176","title":"AoE-Commander","profile":"aoe-wmw"},
+            {"id":"bbbb2222","title":"for-QB-Connector","profile":"forit-backup"}
+        ]"#;
+        let t = parse_commander_target(json).expect("commander found");
+        assert_eq!(t.id, "e284618842464176");
+        assert_eq!(t.profile, "aoe-wmw");
+    }
+
+    #[test]
+    fn commander_resolves_from_sessions_wrapper() {
+        let json = r#"{"sessions":[{"id":"zzz","title":"AoE-Commander","profile":"aoe-fiw"}]}"#;
+        let t = parse_commander_target(json).expect("commander found");
+        assert_eq!(t.id, "zzz");
+        assert_eq!(t.profile, "aoe-fiw");
+    }
+
+    #[test]
+    fn commander_absent_returns_none() {
+        let json = r#"[{"id":"aaaa","title":"for-Accountant","profile":"forit-main"}]"#;
+        assert!(parse_commander_target(json).is_none());
+    }
+
+    #[test]
+    fn commander_title_is_case_sensitive_exact() {
+        // The cmdtop pin and every fleet lookup key on the exact title; a
+        // near-miss must NOT resolve (else escalations target a decoy).
+        let json = r#"[{"id":"x","title":"aoe-commander","profile":"aoe-wmw"}]"#;
+        assert!(parse_commander_target(json).is_none());
+    }
+
+    #[test]
+    fn commander_row_missing_profile_is_skipped() {
+        // A malformed row without a profile cannot be targeted by
+        // `send -p`; resolution must skip it rather than panic.
+        let json = r#"[{"id":"x","title":"AoE-Commander"}]"#;
+        assert!(parse_commander_target(json).is_none());
+    }
+
+    #[test]
+    fn commander_parse_bad_json_returns_none() {
+        assert!(parse_commander_target("not json at all").is_none());
     }
 
     // ── classify: real cap banners fire ────────────────────────────────
