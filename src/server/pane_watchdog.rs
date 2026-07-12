@@ -102,6 +102,34 @@ const ACTION_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 /// pair. Drift is advisory, not operator-blocking, so it re-fires slowly.
 const DRIFT_COOLDOWN: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// How long a session's ACTION REQUIRED fingerprint survives once its gate is
+/// no longer observed, before the content dampener forgets it. Longer than a
+/// handful of scan intervals so a transient one-tick capture miss does not
+/// reset the dampener (which would spuriously re-wake), but short enough that
+/// a genuinely cleared-then-reopened gate is treated as new. WO #139.
+const ACTION_FP_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Last escalated ACTION REQUIRED gate fingerprint for a session, plus when it
+/// was last observed (for TTL pruning). The fingerprint is content-derived
+/// (see [`pane_rules::classify_fp`]); an unchanged fingerprint means the gate
+/// is the same one already surfaced to the Commander, so it must not re-wake.
+#[derive(Clone)]
+struct ActionFp {
+    fp: String,
+    seen: Instant,
+}
+
+/// Whether an observed ACTION REQUIRED gate warrants a *fresh* Commander wake:
+/// only when its content fingerprint differs from the last one escalated for
+/// that session. A first sighting (`None`) wakes; an unchanged, already-
+/// surfaced gate is suppressed; a new/changed gate wakes immediately. This
+/// replaces the old purely-temporal `ACTION_COOLDOWN` re-fire for the action
+/// path, which re-paged every standing gate every 30 min (and on every daemon
+/// restart, since the cooldown map was in-memory only). WO #139.
+fn action_should_wake(last_fp: Option<&str>, current_fp: &str) -> bool {
+    last_fp != Some(current_fp)
+}
+
 /// Spawn the supervised watchdog interval task. No-op when disabled by env
 /// or config. Env overrides win over the `[watchdog]` config section, which
 /// wins over the built-in interval/rule defaults.
@@ -162,6 +190,10 @@ struct PaneScan {
     title: String,
     profile: String,
     signal: Option<PaneSignal>,
+    /// Content fingerprint of the winning rule's match when `signal` is
+    /// `ActionRequired`, else `None`. Drives the WO #139 content dampener:
+    /// an unchanged fingerprint is the same already-surfaced gate.
+    action_fp: Option<String>,
     drift: Option<DriftHit>,
 }
 
@@ -184,8 +216,15 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
                 return None;
             }
             let content = sess.capture_pane(60).ok()?;
-            let signal =
-                pane_rules::classify(&content, rules).and_then(|r| kind_to_signal(&r.kind));
+            // classify_fp yields the winning rule AND its churn-stable content
+            // fingerprint in one pass; keep the fp only for the ActionRequired
+            // signal (the sole content-gated path, WO #139).
+            let hit = pane_rules::classify_fp(&content, rules);
+            let signal = hit.as_ref().and_then(|(r, _)| kind_to_signal(&r.kind));
+            let action_fp = match (signal, &hit) {
+                (Some(PaneSignal::ActionRequired), Some((_, fp))) => Some(fp.clone()),
+                _ => None,
+            };
             let drift = charter_drift::detect(&inst.title, &inst.project_path, &content);
             if signal.is_none() && drift.is_none() {
                 return None;
@@ -195,6 +234,7 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
                 title: inst.title.clone(),
                 profile: inst.source_profile.clone(),
                 signal,
+                action_fp,
                 drift,
             })
         })
@@ -215,6 +255,11 @@ struct Watchdog {
     /// Last charter-drift escalation per (session id, observed target)
     /// ([`DRIFT_COOLDOWN`]).
     last_drift_wake: HashMap<(String, String), Instant>,
+    /// Last ACTION REQUIRED gate fingerprint escalated per session, persisted
+    /// across daemon restarts. An unchanged fingerprint suppresses the re-wake;
+    /// a changed one wakes immediately. WO #139. Loaded from disk in `new` so a
+    /// daemon bounce does not re-page every standing gate (the amplifier bug).
+    last_action_fp: HashMap<String, ActionFp>,
 }
 
 impl Watchdog {
@@ -225,6 +270,7 @@ impl Watchdog {
             last_session_action: HashMap::new(),
             last_all_capped_wake: None,
             last_drift_wake: HashMap::new(),
+            last_action_fp: load_action_fp(),
         }
     }
 
@@ -246,6 +292,11 @@ impl Watchdog {
             .retain(|_, seen| now.duration_since(*seen) < CAP_TTL);
         self.last_drift_wake
             .retain(|_, fired| now.duration_since(*fired) < DRIFT_COOLDOWN);
+        // Forget an ACTION REQUIRED fingerprint once its gate has gone
+        // unobserved past the TTL, so a genuinely cleared-then-reopened gate
+        // is treated as new and wakes again. WO #139.
+        self.last_action_fp
+            .retain(|_, a| now.duration_since(a.seen) < ACTION_FP_TTL);
         for scan in &scans {
             if scan.signal == Some(PaneSignal::Capped) {
                 self.capped_profiles.insert(scan.profile.clone(), now);
@@ -266,6 +317,39 @@ impl Watchdog {
             // BEFORE the action cooldown — the row must stay red even when
             // the escalation is rate-limited.
             mirror_urgent(&scan, signal);
+
+            // ACTION REQUIRED gates are CONTENT-gated, not time-gated: an
+            // unchanged, already-surfaced gate must never re-wake (the flood
+            // WO #139 fixes), but a new/changed gate wakes immediately with no
+            // cooldown wait. This path runs BEFORE the temporal ACTION_COOLDOWN
+            // that still governs cap/auth re-escalation. Every observation
+            // refreshes the fingerprint's `seen` (TTL) and persists the map so
+            // a daemon restart cannot re-page a standing gate.
+            if signal == PaneSignal::ActionRequired {
+                let current_fp = scan.action_fp.clone().unwrap_or_default();
+                let last_fp = self.last_action_fp.get(&scan.id).map(|a| a.fp.as_str());
+                let should = action_should_wake(last_fp, &current_fp);
+                self.last_action_fp.insert(
+                    scan.id.clone(),
+                    ActionFp {
+                        fp: current_fp,
+                        seen: now,
+                    },
+                );
+                if should {
+                    wake(
+                        "action-required",
+                        &scan.id,
+                        format!(
+                            "session '{}' ({}) has an open ACTION REQUIRED gate",
+                            scan.title, scan.id
+                        ),
+                    )
+                    .await;
+                }
+                self.persist_action_fp();
+                continue;
+            }
 
             if let Some(last) = self.last_session_action.get(&scan.id) {
                 if now.duration_since(*last) < ACTION_COOLDOWN {
@@ -290,18 +374,9 @@ impl Watchdog {
                 // above); relocation/wake would thrash on a condition that
                 // clears itself.
                 PaneSignal::Overloaded => {}
-                PaneSignal::ActionRequired => {
-                    self.last_session_action.insert(scan.id.clone(), now);
-                    wake(
-                        "action-required",
-                        &scan.id,
-                        format!(
-                            "session '{}' ({}) has an open ACTION REQUIRED gate",
-                            scan.title, scan.id
-                        ),
-                    )
-                    .await;
-                }
+                // Handled by the content-gated branch above (which `continue`s
+                // before reaching this match), so it is unreachable here.
+                PaneSignal::ActionRequired => {}
             }
         }
     }
@@ -416,6 +491,86 @@ impl Watchdog {
             tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "cap state write failed");
         }
     }
+
+    /// Persist the ACTION REQUIRED fingerprint map so a daemon restart resumes
+    /// the content dampener instead of re-paging every standing gate. Only the
+    /// `id -> fingerprint` pairs are stored; `seen` is monotonic and reset to
+    /// "now" on load (the fp is what dedups; the TTL window simply restarts).
+    /// WO #139.
+    fn persist_action_fp(&self) {
+        let Some(path) = action_fp_path() else { return };
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let gates: HashMap<&str, &str> = self
+            .last_action_fp
+            .iter()
+            .map(|(id, a)| (id.as_str(), a.fp.as_str()))
+            .collect();
+        let json = serde_json::json!({ "updated": now_secs, "gates": gates });
+        if let Err(e) = std::fs::write(&path, json.to_string()) {
+            tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "action-fp state write failed");
+        }
+    }
+}
+
+/// Resolve the ACTION REQUIRED fingerprint state file: `AOE_ACTION_FP_FILE`
+/// override, else `<app_dir>/action-fp-state.json`. `None` when no app dir is
+/// resolvable (fail-open: the dampener degrades to in-memory-only).
+fn action_fp_path() -> Option<PathBuf> {
+    match std::env::var("AOE_ACTION_FP_FILE") {
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => match crate::session::get_app_dir() {
+            Ok(dir) => Some(dir.join("action-fp-state.json")),
+            Err(e) => {
+                tracing::warn!(target: "server.pane_watchdog", error = %e, "no app dir; action-fp state not persisted");
+                None
+            }
+        },
+    }
+}
+
+/// Load the persisted ACTION REQUIRED fingerprint map on daemon start. A
+/// missing / unreadable / malformed file yields an empty map (fail-open).
+/// `seen` is set to now so freshly-loaded entries get a full TTL window; they
+/// are refreshed or aged out by subsequent ticks.
+fn load_action_fp() -> HashMap<String, ActionFp> {
+    let Some(path) = action_fp_path() else {
+        return HashMap::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+        tracing::warn!(target: "server.pane_watchdog", path = %path.display(), "action-fp state unparseable; starting empty");
+    }
+    parse_action_fp(&raw, Instant::now())
+}
+
+/// Parse the persisted `{"gates": {id: fp}}` document into the in-memory map,
+/// stamping every entry with `now` as its `seen`. Pure, so the restart-survival
+/// round-trip is unit-tested without touching the filesystem. A malformed doc
+/// yields an empty map. WO #139.
+fn parse_action_fp(raw: &str, now: Instant) -> HashMap<String, ActionFp> {
+    let mut map = HashMap::new();
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return map;
+    };
+    if let Some(gates) = val.get("gates").and_then(|g| g.as_object()) {
+        for (id, fp) in gates {
+            if let Some(fp) = fp.as_str() {
+                map.insert(
+                    id.clone(),
+                    ActionFp {
+                        fp: fp.to_string(),
+                        seen: now,
+                    },
+                );
+            }
+        }
+    }
+    map
 }
 
 /// Urgent-flag TTLs for the attention.json mirror. Cap/auth match the
@@ -918,5 +1073,49 @@ and enter the code H7Q2K9F4P to authenticate.
             next_uncapped("RAS-Main", &caps(&["forit-backup", "gna-main", "xce-main"])),
             Some("forit-main".to_string())
         );
+    }
+
+    // ── WO #139: ACTION REQUIRED re-fire is content-gated, not time-gated ──
+
+    #[test]
+    fn action_wakes_only_on_fingerprint_change() {
+        // First sighting (no prior fingerprint) → wake.
+        assert!(action_should_wake(None, "fp-outward-email"));
+        // Unchanged, already-surfaced gate → suppress the re-wake (this is
+        // the flood the Commander reported: identical standing gates re-paging
+        // every ACTION_COOLDOWN and on every daemon restart).
+        assert!(!action_should_wake(
+            Some("fp-outward-email"),
+            "fp-outward-email"
+        ));
+        // A new/changed gate on the same session → wake immediately.
+        assert!(action_should_wake(Some("fp-outward-email"), "fp-ramp-card"));
+    }
+
+    #[test]
+    fn action_fp_survives_a_daemon_restart_round_trip() {
+        // The amplifier the Commander reported: the fingerprint map was
+        // in-memory only, so every daemon restart wiped it and re-paged every
+        // standing gate at once. Persisted JSON must reload so a restarted
+        // watchdog treats an unchanged gate as already-surfaced (no wake).
+        let doc = serde_json::json!({
+            "updated": 1_700_000_000u64,
+            "gates": { "sess-abc": "fp-outward-email", "sess-def": "fp-ramp-card" }
+        })
+        .to_string();
+        let loaded = parse_action_fp(&doc, Instant::now());
+        assert_eq!(loaded.len(), 2);
+        // The reloaded fingerprint suppresses the re-wake for the same gate.
+        let last = loaded.get("sess-abc").map(|a| a.fp.as_str());
+        assert!(!action_should_wake(last, "fp-outward-email"));
+        // But a gate that changed while the daemon was down still wakes.
+        assert!(action_should_wake(last, "fp-outward-email-v2"));
+    }
+
+    #[test]
+    fn action_fp_malformed_state_loads_empty() {
+        assert!(parse_action_fp("not json", Instant::now()).is_empty());
+        assert!(parse_action_fp("{}", Instant::now()).is_empty());
+        assert!(parse_action_fp(r#"{"gates":[]}"#, Instant::now()).is_empty());
     }
 }

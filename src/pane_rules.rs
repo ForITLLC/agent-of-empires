@@ -221,6 +221,60 @@ pub fn classify<'a>(raw: &str, rules: &'a [CompiledRule]) -> Option<&'a Compiled
     })
 }
 
+/// Like [`classify`], but also returns a stable fingerprint of the exact text
+/// that triggered the match: the normalized matched line (Line scope) or the
+/// matched substring (Window scope). ANSI-stripped, whitespace-collapsed and
+/// lowercased so it is stable across cosmetic pane churn — spinner frames,
+/// elapsed-time counters and token tallies live on *other* lines and never
+/// enter the fingerprint. The watchdog uses this to tell an UNCHANGED standing
+/// gate (already surfaced → suppress the re-wake) from a NEW/CHANGED one (wake
+/// immediately), so a parked Ben-gate stops re-paging the Commander. WO #139.
+pub fn classify_fp<'a>(raw: &str, rules: &'a [CompiledRule]) -> Option<(&'a CompiledRule, String)> {
+    let stripped = crate::tmux::utils::strip_ansi(raw);
+    let lines: Vec<&str> = stripped
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    rules.iter().find_map(|rule| {
+        let window = &lines[lines.len().saturating_sub(rule.tail_lines)..];
+        match rule.scope {
+            RuleScope::Window => {
+                let text = window.join("\n");
+                if rule.negative.iter().any(|g| g.is_match(&text)) {
+                    return None;
+                }
+                rule.pattern
+                    .find(&text)
+                    .map(|m| (rule, fingerprint(m.as_str())))
+            }
+            RuleScope::Line => window.iter().find_map(|line| {
+                if rule.negative.iter().any(|g| g.is_match(line)) {
+                    return None;
+                }
+                let candidate = if rule.strip_decoration {
+                    normalize_line(line)
+                } else {
+                    line
+                };
+                rule.pattern
+                    .is_match(candidate)
+                    .then(|| (rule, fingerprint(candidate)))
+            }),
+        }
+    })
+}
+
+/// Collapse a matched fragment to a churn-stable key: trim, collapse internal
+/// whitespace runs to single spaces, and lowercase.
+fn fingerprint(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// The built-in rule set: the operator-blocking states the watchdog shipped
 /// with, expressed as data. Config `[[watchdog.rules]]` entries extend these
 /// (or replace them via `replace_default_rules`).
@@ -445,8 +499,11 @@ mod tests {
         }
         // A genuinely actionable gate STILL fires.
         assert_eq!(
-            classify("ACTION REQUIRED: reply send to approve the merge\n", &compiled)
-                .map(|m| m.name.as_str()),
+            classify(
+                "ACTION REQUIRED: reply send to approve the merge\n",
+                &compiled
+            )
+            .map(|m| m.name.as_str()),
             Some("action-required"),
         );
     }
@@ -482,5 +539,61 @@ mod tests {
         let rules = cfg.effective_rules();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].name, "only");
+    }
+
+    // ── WO #139: content fingerprint for the re-fire dampener ────────────
+
+    #[test]
+    fn classify_fp_is_stable_across_cosmetic_pane_churn() {
+        // Two captures of the SAME open ACTION REQUIRED gate, differing only
+        // in the spinner frame + elapsed/token counters on the surrounding
+        // chrome lines. The fingerprint must be identical so a standing,
+        // unchanged gate does not re-wake the Commander every tick.
+        let compiled = compile(&default_rules());
+        let pane_a = "✻ Working… (12s · ↑ 1.2k tokens)\n\
+                      ACTION REQUIRED: reply send to release the outward email\n\
+                      > \n";
+        let pane_b = "✢ Working… (47s · ↑ 3.9k tokens)\n\
+                      ACTION REQUIRED: reply send to release the outward email\n\
+                      > \n";
+        let (_, fp_a) = classify_fp(pane_a, &compiled).expect("gate a matches");
+        let (_, fp_b) = classify_fp(pane_b, &compiled).expect("gate b matches");
+        assert_eq!(
+            fp_a, fp_b,
+            "unchanged gate must fingerprint identically despite spinner/counter churn"
+        );
+    }
+
+    #[test]
+    fn classify_fp_changes_when_gate_payload_changes() {
+        // A genuinely new/different gate on the same session must yield a
+        // different fingerprint so it wakes immediately.
+        let compiled = compile(&default_rules());
+        let (_, fp1) = classify_fp(
+            "ACTION REQUIRED: reply send to release the outward email\n",
+            &compiled,
+        )
+        .expect("gate 1");
+        let (_, fp2) = classify_fp(
+            "ACTION REQUIRED: approve the Ramp virtual-card charge\n",
+            &compiled,
+        )
+        .expect("gate 2");
+        assert_ne!(
+            fp1, fp2,
+            "a changed gate must fingerprint differently so it re-wakes"
+        );
+    }
+
+    #[test]
+    fn classify_fp_agrees_with_classify_on_the_winning_rule() {
+        let compiled = compile(&default_rules());
+        let pane = "ACTION REQUIRED: reply send to approve the merge\n";
+        let rule = classify(pane, &compiled).expect("classify matches");
+        let (fp_rule, _) = classify_fp(pane, &compiled).expect("classify_fp matches");
+        assert_eq!(
+            rule.name, fp_rule.name,
+            "both must pick the same winning rule"
+        );
     }
 }
