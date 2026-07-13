@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::file_watch::FileWatchService;
 use crate::pane_rules::{self, CompiledRule};
 
+use super::ben_gate_surface;
 use super::charter_drift::{self, DriftHit};
 
 /// What a pane tail says the session is blocked on.
@@ -194,6 +195,11 @@ struct PaneScan {
     /// `ActionRequired`, else `None`. Drives the WO #139 content dampener:
     /// an unchanged fingerprint is the same already-surfaced gate.
     action_fp: Option<String>,
+    /// Cross-surfacer claim key for the shared Ben-gate surface ledger
+    /// (MISTAKE-f9e3f8d8 MIT-1), set only for `ActionRequired`. Primary
+    /// `gate:<id>` when the pane carries a GATE-ID/BEN-GATE label, else the
+    /// `sess:<id>|fp:<action_fp>` fallback.
+    surface_key: Option<String>,
     drift: Option<DriftHit>,
 }
 
@@ -225,6 +231,15 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
                 (Some(PaneSignal::ActionRequired), Some((_, fp))) => Some(fp.clone()),
                 _ => None,
             };
+            // Cross-surfacer claim key (MIT-1): prefer the labelled gate id from
+            // the pane (shared across all four notifiers for an outward-comms
+            // gate), else the watchdog's own session+fingerprint fallback.
+            let surface_key = action_fp
+                .as_ref()
+                .map(|fp| match ben_gate_surface::extract_gate_id(&content) {
+                    Some(g) => format!("gate:{g}"),
+                    None => format!("sess:{}|fp:{}", inst.id, fp),
+                });
             let drift = charter_drift::detect(&inst.title, &inst.project_path, &content);
             if signal.is_none() && drift.is_none() {
                 return None;
@@ -235,6 +250,7 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
                 profile: inst.source_profile.clone(),
                 signal,
                 action_fp,
+                surface_key,
                 drift,
             })
         })
@@ -337,15 +353,41 @@ impl Watchdog {
                     },
                 );
                 if should {
-                    wake(
-                        "action-required",
-                        &scan.id,
-                        format!(
-                            "session '{}' ({}) has an open ACTION REQUIRED gate",
-                            scan.title, scan.id
+                    // Cross-surfacer dedup (MISTAKE-f9e3f8d8 MIT-1): even when
+                    // this gate is new/changed for the watchdog's own WO#139
+                    // dampener, suppress the wake if another notifier (worker
+                    // Stop-hook, worker->Commander report, fleet-tick page)
+                    // already surfaced this exact gate-state to Ben. The claim
+                    // is content-keyed (`gate:<id>`) so all four lanes converge;
+                    // a live claim held by a DIFFERENT surfacer suppresses, the
+                    // same surfacer refreshes. Fail-open: any ledger error ->
+                    // claim returns true and the wake proceeds.
+                    let cross_ok = match &scan.surface_key {
+                        Some(key) => ben_gate_surface::claim_surface(
+                            key,
+                            "pane-watchdog",
+                            ACTION_FP_TTL.as_secs(),
+                            unix_now(),
                         ),
-                    )
-                    .await;
+                        None => true,
+                    };
+                    if cross_ok {
+                        wake(
+                            "action-required",
+                            &scan.id,
+                            format!(
+                                "session '{}' ({}) has an open ACTION REQUIRED gate",
+                                scan.title, scan.id
+                            ),
+                        )
+                        .await;
+                    } else {
+                        tracing::debug!(
+                            target: "server.pane_watchdog",
+                            id = %scan.id,
+                            "ACTION REQUIRED gate already surfaced by another notifier; cross-surfacer deduped (MIT-1)"
+                        );
+                    }
                 }
                 self.persist_action_fp();
                 continue;
@@ -513,6 +555,17 @@ impl Watchdog {
             tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "action-fp state write failed");
         }
     }
+}
+
+/// Wall-clock unix seconds as f64, matching the py lanes' `time.time()`. Used
+/// only to timestamp cross-surfacer ledger claims (MIT-1). Fail-safe: an
+/// unresolvable clock -> 0.0 (a claim that instantly looks expired, i.e.
+/// fail-open toward surfacing).
+fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// Resolve the ACTION REQUIRED fingerprint state file: `AOE_ACTION_FP_FILE`

@@ -297,7 +297,7 @@ fn gate_fingerprint(rule: &CompiledRule, candidate: &str) -> String {
 /// ("#18 and #24" == "#24 then #18"). Pure byte scan — no per-call regex. If the
 /// line cites no `#N` ref, fall back to the full-line prose fingerprint so two
 /// unrelated id-less gates stay distinct rather than over-collapsing.
-fn action_gate_fingerprint(candidate: &str) -> String {
+pub(crate) fn action_gate_fingerprint(candidate: &str) -> String {
     let bytes = candidate.as_bytes();
     let mut refs: Vec<u64> = Vec::new();
     let mut i = 0;
