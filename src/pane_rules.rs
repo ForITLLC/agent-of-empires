@@ -400,6 +400,17 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             // un-anchored to tolerate leading decoration.
             negative: vec![
                 r"(?i)ACTION REQUIRED[:\s—–-]*(?:none|nothing|n/?a|cleared)\b".into(),
+                // WO d6bcae49: void a QUOTED-template match. Stop-hook /
+                // commander boilerplate quotes the phrase to describe the
+                // format (`ACTION REQUIRED:` / 'ACTION REQUIRED:'). normalize
+                // strips the leading backtick/quote so the quotation false-fires
+                // `^ACTION REQUIRED`. The negative guard sees the RAW line, so
+                // when a backtick or straight/smart quote is the leading
+                // decoration wrapping the phrase, it is template text, not a
+                // live gate. Bullet/blockquote decoration (-, >) is NOT a quote
+                // and still fires; a backtick elsewhere in a real payload
+                // ("run `git push`") is not at line-start and still fires.
+                r#"^\s*[`'"\x{2018}\x{2019}\x{201C}\x{201D}]\s*ACTION REQUIRED"#.into(),
             ],
             tail_lines: 15,
             scope: RuleScope::Line,
@@ -794,6 +805,61 @@ mod tests {
             .map(|m| m.name.as_str()),
             Some("action-required"),
         );
+    }
+
+    #[test]
+    fn action_required_quoted_template_text_does_not_fire() {
+        // WO Commander d6bcae49: the gate-watchdog fired on its OWN pane. The
+        // sole matching line was stop-hook / commander BOILERPLATE that QUOTES
+        // the phrase to describe the format, e.g. the monitoring-loop rule
+        // "your correct final line is `ACTION REQUIRED:` / a heartbeat note".
+        // normalize_line() strips the leading backtick/quote, so the quoted
+        // template becomes `^ACTION REQUIRED` and false-fires. A real emitted
+        // gate is never wrapped in a backtick/quote at line start; that wrapper
+        // is the template signature. Guard runs on the RAW line so the wrapper
+        // is still visible.
+        let compiled = compile(&default_rules());
+        for line in [
+            // backtick-wrapped (global CLAUDE.md monitoring rule + this session)
+            "`ACTION REQUIRED:` — prefix a line only when Ben must personally act\n",
+            "   `ACTION REQUIRED:` / a heartbeat note with the task still OPEN\n",
+            // single-quote-wrapped (claude-commander-session-start-hook.py:166)
+            "'ACTION REQUIRED:' ONLY when Ben must personally act\n",
+            // double-quote-wrapped
+            "\"ACTION REQUIRED:\" is the Moshi-notify sentinel\n",
+            // smart-quote-wrapped (voice/markdown renderers emit these)
+            "\u{2018}ACTION REQUIRED:\u{2019} template, not a live gate\n",
+            "\u{201c}ACTION REQUIRED\u{201d} prefix a line\n",
+        ] {
+            assert!(
+                classify(line, &compiled).is_none(),
+                "quoted template text must not fire: {line:?}",
+            );
+        }
+        // A real gate whose PAYLOAD happens to contain a backtick still fires
+        // (the wrapper guard keys on the phrase itself being quoted, not on a
+        // backtick anywhere in the payload).
+        assert_eq!(
+            classify(
+                "ACTION REQUIRED: run `git push` to land the approved merge\n",
+                &compiled
+            )
+            .map(|m| m.name.as_str()),
+            Some("action-required"),
+            "a real gate with a backtick in its payload must still fire",
+        );
+        // A bullet/blockquote-decorated real gate (non-quote leading decoration)
+        // still fires — only quote/backtick wrapping is the template signature.
+        for line in [
+            "- ACTION REQUIRED: approve the send\n",
+            "> ACTION REQUIRED: approve the send\n",
+        ] {
+            assert_eq!(
+                classify(line, &compiled).map(|m| m.name.as_str()),
+                Some("action-required"),
+                "bullet/blockquote-decorated real gate must still fire: {line:?}",
+            );
+        }
     }
 
     #[test]
