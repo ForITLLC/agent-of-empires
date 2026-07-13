@@ -330,7 +330,10 @@ diff ~/GitProjects/for-Directory/a.ts ~/GitProjects/for-Directory/b.ts ~/GitProj
         let hit = detect("for-Forms", "/Users/ben/GitProjects/for-Forms", pane)
             .expect("real for-Directory work must still fire");
         assert!(hit.observed.contains("repo for-Directory"), "{hit:?}");
-        assert!(!hit.observed.contains("per-dev"), "plumbing must not win: {hit:?}");
+        assert!(
+            !hit.observed.contains("per-dev"),
+            "plumbing must not win: {hit:?}"
+        );
     }
 
     #[test]
@@ -341,12 +344,22 @@ diff ~/GitProjects/for-Directory/a.ts ~/GitProjects/for-Directory/b.ts ~/GitProj
         assert!(is_hook_plumbing(
             "PostToolUse [/Users/ben/GitProjects/personal-dev/claude-hooks/y.py PostToolUse] completed"
         ));
-        assert!(is_hook_plumbing("  ⎿  Compacted (ctrl+o to see full summary)"));
-        assert!(is_hook_plumbing("  ⎿  Skills restored (superpowers:verification-before-completion)"));
-        assert!(is_hook_plumbing("  ⎿  Referenced file ../../.claude/CLAUDE.md"));
+        assert!(is_hook_plumbing(
+            "  ⎿  Compacted (ctrl+o to see full summary)"
+        ));
+        assert!(is_hook_plumbing(
+            "  ⎿  Skills restored (superpowers:verification-before-completion)"
+        ));
+        assert!(is_hook_plumbing(
+            "  ⎿  Referenced file ../../.claude/CLAUDE.md"
+        ));
         // real work lines must NOT be treated as plumbing
-        assert!(!is_hook_plumbing("⏺ Edit(~/GitProjects/for-Directory/src/api/people.ts)"));
-        assert!(!is_hook_plumbing("⏺ Bash(cd ~/GitProjects/for-Support && npm test)"));
+        assert!(!is_hook_plumbing(
+            "⏺ Edit(~/GitProjects/for-Directory/src/api/people.ts)"
+        ));
+        assert!(!is_hook_plumbing(
+            "⏺ Bash(cd ~/GitProjects/for-Support && npm test)"
+        ));
     }
 
     // ── exemptions ──────────────────────────────────────────────────────
