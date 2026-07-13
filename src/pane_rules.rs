@@ -410,6 +410,103 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
     ]
 }
 
+/// True when a session's `extra_args` pins it to the Fable model
+/// (`--model fable`, `--model=fable`, or a full `claude-fable-*` id). The Fable
+/// model-drift detector ([`fable_drift_rules`]) is gated on this: condition (a)
+/// — a Sonnet/Opus SUBAGENT — is normal on a non-Fable session and must never
+/// fire there; only a Fable-pinned session dispatching off-Fable work is drift.
+/// WO d6bcae49 (subagent-vector + silent-Fable-limit).
+pub fn is_fable_pinned(extra_args: &str) -> bool {
+    let lower = extra_args.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(idx) = rest.find("--model") {
+        let after = &rest[idx + "--model".len()..];
+        // Tolerate both `--model fable` and `--model=fable`.
+        let after = after.strip_prefix('=').unwrap_or(after);
+        let val = after
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| c == '"' || c == '\'');
+        if val == "fable" || val.starts_with("claude-fable") || val.starts_with("fable-") {
+            return true;
+        }
+        rest = &rest[idx + "--model".len()..];
+    }
+    false
+}
+
+/// The Fable model-drift rule battery (kind `"fable"`). Run as a SEPARATE pass,
+/// only for Fable-pinned sessions (see [`is_fable_pinned`]), so the general
+/// engine stays model-agnostic. Three vectors, all tightened so that a Fable
+/// session merely *building a Claude app* (writing `model="claude-opus-4-8"`) or
+/// carrying injected skill prose ("default to using Opus") never fires — an
+/// ACTION verb, a subagent/Task token, or a named Fable-limit is required:
+///   1. `fable-limit-paraphrase` — the account hit a Fable cap on a background /
+///      subagent path and the exact credit-out banner (the general `cap` rule)
+///      never rendered; "Fable" named next to a limit/credit/quota word.
+///   2. `fable-downgrade-verb` — an explicit relaunch / fall-back / drop-to /
+///      switch-to onto a non-Fable model ("relaunched on Sonnet", "dropped to
+///      sonnet").
+///   3. `fable-subagent-model` — a subagent / Task tool named adjacent to a
+///      non-Fable model ("Sonnet subagents", "Task(build) running on
+///      claude-sonnet-5") — condition (a), the subagent vector.
+/// On a hit the watchdog PAGES the Commander (never auto-swaps the model), with
+/// a content-gated fingerprint dampener so a standing drift does not re-flood.
+pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
+    vec![
+        PaneRuleConfig {
+            name: "fable-limit-paraphrase".into(),
+            kind: "fable".into(),
+            // "Fable" named within 40 chars of a limit/credit/quota word, in
+            // either order. This is the SILENT-limit case the general `cap`
+            // rule misses because the paraphrase does not match a cap banner.
+            pattern: r"(?i)(?:fable\b[^\n]{0,40}\b(?:usage limit|usage credit|out of (?:usage )?credits?|credit limit|credits? (?:remaining|left|exhausted|depleted|ran out)|quota|rate.?limit(?:ed)?|limit (?:reached|hit|exceeded))|\b(?:usage limit|out of (?:usage )?credits?|limit (?:reached|hit|exceeded))[^\n]{0,40}\bfable\b)".into(),
+            // The Fable rollout promo names Fable next to "weekly usage limit".
+            negative: vec![
+                r"(?i)up to 50% of".into(),
+                r"(?i)try claude fable".into(),
+            ],
+            tail_lines: 25,
+            scope: RuleScope::Window,
+            strip_decoration: false,
+            priority: 0,
+            enabled: true,
+        },
+        PaneRuleConfig {
+            name: "fable-downgrade-verb".into(),
+            kind: "fable".into(),
+            // A strong runtime-downgrade verb within 25 chars of a non-Fable
+            // model. Strong verbs only — "default to", "use", "using" are
+            // excluded because they dominate app-building prose / injected skill
+            // context ("default to using Opus", "unless the user says 'use
+            // sonnet'").
+            pattern: r"(?i)\b(?:re-?launch(?:ed|ing)?|restart(?:ed|ing)?|fell back|fall(?:ing)? back|fallback|drop(?:ped|ping)? (?:down |back )?to|switch(?:ed|ing)? (?:to|onto)|revert(?:ed|ing)? to|downgrad(?:ed|e|ing)? to|bumped? down to|kicked (?:it )?(?:down|over) to|moved? (?:down |back )?to)\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus)\b".into(),
+            negative: Vec::new(),
+            tail_lines: 25,
+            scope: RuleScope::Line,
+            strip_decoration: true,
+            priority: 1,
+            enabled: true,
+        },
+        PaneRuleConfig {
+            name: "fable-subagent-model".into(),
+            kind: "fable".into(),
+            // A subagent / Task tool named adjacent to a non-Fable model, either
+            // order. A subagent with NO model named (a normal Fable subagent) or
+            // a model literal with NO subagent (app code) never fires.
+            pattern: r"(?i)(?:\b(?:claude-)?(?:sonnet|opus)\b[^\n]{0,20}\bsub-?agents?\b|\bsub-?agents?\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus)\b|task\([^\n]{0,60}\b(?:claude-)?(?:sonnet|opus)\b)".into(),
+            negative: Vec::new(),
+            tail_lines: 25,
+            scope: RuleScope::Line,
+            strip_decoration: true,
+            priority: 2,
+            enabled: true,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,6 +523,140 @@ mod tests {
             priority: 0,
             enabled: true,
         }
+    }
+
+    // ---- Fable model-drift detection (WO d6bcae49) ---------------------------
+
+    #[test]
+    fn is_fable_pinned_recognizes_fable_model_flag() {
+        // Positive: --model fable / --model=fable / full claude-fable id.
+        assert!(is_fable_pinned("--model fable"));
+        assert!(is_fable_pinned("--model=fable"));
+        assert!(is_fable_pinned("--model claude-fable-5"));
+        assert!(is_fable_pinned(
+            "--dangerously-skip-permissions --model fable --resume abc123"
+        ));
+        assert!(is_fable_pinned("--model=\"claude-fable-5\""));
+        // Loops past a non-fable --model to a later fable one.
+        assert!(is_fable_pinned("--model opus --model fable"));
+    }
+
+    #[test]
+    fn is_fable_pinned_rejects_non_fable() {
+        assert!(!is_fable_pinned(""));
+        assert!(!is_fable_pinned("--resume xyz"));
+        assert!(!is_fable_pinned("--model sonnet"));
+        assert!(!is_fable_pinned("--model claude-opus-4-8"));
+        assert!(!is_fable_pinned("--model=claude-sonnet-5 --resume q"));
+        // A session merely mentioning fable in a non-model arg must NOT pin.
+        assert!(!is_fable_pinned("--resume fable-notes-session"));
+    }
+
+    #[test]
+    fn fable_drift_fires_on_silent_limit_and_downgrade_and_subagent() {
+        let compiled = compile(&fable_drift_rules());
+        // (b) silent Fable-limit paraphrase — the exact cap banner never rendered.
+        assert!(
+            classify(
+                "You've hit your Fable usage limit for the week.\n",
+                &compiled
+            )
+            .is_some(),
+            "fable usage-limit paraphrase must fire"
+        );
+        assert!(
+            classify("Error: out of usage credits for fable.\n", &compiled).is_some(),
+            "out-of-credits (fable) must fire"
+        );
+        // (b) explicit runtime downgrade onto a non-Fable model.
+        assert!(
+            classify("Fable capped — relaunched on Sonnet.\n", &compiled).is_some(),
+            "relaunch-on-sonnet must fire"
+        );
+        assert!(
+            classify("dropped to sonnet for the rest of the run\n", &compiled).is_some(),
+            "dropped-to-sonnet must fire"
+        );
+        // (a) subagent vector — non-Fable model named at a subagent/Task.
+        assert!(
+            classify(
+                "dispatching its whole build on Sonnet subagents now\n",
+                &compiled
+            )
+            .is_some(),
+            "sonnet-subagents must fire"
+        );
+        assert!(
+            classify(
+                "⏺ Task(build the API) running on claude-sonnet-5\n",
+                &compiled
+            )
+            .is_some(),
+            "Task-on-sonnet must fire"
+        );
+        assert!(
+            classify("spawned an Opus subagent to do the migration\n", &compiled).is_some(),
+            "opus-subagent must fire (condition (a) covers Sonnet OR Opus)"
+        );
+    }
+
+    #[test]
+    fn fable_drift_ignores_clean_pane_and_app_code() {
+        let compiled = compile(&fable_drift_rules());
+        // Clean working spinner — no drift.
+        assert!(classify("✻ Working… (12s · ↑ 1.2k tokens)\n", &compiled).is_none());
+        // A Fable session BUILDING a Claude app writes model literals — must NOT fire.
+        assert!(classify("        model=\"claude-opus-4-8\",\n", &compiled).is_none());
+        assert!(
+            classify(
+                "default to using claude-opus-4-8 for the API calls\n",
+                &compiled
+            )
+            .is_none(),
+            "injected skill prose 'using opus' must NOT fire"
+        );
+        assert!(
+            classify(
+                "unless the user says 'use sonnet' or 'use haiku'\n",
+                &compiled
+            )
+            .is_none(),
+            "'use sonnet' imperative must NOT fire"
+        );
+        // A subagent with NO model named is a NORMAL Fable subagent — must NOT fire.
+        assert!(classify("Use parallel subagents aggressively.\n", &compiled).is_none());
+        assert!(classify("⏺ Task(build the classifier)\n", &compiled).is_none());
+        // A Fable session literally coding sonnet into an app (no subagent/verb) — no fire.
+        assert!(
+            classify(
+                "        model = \"claude-sonnet-5\"  # classifier\n",
+                &compiled
+            )
+            .is_none(),
+            "sonnet model literal without subagent/downgrade-verb must NOT fire"
+        );
+        // The Fable rollout promo names Fable next to 'usage limit' — negative guard.
+        assert!(
+            classify(
+                "Try Claude Fable 5 — up to 50% of your weekly usage limit.\n",
+                &compiled
+            )
+            .is_none(),
+            "fable promo line must NOT fire"
+        );
+    }
+
+    #[test]
+    fn fable_drift_fingerprint_stable_across_spinner_churn() {
+        let compiled = compile(&fable_drift_rules());
+        let a = "You've hit your Fable usage limit.\n✻ Working… (3s)\n";
+        let b = "You've hit your Fable usage limit.\n✻ Working… (49s)\n";
+        let (_, fp_a) = classify_fp(a, &compiled).expect("a matches");
+        let (_, fp_b) = classify_fp(b, &compiled).expect("b matches");
+        assert_eq!(
+            fp_a, fp_b,
+            "fingerprint must be stable across cosmetic churn"
+        );
     }
 
     #[test]

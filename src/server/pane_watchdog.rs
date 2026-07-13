@@ -68,6 +68,32 @@ pub(crate) fn classify_pane_tail(raw: &str) -> Option<PaneSignal> {
     pane_rules::classify(raw, &DEFAULT_COMPILED).and_then(|r| kind_to_signal(&r.kind))
 }
 
+/// The Fable model-drift battery, compiled once. Built-in only (not user
+/// configurable), like [`DEFAULT_COMPILED`]. WO d6bcae49.
+static DEFAULT_FABLE_COMPILED: LazyLock<Vec<CompiledRule>> =
+    LazyLock::new(|| pane_rules::compile(&pane_rules::fable_drift_rules()));
+
+/// Classify a raw pane tail against the Fable-drift rules. Returns the winning
+/// rule name and its churn-stable content fingerprint, or None for a clean
+/// pane. WO d6bcae49.
+pub(crate) fn classify_fable_drift(raw: &str) -> Option<(String, String)> {
+    pane_rules::classify_fp(raw, &DEFAULT_FABLE_COMPILED).map(|(r, fp)| (r.name.clone(), fp))
+}
+
+/// Fable model-drift for one session, GATED on the session being Fable-pinned.
+/// This gate is the whole safety property: a NON-Fable session running a
+/// Sonnet/Opus subagent is normal and returns None; only a Fable-pinned session
+/// hitting a silent Fable cap, announcing a downgrade, or dispatching a
+/// non-Fable subagent yields a hit. Returns (rule, fingerprint). WO d6bcae49
+/// (subagent-vector + silent-Fable-limit). The watchdog PAGES the Commander on
+/// a hit and never auto-swaps the model.
+pub(crate) fn fable_scan_hit(extra_args: &str, content: &str) -> Option<(String, String)> {
+    if !pane_rules::is_fable_pinned(extra_args) {
+        return None;
+    }
+    classify_fable_drift(content)
+}
+
 /// The hard account draw order for cap relocation. Sessions on profiles
 /// outside this pool are never auto-moved (escalate only).
 pub(crate) const DRAW_ORDER: [&str; 5] = [
@@ -201,6 +227,11 @@ struct PaneScan {
     /// `sess:<id>|fp:<action_fp>` fallback.
     surface_key: Option<String>,
     drift: Option<DriftHit>,
+    /// Fable model-drift evidence `(rule, fingerprint)` when this is a
+    /// Fable-pinned session showing off-Fable drift, else `None`. Content-gated
+    /// on its own fingerprint dampener (mirror of `action_fp`), pages the
+    /// Commander, never auto-swaps. WO d6bcae49.
+    fable_hit: Option<(String, String)>,
 }
 
 /// Capture and classify every registered non-structured session's pane tail.
@@ -241,7 +272,10 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
                     None => format!("sess:{}|fp:{}", inst.id, fp),
                 });
             let drift = charter_drift::detect(&inst.title, &inst.project_path, &content);
-            if signal.is_none() && drift.is_none() {
+            // Fable model-drift is gated on the session's own model pin, so a
+            // non-Fable session's Sonnet/Opus subagent never fires here.
+            let fable_hit = fable_scan_hit(&inst.extra_args, &content);
+            if signal.is_none() && drift.is_none() && fable_hit.is_none() {
                 return None;
             }
             Some(PaneScan {
@@ -252,6 +286,7 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
                 action_fp,
                 surface_key,
                 drift,
+                fable_hit,
             })
         })
         .collect()
@@ -276,6 +311,11 @@ struct Watchdog {
     /// a changed one wakes immediately. WO #139. Loaded from disk in `new` so a
     /// daemon bounce does not re-page every standing gate (the amplifier bug).
     last_action_fp: HashMap<String, ActionFp>,
+    /// Last Fable model-drift fingerprint paged per session, persisted across
+    /// restarts. Same content-dampener semantics as `last_action_fp`: an
+    /// unchanged drift fingerprint is suppressed, a new/changed one pages the
+    /// Commander immediately. WO d6bcae49.
+    last_fable_fp: HashMap<String, ActionFp>,
 }
 
 impl Watchdog {
@@ -287,6 +327,7 @@ impl Watchdog {
             last_all_capped_wake: None,
             last_drift_wake: HashMap::new(),
             last_action_fp: load_action_fp(),
+            last_fable_fp: load_fable_fp(),
         }
     }
 
@@ -313,6 +354,10 @@ impl Watchdog {
         // is treated as new and wakes again. WO #139.
         self.last_action_fp
             .retain(|_, a| now.duration_since(a.seen) < ACTION_FP_TTL);
+        // Same TTL-forget for Fable-drift fingerprints: a drift that stops being
+        // observed ages out so a genuinely new one later pages again. WO d6bcae49.
+        self.last_fable_fp
+            .retain(|_, a| now.duration_since(a.seen) < ACTION_FP_TTL);
         for scan in &scans {
             if scan.signal == Some(PaneSignal::Capped) {
                 self.capped_profiles.insert(scan.profile.clone(), now);
@@ -323,6 +368,12 @@ impl Watchdog {
         for scan in scans {
             if let Some(hit) = scan.drift.clone() {
                 self.handle_drift(&scan, &hit, now).await;
+            }
+            // Fable model-drift is independent of the general signal (a
+            // Fable-pinned session can drift with no cap/auth signal), so handle
+            // it before the `signal` guard, content-gated on its own dampener.
+            if let Some((rule, fp)) = scan.fable_hit.clone() {
+                self.handle_fable_drift(&scan, &rule, &fp, now).await;
             }
             let Some(signal) = scan.signal else { continue };
             // Mirror the observed block into the instance's attention.json so
@@ -447,6 +498,38 @@ impl Watchdog {
         .await;
     }
 
+    /// Page the Commander that a Fable-pinned session is drifting off Fable: a
+    /// silent Fable cap, a runtime downgrade announcement, or a non-Fable
+    /// subagent (condition (a)/(b), WO d6bcae49). Content-gated on the drift
+    /// fingerprint (mirror of the WO #139 ActionFp dampener) so a standing drift
+    /// does not re-flood; a new/changed drift pages immediately. NEVER auto-
+    /// swaps the model — the Commander decides. Every observation refreshes the
+    /// fingerprint's `seen` (TTL) and persists the map so a daemon restart
+    /// cannot re-page a standing drift.
+    async fn handle_fable_drift(&mut self, scan: &PaneScan, rule: &str, fp: &str, now: Instant) {
+        let last_fp = self.last_fable_fp.get(&scan.id).map(|a| a.fp.as_str());
+        let should = action_should_wake(last_fp, fp);
+        self.last_fable_fp.insert(
+            scan.id.clone(),
+            ActionFp {
+                fp: fp.to_string(),
+                seen: now,
+            },
+        );
+        if should {
+            wake(
+                "fable-model-drift",
+                &scan.id,
+                format!(
+                    "Fable-pinned session '{}' ({}) shows off-Fable model drift [{}]: {}",
+                    scan.title, scan.id, rule, fp
+                ),
+            )
+            .await;
+        }
+        self.persist_fable_fp();
+    }
+
     async fn handle_capped(&mut self, scan: &PaneScan, now: Instant) {
         if !DRAW_ORDER.contains(&scan.profile.as_str()) {
             self.last_session_action.insert(scan.id.clone(), now);
@@ -555,6 +638,23 @@ impl Watchdog {
             tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "action-fp state write failed");
         }
     }
+
+    fn persist_fable_fp(&self) {
+        let Some(path) = fable_fp_path() else { return };
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let gates: HashMap<&str, &str> = self
+            .last_fable_fp
+            .iter()
+            .map(|(id, a)| (id.as_str(), a.fp.as_str()))
+            .collect();
+        let json = serde_json::json!({ "updated": now_secs, "gates": gates });
+        if let Err(e) = std::fs::write(&path, json.to_string()) {
+            tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "fable-fp state write failed");
+        }
+    }
 }
 
 /// Wall-clock unix seconds as f64, matching the py lanes' `time.time()`. Used
@@ -598,6 +698,35 @@ fn load_action_fp() -> HashMap<String, ActionFp> {
     if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
         tracing::warn!(target: "server.pane_watchdog", path = %path.display(), "action-fp state unparseable; starting empty");
     }
+    parse_action_fp(&raw, Instant::now())
+}
+
+/// Resolve the Fable-drift fingerprint state file: `AOE_FABLE_FP_FILE` override,
+/// else `<app_dir>/fable-fp-state.json`. Separate file from the ACTION REQUIRED
+/// dampener so the two never collide. WO d6bcae49.
+fn fable_fp_path() -> Option<PathBuf> {
+    match std::env::var("AOE_FABLE_FP_FILE") {
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => match crate::session::get_app_dir() {
+            Ok(dir) => Some(dir.join("fable-fp-state.json")),
+            Err(e) => {
+                tracing::warn!(target: "server.pane_watchdog", error = %e, "no app dir; fable-fp state not persisted");
+                None
+            }
+        },
+    }
+}
+
+/// Load the persisted Fable-drift fingerprint map on daemon start. Reuses the
+/// `{"gates": {id: fp}}` shape and pure [`parse_action_fp`]; missing / malformed
+/// yields an empty map (fail-open). WO d6bcae49.
+fn load_fable_fp() -> HashMap<String, ActionFp> {
+    let Some(path) = fable_fp_path() else {
+        return HashMap::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
     parse_action_fp(&raw, Instant::now())
 }
 
@@ -1170,5 +1299,79 @@ and enter the code H7Q2K9F4P to authenticate.
         assert!(parse_action_fp("not json", Instant::now()).is_empty());
         assert!(parse_action_fp("{}", Instant::now()).is_empty());
         assert!(parse_action_fp(r#"{"gates":[]}"#, Instant::now()).is_empty());
+    }
+
+    // ── fable_scan_hit: the Fable-pinned GATE is the safety property ─────
+    // WO d6bcae49. The watchdog only pages the Commander for model-drift on a
+    // session that was LAUNCHED Fable-pinned; a non-Fable session running a
+    // Sonnet/Opus subagent is normal fleet traffic and must stay silent.
+
+    /// A synthesized bat-Summit-style pane: a Fable session that silently hit a
+    /// Fable cap and got relaunched on Sonnet, then dispatched Sonnet subagents.
+    const BAT_SUMMIT_TAIL: &str = "\
+⏺ Heads up — I hit the Fable usage limit, so this session was relaunched on Sonnet.
+⏺ Task(Investigate the pane watchdog)
+  ⎿ Running subagent on claude-sonnet-5…
+> │
+";
+
+    #[test]
+    fn fable_scan_non_fable_session_never_fires() {
+        // The gate: an Opus/Sonnet session showing the exact bat-Summit tail is
+        // ordinary — it was never Fable, so a Sonnet subagent is not drift.
+        assert_eq!(
+            fable_scan_hit("--model claude-opus-4-8", BAT_SUMMIT_TAIL),
+            None
+        );
+        assert_eq!(fable_scan_hit("", BAT_SUMMIT_TAIL), None);
+    }
+
+    #[test]
+    fn fable_scan_fable_session_fires_on_bat_summit() {
+        // A Fable-pinned session with the same tail IS drift → a (rule, fp) hit.
+        let hit = fable_scan_hit("--model fable", BAT_SUMMIT_TAIL);
+        assert!(hit.is_some(), "Fable-pinned bat-Summit pane must fire");
+        let (rule, fp) = hit.unwrap();
+        assert!(!rule.is_empty());
+        assert!(
+            !fp.is_empty(),
+            "fingerprint must be non-empty for the dampener"
+        );
+    }
+
+    #[test]
+    fn fable_scan_fable_session_clean_pane_is_none() {
+        // Acceptance: a clean Fable pane (healthy work, its own Fable subagents)
+        // does NOT fire.
+        let clean = "\
+⏺ Task(Draft the quarterly summary)
+  ⎿ Running subagent on claude-fable-5…
+⏺ Done — the summary is ready for review.
+> │
+";
+        assert_eq!(fable_scan_hit("--model claude-fable-5", clean), None);
+    }
+
+    #[test]
+    fn fable_scan_does_not_fire_on_opus_code_literal() {
+        // Must NOT fire on a Fable session that merely has the model ID as a code
+        // literal (e.g. writing claude-api code) — no downgrade, no cap, no
+        // non-Fable subagent dispatch.
+        let code = "\
+⏺ Wrote client.py with model=\"claude-opus-4-8\" and thinking adaptive.
+⏺ The migration guide says to use sonnet only when the user asks.
+> │
+";
+        assert_eq!(fable_scan_hit("--model fable", code), None);
+    }
+
+    #[test]
+    fn fable_scan_hit_matches_direct_classify() {
+        // The gated hit, once past the Fable-pin check, is exactly what the
+        // ungated classifier returns for the same content.
+        assert_eq!(
+            fable_scan_hit("--model fable", BAT_SUMMIT_TAIL),
+            classify_fable_drift(BAT_SUMMIT_TAIL)
+        );
     }
 }
