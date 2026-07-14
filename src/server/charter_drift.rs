@@ -41,6 +41,15 @@ const HOST_OWNERS: [(&str, &str); 1] = [("homeassistant.local", "per-Home")];
 /// Shared repos every fleet session legitimately reads (docs, briefs).
 const ALLOW_REPOS: [&str; 2] = ["for-Common", "forit-Common"];
 
+/// Charter-map: repos a specific charter legitimately works beyond its own
+/// prefix-relatives. Keyed by the session's own repo (case-insensitive).
+/// per-dev is the fleet-infra lane; its `claude-hooks/` and `mcp-servers/`
+/// are symlinks into the extracted per-hooks and per-mcp repos (and the repo
+/// was named personal-dev before 2026-06), so work there prints those repo
+/// paths by design. The grant is per-charter, never fleet-wide.
+const CHARTER_ALLIES: [(&str, &[&str]); 1] =
+    [("per-dev", &["per-mcp", "per-hooks", "personal-dev"])];
+
 /// Distinct tail lines a foreign repo path must appear on before it counts
 /// as work rather than a mention.
 const REPO_MIN_LINES: usize = 3;
@@ -105,6 +114,10 @@ pub(crate) fn detect(title: &str, project_path: &str, pane: &str) -> Option<Drif
             || (!own_lc.is_empty()
                 && (name_lc.starts_with(&own_lc) || own_lc.starts_with(&name_lc)))
             || ALLOW_REPOS.iter().any(|a| a.eq_ignore_ascii_case(name))
+            || CHARTER_ALLIES.iter().any(|(charter, allies)| {
+                charter.eq_ignore_ascii_case(own_repo)
+                    && allies.iter().any(|a| a.eq_ignore_ascii_case(name))
+            })
     };
 
     let stripped = crate::tmux::utils::strip_ansi(pane);
@@ -287,6 +300,54 @@ diff ~/GitProjects/for-Directory/a.ts ~/GitProjects/for-Directory/b.ts ~/GitProj
             ),
             None
         );
+    }
+
+    // ── charter allies: per-dev's infra lane spans the extracted repos ──
+
+    #[test]
+    fn per_dev_working_per_mcp_gateway_is_in_charter() {
+        // per-dev's own mcp-servers/ is a symlink into the extracted per-mcp
+        // repo, so gateway work legitimately prints per-mcp paths. Live false
+        // positive: the watchdog paged URGENT while per-dev read the gateway
+        // for a Commander keystroke ruling (WO 2026-07-14).
+        let pane = "\
+⏺ Read(~/GitProjects/per-mcp/fastmcp-gateway/comms_hold.py)
+⏺ Bash(git -C ~/GitProjects/per-mcp log -1 --oneline)
+⏺ Grep(classify_decision, path: ~/GitProjects/per-mcp/fastmcp-gateway)
+";
+        assert_eq!(
+            detect("per-dev", "/Users/ben/GitProjects/per-dev", pane),
+            None
+        );
+    }
+
+    #[test]
+    fn per_dev_working_per_hooks_is_in_charter() {
+        // Same class: claude-hooks/ is a symlink into the extracted per-hooks
+        // repo.
+        let pane = "\
+⏺ Read(~/GitProjects/per-hooks/claude-guard-hook.py)
+⏺ Edit(~/GitProjects/per-hooks/claude-guard-hook.py)
+⏺ Bash(cd ~/GitProjects/per-hooks && ./verify.sh)
+";
+        assert_eq!(
+            detect("per-dev", "/Users/ben/GitProjects/per-dev", pane),
+            None
+        );
+    }
+
+    #[test]
+    fn charter_allies_do_not_leak_to_other_sessions() {
+        // The ally grant is per-charter: a product session in per-mcp is
+        // still drift.
+        let pane = "\
+⏺ Read(~/GitProjects/per-mcp/fastmcp-gateway/server.py)
+⏺ Edit(~/GitProjects/per-mcp/fastmcp-gateway/server.py)
+⏺ Bash(git -C ~/GitProjects/per-mcp status)
+";
+        let hit = detect("for-Forms", "/Users/ben/GitProjects/for-Forms", pane)
+            .expect("non-ally session in per-mcp must still fire");
+        assert!(hit.observed.contains("repo per-mcp"), "{hit:?}");
     }
 
     // ── compaction / hook plumbing is not the session's work ────────────
