@@ -1076,9 +1076,12 @@ fn count_sessions_in_group(path: &str, instances: &[Instance]) -> usize {
 /// the fleet manager is visible from every view. No-op when no non-archived
 /// commander session exists (an archived commander stays in the Archived
 /// section rather than clawing back to the top).
-pub fn pin_commander_first(items: &mut Vec<Item>, instances: &[Instance]) {
+pub fn pin_commander_first<'a>(
+    items: &mut Vec<Item>,
+    instances: impl IntoIterator<Item = &'a Instance>,
+) {
     let commander_id = match instances
-        .iter()
+        .into_iter()
         .find(|i| i.is_commander() && !i.is_archived())
     {
         Some(inst) => inst.id.clone(),

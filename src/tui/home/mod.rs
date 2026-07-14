@@ -5300,7 +5300,7 @@ impl HomeView {
         let mut items = self.build_flat_items_unpinned();
         // Pass the full instance set (not a profile-filtered slice) so the
         // commander pins to the top even in views that would otherwise hide it.
-        pin_commander_first(&mut items, &self.instances);
+        pin_commander_first(&mut items, self.instances.values());
         items
     }
 
