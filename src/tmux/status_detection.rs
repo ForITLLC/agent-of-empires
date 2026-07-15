@@ -884,6 +884,66 @@ pub(crate) fn claude_pane_has_resume_picker(raw_content: &str) -> bool {
     claude_has_resume_picker(&recent)
 }
 
+/// How many trailing non-empty pane lines the composer detectors scan. The
+/// composer prompt renders at the bottom of the pane with at most the box
+/// rule, the permissions footer, and a hint line below it.
+const CLAUDE_COMPOSER_TAIL: usize = 10;
+
+/// The Claude Code composer (input box) is rendered and accepting input: a
+/// `❯` prompt line in the trailing region that is NOT a numbered menu choice
+/// (the folder-trust dialog, resume picker, and approval menus all render
+/// their selection cursor as `❯ 1. ...`). This is the "truly ready" signal a
+/// post-restart send must gate on. Measured on a live boot: the pane's shell
+/// is replaced ~600ms before the composer renders, and a paste landing in
+/// that gap keeps its text but loses its submitting Enter (the boot-time
+/// terminal-mode churn consumes it), leaving the message sitting unsubmitted.
+/// `pub(crate)` for the daemon send path and the restart wake worker.
+pub(crate) fn claude_pane_input_ready(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    clean
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<&str>>()
+        .iter()
+        .rev()
+        .take(CLAUDE_COMPOSER_TAIL)
+        .any(|line| {
+            let trimmed = line.trim();
+            (trimmed == "❯" || trimmed.starts_with("❯ "))
+                && !claude_line_is_numbered_choice(trimmed)
+        })
+}
+
+/// `message` is sitting unsubmitted in the Claude composer: the paste landed
+/// but the submitting Enter was swallowed (the post-restart boot race). The
+/// composer renders the draft on its `❯` prompt line, so match a bounded
+/// prefix of the message's first line right after the cursor. Bounding the
+/// prefix keeps line wrapping and narrow panes from breaking the match;
+/// requiring the message's own text keeps an unrelated draft (someone else's
+/// half-typed input) from triggering a recovery Enter that would submit text
+/// this send does not own. `pub(crate)` for the same two callers.
+pub(crate) fn claude_message_stuck_in_composer(raw_content: &str, message: &str) -> bool {
+    let first_line = message.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return false;
+    }
+    let prefix: String = first_line.chars().take(32).collect();
+    let clean = strip_ansi(raw_content);
+    clean
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<&str>>()
+        .iter()
+        .rev()
+        .take(CLAUDE_COMPOSER_TAIL)
+        .any(|line| {
+            line.trim()
+                .strip_prefix('❯')
+                .map(str::trim_start)
+                .is_some_and(|draft| draft.starts_with(&prefix))
+        })
+}
+
 /// Claude Code prints a usage-limit banner when a subscription account hits its
 /// 5-hour or weekly cap mid-turn: the live turn is severed and a "usage limit
 /// reached … resets <time>" line replaces the spinner. No Stop/idle hook fires
@@ -3132,6 +3192,133 @@ enter to select · esc to cancel";
             reconcile_claude_hook_status(Status::Running, prose),
             Status::Running
         );
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_on_fresh_composer() {
+        // A freshly booted pane whose composer has rendered: the lone `❯`
+        // prompt line between the box rules, bypass footer below. This is the
+        // "truly ready" state a post-restart send must wait for (the shell
+        // being gone is ~600ms too early; a paste landing in that gap loses
+        // its submitting Enter). Captured from a live boot probe.
+        let pane = "\
+ ▐▛███▜▌   Claude Code v2.1.197
+▝▜█████▛▘  Sonnet 4.5 · Claude Max
+  ▘▘ ▝▝    /Users/benjaminwesleythomas/GitProjects/per-dev
+
+────────────────────────────────────────────────────────
+ ❯
+────────────────────────────────────────────────────────
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_false_on_booting_banner() {
+        // Mid-boot: the version banner is up but the composer has not rendered
+        // yet. A send now is exactly the race being fixed; not ready.
+        let pane = "\
+ ▐▛███▜▌   Claude Code v2.1.197
+▝▜█████▛▘  Sonnet 4.5 · Claude Max
+  ▘▘ ▝▝    /Users/benjaminwesleythomas/GitProjects/per-dev";
+        assert!(!claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_false_on_empty_pane() {
+        assert!(!claude_pane_input_ready(""));
+        assert!(!claude_pane_input_ready("\n\n\n"));
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_false_on_trust_dialog() {
+        // The folder-trust dialog renders a `❯` cursor, but on a numbered
+        // menu choice: pasting a message here types into a menu, not the
+        // composer. Not ready.
+        let pane = "\
+ Do you trust the files in this folder?
+
+ /Users/benjaminwesleythomas/GitProjects/per-dev
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit";
+        assert!(!claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_false_on_resume_picker() {
+        let pane = "\
+  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is";
+        assert!(!claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_with_ansi_and_running_turn() {
+        // Mid-turn the composer stays rendered below the spinner (steering
+        // input is legitimate), and live capture carries ANSI. Ready.
+        let pane = "\x1b[2m✶ Working… (4s · ↓ 88 tokens)\x1b[0m\n\
+────────────────────────────────\n\
+\x1b[1m ❯ \x1b[0m\n\
+────────────────────────────────\n\
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn test_claude_message_stuck_in_composer_on_swallowed_enter() {
+        // The boot race outcome observed live: the daemon's paste landed in
+        // the composer but the trailing Enter was consumed by boot-time
+        // terminal-mode churn, so the message sits unsubmitted after `❯`.
+        let pane = "\
+────────────────────────────────────────────────────────
+ ❯ RACE-PROBE-MESSAGE this text was pasted during boot
+────────────────────────────────────────────────────────
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_message_stuck_in_composer(
+            pane,
+            "RACE-PROBE-MESSAGE this text was pasted during boot"
+        ));
+    }
+
+    #[test]
+    fn test_claude_message_stuck_matches_on_bounded_prefix() {
+        // A long message wraps/truncates on the composer line; only a bounded
+        // prefix of its first line is required to match.
+        let message = "STATUS UPDATE: please re-verify the gateway health probe and report the exact timestamp delta plus the disposition flip you observed";
+        let pane = " ❯ STATUS UPDATE: please re-verify the gateway health probe and report the exa\n   ⏵⏵ bypass permissions on";
+        assert!(claude_message_stuck_in_composer(pane, message));
+    }
+
+    #[test]
+    fn test_claude_message_stuck_uses_first_line_of_multiline_message() {
+        let message = "line one of the work order\nline two detail";
+        let pane = " ❯ line one of the work order\n   ⏵⏵ bypass permissions on";
+        assert!(claude_message_stuck_in_composer(pane, message));
+    }
+
+    #[test]
+    fn test_claude_message_stuck_false_on_empty_composer() {
+        // The message submitted; the composer is back to a bare prompt.
+        let pane = "\
+────────────────────────────────\n ❯ \n────────────────────────────────";
+        assert!(!claude_message_stuck_in_composer(
+            pane,
+            "RACE-PROBE-MESSAGE this text was pasted during boot"
+        ));
+        assert!(!claude_message_stuck_in_composer(pane, ""));
+    }
+
+    #[test]
+    fn test_claude_message_stuck_false_on_unrelated_composer_text() {
+        // Someone else's draft sits in the composer; pressing Enter for it
+        // would submit text this send does not own. Must not match.
+        let pane = " ❯ an unrelated half-typed draft\n   ⏵⏵ bypass permissions on";
+        assert!(!claude_message_stuck_in_composer(
+            pane,
+            "RACE-PROBE-MESSAGE this text was pasted during boot"
+        ));
     }
 
     #[test]

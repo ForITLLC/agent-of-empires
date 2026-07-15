@@ -1415,6 +1415,80 @@ impl Session {
         Ok(())
     }
 
+    /// Like [`send_keys_with_delay`](Self::send_keys_with_delay), but hardened
+    /// against the claude boot race: after a restart the pane leaves its boot
+    /// shell ~0.1s in, while the composer only starts accepting input ~0.7s in.
+    /// A paste landing in that gap renders the text but the submitting Enter
+    /// is swallowed, leaving the message sitting unsubmitted at the `❯` prompt.
+    /// This variant (claude panes only; other tools fall through unchanged)
+    /// first waits, bounded, for the composer to accept input, then sends, then
+    /// verifies the message actually left the composer, recovering a swallowed
+    /// Enter with a bare Enter resend. It never re-pastes: the text is already
+    /// in the composer, so a re-paste would double it.
+    ///
+    /// Blocking (bounded ~12s worst case); call from a blocking context.
+    pub fn send_keys_verified(&self, text: &str, enter_delay_ms: u64, tool: &str) -> Result<()> {
+        if tool != "claude" {
+            return self.send_keys_with_delay(text, enter_delay_ms);
+        }
+
+        const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
+        const READY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+        const VERIFY_SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+        const MAX_SUBMIT_RETRIES: u32 = 3;
+        const VERIFY_CAPTURE_LINES: usize = 30;
+
+        // Phase 1: wait for the composer. On timeout proceed anyway; a pane in
+        // a state the detector doesn't recognize (dialog, alt screen) must
+        // still get the send, and the verify phase below recovers the Enter.
+        let ready_deadline = std::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
+            if super::status_detection::claude_pane_input_ready(&content) {
+                break;
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                tracing::debug!(target: "tmux.command",
+                    "send_keys_verified: composer not ready after {READY_TIMEOUT:?}; sending anyway"
+                );
+                break;
+            }
+            std::thread::sleep(READY_POLL);
+        }
+
+        self.send_keys_with_delay(text, enter_delay_ms)?;
+
+        // Phase 2: confirm the message left the composer. A matching draft
+        // still parked at `❯` while the pane is not generating means the
+        // Enter was swallowed; resubmit it bare.
+        for _attempt in 0..MAX_SUBMIT_RETRIES {
+            std::thread::sleep(VERIFY_SETTLE);
+            let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
+            if !super::status_detection::claude_message_stuck_in_composer(&content, text) {
+                return Ok(());
+            }
+            if super::status_detection::detect_status_from_content(&content, tool)
+                == crate::session::Status::Running
+            {
+                // Generating with a matching draft parked: the draft is stale
+                // detection or the user's own typing; never inject Enter into
+                // a running turn.
+                return Ok(());
+            }
+            tracing::info!(target: "tmux.command",
+                "send_keys_verified: message stuck in composer (swallowed Enter); resubmitting"
+            );
+            self.send_raw_bytes(b"\r")?;
+        }
+        let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
+        if super::status_detection::claude_message_stuck_in_composer(&content, text) {
+            tracing::warn!(target: "tmux.command",
+                "send_keys_verified: message still unsubmitted after {MAX_SUBMIT_RETRIES} Enter resends"
+            );
+        }
+        Ok(())
+    }
+
     /// Sends exactly the given token sequence to the pane, in order, with no
     /// implicit trailing key. Unlike [`send_keys_with_delay`](Self::send_keys_with_delay),
     /// which always appends a submitting `Enter`, the caller's token list

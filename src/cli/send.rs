@@ -85,7 +85,10 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     );
 
     let delay = crate::agents::send_keys_enter_delay(&tool);
-    tmux_session.send_keys_with_delay(&args.message, delay)?;
+    // Verified send: a just-revived claude pane accepts the paste before its
+    // composer accepts Enter; the verified variant gates on composer readiness
+    // and resubmits a swallowed Enter (never re-pastes).
+    tmux_session.send_keys_verified(&args.message, delay, &tool)?;
 
     // Stamp last_accessed_at so the "last activity" column reflects user
     // interaction, and remap the status to Running. The agent has just been

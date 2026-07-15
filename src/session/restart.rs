@@ -99,6 +99,12 @@ enum WakeStep {
     /// is genuinely capped, generation simply won't start and we retry-then-give
     /// up; the stale banner never blocks the attempt.
     SendWake,
+    /// The wake message is sitting unsubmitted in Claude's composer: the paste
+    /// landed but the submitting Enter was swallowed by boot-time terminal-mode
+    /// churn (the post-restart first-message race). Press a bare Enter to
+    /// submit the existing draft. Re-sending the full message here (the old
+    /// behavior, via `SendWake`) doubled the text in the composer.
+    SubmitStuck,
 }
 
 /// Decide the next wake action from a pane capture. Pure + tool-aware so the
@@ -108,11 +114,18 @@ enum WakeStep {
 /// `detect_status_from_content` already collapses the picker to `Waiting`
 /// (alongside a real approval prompt and a stale limit banner) — and a `Waiting`
 /// pane otherwise routes to `SendWake`, which would dump the wake text into the
-/// menu. Only an actively-*Running* pane is `Done`; every other state (Idle,
-/// or Waiting-because-stale-banner) sends the wake.
-fn classify_wake_pane(content: &str, tool: &str) -> WakeStep {
-    if tool == "claude" && crate::tmux::status_detection::claude_pane_has_resume_picker(content) {
-        return WakeStep::DismissPicker;
+/// menu. A wake message stuck unsubmitted in the composer is checked next
+/// (before the Running collapse: submitting it is correct even if a turn is
+/// already generating). Only an actively-*Running* pane is `Done`; every other
+/// state (Idle, or Waiting-because-stale-banner) sends the wake.
+fn classify_wake_pane(content: &str, tool: &str, wake_message: &str) -> WakeStep {
+    if tool == "claude" {
+        if crate::tmux::status_detection::claude_pane_has_resume_picker(content) {
+            return WakeStep::DismissPicker;
+        }
+        if crate::tmux::status_detection::claude_message_stuck_in_composer(content, wake_message) {
+            return WakeStep::SubmitStuck;
+        }
     }
     match crate::tmux::status_detection::detect_status_from_content(content, tool) {
         crate::session::Status::Running => WakeStep::Done,
@@ -173,6 +186,7 @@ fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_messa
             let delay = crate::agents::send_keys_enter_delay(&tool);
             let mut wake_sends: u32 = 0;
             let mut picker_dismissals: u32 = 0;
+            let mut stuck_submits: u32 = 0;
 
             while std::time::Instant::now() < overall_deadline {
                 if !tmux_session.exists() {
@@ -181,7 +195,7 @@ fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_messa
                 let content = tmux_session
                     .capture_pane(WAKE_CAPTURE_LINES)
                     .unwrap_or_default();
-                match classify_wake_pane(&content, &tool) {
+                match classify_wake_pane(&content, &tool, &wake_message) {
                     WakeStep::Done => {
                         tracing::info!(
                             target: "session.restart",
@@ -212,6 +226,29 @@ fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_messa
                             );
                         }
                         std::thread::sleep(PICKER_SETTLE);
+                    }
+                    WakeStep::SubmitStuck => {
+                        if stuck_submits >= MAX_WAKE_SENDS {
+                            tracing::warn!(
+                                target: "session.restart",
+                                session_id = %session_id,
+                                "restart wake: message still stuck in composer after {MAX_WAKE_SENDS} submits; parked"
+                            );
+                            return;
+                        }
+                        stuck_submits += 1;
+                        // The wake text already landed in the composer; only its
+                        // Enter was swallowed by the still-booting TUI. Submit it
+                        // with a bare Enter, never a re-paste, which would double
+                        // the message text.
+                        if let Err(e) = tmux_session.send_raw_bytes(b"\r") {
+                            tracing::warn!(
+                                target: "session.restart",
+                                session_id = %session_id,
+                                "restart wake: failed to submit stuck composer message: {e}"
+                            );
+                        }
+                        std::thread::sleep(WAKE_VERIFY);
                     }
                     WakeStep::SendWake => {
                         if wake_sends >= MAX_WAKE_SENDS {
@@ -310,7 +347,7 @@ mod tests {
     fn classify_dismisses_resume_picker_before_waking() {
         // Picker present -> Enter, NOT a wake message typed into the menu.
         assert_eq!(
-            classify_wake_pane(resume_picker_pane(), "claude"),
+            classify_wake_pane(resume_picker_pane(), "claude", "wake up"),
             WakeStep::DismissPicker
         );
     }
@@ -324,7 +361,10 @@ mod tests {
  Claude usage limit reached. Your limit will reset at 1pm (America/Chicago).
 
 > ";
-        assert_eq!(classify_wake_pane(pane, "claude"), WakeStep::SendWake);
+        assert_eq!(
+            classify_wake_pane(pane, "claude", "wake up"),
+            WakeStep::SendWake
+        );
     }
 
     #[test]
@@ -333,7 +373,10 @@ mod tests {
  Some earlier output from before the restart.
 
 > ";
-        assert_eq!(classify_wake_pane(pane, "claude"), WakeStep::SendWake);
+        assert_eq!(
+            classify_wake_pane(pane, "claude", "wake up"),
+            WakeStep::SendWake
+        );
     }
 
     #[test]
@@ -343,7 +386,10 @@ mod tests {
 ⏺ Picking up where I left off…
 
   s · ↓ 412 tokens · esc to interrupt";
-        assert_eq!(classify_wake_pane(pane, "claude"), WakeStep::Done);
+        assert_eq!(
+            classify_wake_pane(pane, "claude", "wake up"),
+            WakeStep::Done
+        );
     }
 
     #[test]
@@ -352,7 +398,10 @@ mod tests {
 ⏺ Working on the task now.
 
   ✻ Thinking… (esc to interrupt)";
-        assert_eq!(classify_wake_pane(pane, "claude"), WakeStep::Done);
+        assert_eq!(
+            classify_wake_pane(pane, "claude", "wake up"),
+            WakeStep::Done
+        );
     }
 
     #[test]
@@ -361,7 +410,46 @@ mod tests {
         // words must not be treated as a dismissable menu. With no live-run
         // signal it falls through to SendWake (the safe default).
         assert_eq!(
-            classify_wake_pane(resume_picker_pane(), "codex"),
+            classify_wake_pane(resume_picker_pane(), "codex", "wake up"),
+            WakeStep::SendWake
+        );
+    }
+
+    #[test]
+    fn classify_submits_stuck_wake_instead_of_repasting() {
+        // The post-restart boot race: the first wake paste landed in the
+        // composer but its submitting Enter was swallowed by boot-time
+        // terminal-mode churn. The old policy saw a non-Running pane and
+        // re-sent the FULL message, doubling the text in the composer. The
+        // stuck draft must instead get a bare Enter.
+        let pane = "\
+────────────────────────────────
+ ❯ wake up and resume the task
+────────────────────────────────
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert_eq!(
+            classify_wake_pane(pane, "claude", "wake up and resume the task"),
+            WakeStep::SubmitStuck
+        );
+    }
+
+    #[test]
+    fn classify_stuck_check_is_claude_only() {
+        let pane = " ❯ wake up and resume the task";
+        assert_eq!(
+            classify_wake_pane(pane, "codex", "wake up and resume the task"),
+            WakeStep::SendWake
+        );
+    }
+
+    #[test]
+    fn classify_unrelated_composer_draft_is_not_stuck() {
+        // A draft that is not our wake message must not draw a submitting
+        // Enter (it would fire text this worker does not own); with the pane
+        // otherwise idle the wake is sent normally.
+        let pane = " ❯ some other half-typed draft\n   ⏵⏵ bypass permissions on";
+        assert_eq!(
+            classify_wake_pane(pane, "claude", "wake up and resume the task"),
             WakeStep::SendWake
         );
     }

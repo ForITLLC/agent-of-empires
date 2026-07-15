@@ -11520,7 +11520,10 @@ pub async fn send_message(
             return Err(Box::new((inst_owned, outcome, SendKeysError::NotRunning)));
         }
         let delay = crate::agents::send_keys_enter_delay(&tool);
-        if let Err(e) = tmux_session.send_keys_with_delay(&message, delay) {
+        // Verified send: post-restart claude panes accept a paste ~0.6s before
+        // the composer accepts its Enter; the verified variant gates on
+        // composer readiness and resubmits a swallowed Enter (never re-pastes).
+        if let Err(e) = tmux_session.send_keys_verified(&message, delay, &tool) {
             return Err(Box::new((inst_owned, outcome, SendKeysError::Tmux(e))));
         }
         Ok((outcome, inst_owned))
