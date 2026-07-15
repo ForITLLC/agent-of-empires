@@ -944,6 +944,39 @@ pub(crate) fn claude_message_stuck_in_composer(raw_content: &str, message: &str)
         })
 }
 
+/// Claude Code's folder-trust dialog is blocking the pane: a first boot in a
+/// directory Claude has never seen renders "Do you trust the files in this
+/// folder?" with a numbered choice menu, and NOTHING else works until it is
+/// answered. It never self-dismisses. A paste landing on it types into the
+/// menu and the trailing Enter answers the dialog instead of submitting the
+/// message (observed live on a fresh-dir probe: send took 8.3s, message never
+/// reached the composer). The question line is matched line-anchored and the
+/// option line requires its numbered-menu shape, so prose that merely quotes
+/// the phrases mid-scrollback does not trip it; only the trailing window is
+/// scanned. `pub(crate)` for the daemon send path.
+pub(crate) fn claude_trust_dialog_visible(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    clean
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<&str>>()
+        .iter()
+        .rev()
+        .take(30)
+        .any(|line| {
+            let trimmed = line.trim();
+            let lower = trimmed.to_lowercase();
+            // Question line, anchored at line start (prose embeds it mid-sentence).
+            if lower.starts_with("do you trust the files in this folder") {
+                return true;
+            }
+            // Option line in its numbered-menu shape: "1. Yes, I trust this
+            // folder", optionally behind the `❯` selection cursor.
+            let choice = trimmed.strip_prefix('❯').map(str::trim_start).unwrap_or(trimmed);
+            choice.to_lowercase().starts_with("1. yes, i trust this folder")
+        })
+}
+
 /// Claude Code prints a usage-limit banner when a subscription account hits its
 /// 5-hour or weekly cap mid-turn: the live turn is severed and a "usage limit
 /// reached … resets <time>" line replaces the spinner. No Stop/idle hook fires
@@ -3319,6 +3352,72 @@ enter to select · esc to cancel";
             pane,
             "RACE-PROBE-MESSAGE this text was pasted during boot"
         ));
+    }
+
+    #[test]
+    fn test_claude_trust_dialog_visible_on_fresh_boot() {
+        // First boot in a never-seen directory: the trust dialog blocks the
+        // pane and never self-dismisses. Captured from the live fresh-dir
+        // probe that lost its message to this dialog.
+        let pane = "\
+ Do you trust the files in this folder?
+
+ /private/tmp/claude-501/probe356-fresh
+
+ Claude Code may read files in this folder. Reading untrusted files may
+ lead Claude Code to behave in unexpected ways.
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit";
+        assert!(claude_trust_dialog_visible(pane));
+    }
+
+    #[test]
+    fn test_claude_trust_dialog_visible_with_ansi() {
+        let pane = "\x1b[1m Do you trust the files in this folder?\x1b[0m\n\n\
+\x1b[36m ❯ 1. Yes, I trust this folder\x1b[0m\n   2. No, exit";
+        assert!(claude_trust_dialog_visible(pane));
+    }
+
+    #[test]
+    fn test_claude_trust_dialog_visible_on_option_line_only() {
+        // Narrow pane / partial capture: only the menu half is visible. The
+        // numbered option line alone is distinctive enough.
+        let pane = " ❯ 1. Yes, I trust this folder\n   2. No, exit";
+        assert!(claude_trust_dialog_visible(pane));
+    }
+
+    #[test]
+    fn test_claude_trust_dialog_visible_false_on_composer() {
+        let pane = "\
+────────────────────────────────────────────────────────
+ ❯
+────────────────────────────────────────────────────────
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!claude_trust_dialog_visible(pane));
+        assert!(!claude_trust_dialog_visible(""));
+    }
+
+    #[test]
+    fn test_claude_trust_dialog_visible_false_on_prose_mention() {
+        // A pane discussing the dialog (e.g. an agent editing this very
+        // detector) embeds the phrases mid-prose, not in dialog shape.
+        let pane = "\
+ ⏺ The fix handles the case where Yes, I trust this folder was never
+   clicked, i.e. when do you trust the files in this folder is on screen.
+────────────────────────────────
+ ❯
+────────────────────────────────";
+        assert!(!claude_trust_dialog_visible(pane));
+    }
+
+    #[test]
+    fn test_claude_trust_dialog_visible_false_on_resume_picker() {
+        // A different numbered menu must not read as the trust dialog.
+        let pane = "\
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is";
+        assert!(!claude_trust_dialog_visible(pane));
     }
 
     #[test]

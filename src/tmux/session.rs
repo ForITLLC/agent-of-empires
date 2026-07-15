@@ -1441,13 +1441,39 @@ impl Session {
         // Phase 1: wait for the composer. On timeout proceed anyway; a pane in
         // a state the detector doesn't recognize (dialog, alt screen) must
         // still get the send, and the verify phase below recovers the Enter.
-        let ready_deadline = std::time::Instant::now() + READY_TIMEOUT;
+        // Exception: the folder-trust dialog (first boot in a never-seen dir)
+        // is modal and never self-dismisses — pasting into it types into the
+        // menu and the trailing Enter answers the dialog, losing the message
+        // outright (observed live on a fresh-dir probe). The dir is one the
+        // operator deliberately pointed this session at, so accept the dialog
+        // (its cursor defaults to "Yes, I trust this folder") and keep
+        // waiting; if it still blocks the pane at the deadline, fail the send
+        // rather than feed the message to a menu.
+        let mut ready_deadline = std::time::Instant::now() + READY_TIMEOUT;
+        let mut trust_answered = false;
         loop {
             let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
             if super::status_detection::claude_pane_input_ready(&content) {
                 break;
             }
+            let trust_blocking = super::status_detection::claude_trust_dialog_visible(&content);
+            if trust_blocking && !trust_answered {
+                tracing::info!(target: "tmux.command",
+                    "send_keys_verified: folder-trust dialog blocking pane; accepting it"
+                );
+                self.send_raw_bytes(b"\r")?;
+                trust_answered = true;
+                // The composer boots fresh after the dialog clears; restart
+                // the ready window so a late dialog doesn't eat the wait.
+                ready_deadline = std::time::Instant::now() + READY_TIMEOUT;
+            }
             if std::time::Instant::now() >= ready_deadline {
+                if trust_blocking {
+                    bail!(
+                        "claude folder-trust dialog still blocking pane after {READY_TIMEOUT:?}; \
+                         message not sent (pasting would feed it to the dialog menu)"
+                    );
+                }
                 tracing::debug!(target: "tmux.command",
                     "send_keys_verified: composer not ready after {READY_TIMEOUT:?}; sending anyway"
                 );
