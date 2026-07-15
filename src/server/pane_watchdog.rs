@@ -1056,6 +1056,32 @@ Your limit will reset at 8pm.
         assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
     }
 
+    #[test]
+    fn cap_run_usage_credits_option_line() {
+        // Fable cap modal variant: the recovery options render as standalone
+        // lines WITHOUT the "You've reached your … limit" sentence (it may
+        // have scrolled off). Each option line must carry the cap on its own.
+        let pane = "\
+ ❯ 1. Run /usage-credits to continue
+   2. Wait for your limit to reset
+";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
+    }
+
+    #[test]
+    fn cap_switch_models_with_model_option_line() {
+        let pane = "   2. Switch models with /model\n";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
+    }
+
+    #[test]
+    fn noise_prose_mentioning_usage_credits_is_not_cap() {
+        // Mid-sentence prose discussing the /usage-credits command (e.g. a
+        // session building this very detector) must not fire — line anchor.
+        let pane = "the modal says run /usage-credits when capped, per the WO\n";
+        assert_eq!(classify_pane_tail(pane), None);
+    }
+
     // ── classify: cap NOISE must not fire ──────────────────────────────
 
     #[test]

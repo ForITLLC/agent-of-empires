@@ -344,7 +344,7 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             // sentence ("You've hit/reached your <X> limit", any <X>), so new
             // model names never need a rule edit. Prefix anchoring keeps
             // scrollback prose that merely mentions a limit from firing.
-            pattern: r"(?i)^(?:claude usage limit reached|usage limit reached|session limit reached|5-hour limit reached|weekly limit reached|stop and wait for limit|switch to usage credits|switch to team plan|(?:you'?re |you are )?out of usage credits|your limit will reset|(?:you'?ve|you have) (?:hit|reached) your .*limit)".into(),
+            pattern: r"(?i)^(?:claude usage limit reached|usage limit reached|session limit reached|5-hour limit reached|weekly limit reached|stop and wait for limit|switch to usage credits|switch to team plan|run /usage-credits|switch models with /model|(?:you'?re |you are )?out of usage credits|your limit will reset|(?:you'?ve|you have) (?:hit|reached) your .*limit)".into(),
             // The transient server-side 429 banner and the Fable promo blurb
             // both talk about usage limits without the account being capped.
             negative: vec![
