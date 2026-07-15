@@ -8502,16 +8502,15 @@ mod tests {
             )
             .await
             .into_response();
-<<<<<<< HEAD
-            let Json(envelope) = list_sessions(State(state), axum::extract::Query(ListSessionsQuery { state: None })).await;
-            assert!(envelope.mcp_surface.is_none(), "healthy must clear envelope badge");
-=======
-            let Json(envelope) = list_sessions(State(state)).await;
+            let Json(envelope) = list_sessions(
+                State(state),
+                axum::extract::Query(ListSessionsQuery { state: None }),
+            )
+            .await;
             assert!(
                 envelope.mcp_surface.is_none(),
                 "healthy must clear envelope badge"
             );
->>>>>>> 68937723 (style(server): rustfmt fixup for mcp-surface badge code (ead7772a))
         }
     }
 

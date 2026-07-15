@@ -193,6 +193,20 @@ pub(crate) fn tmux_command() -> Command {
     cmd
 }
 
+/// True when the current process has an interactive terminal on stdin and
+/// stdout. Attach/switch-client from a non-interactive caller (scripts,
+/// agents, cron) cannot name a legitimate target client, so tmux falls back
+/// to the most recently active attached client — hijacking whatever window
+/// the user is sitting in. `AOE_FORCE_ATTACH=1` overrides for the rare
+/// piped-but-really-interactive setup.
+pub fn interactive_client_available() -> bool {
+    if std::env::var("AOE_FORCE_ATTACH").as_deref() == Ok("1") {
+        return true;
+    }
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
 /// Like [`tmux_command`], but pins `LC_ALL=C` so tmux's connection-failure
 /// messages on stderr stay stable English for callers that match them. tmux's
 /// `client.c` prints `error connecting to <socket> (strerror(errno))` for a

@@ -666,6 +666,14 @@ impl Session {
     }
 
     pub fn attach(&self) -> Result<()> {
+        if !crate::tmux::interactive_client_available() {
+            bail!(
+                "refusing to attach to '{}' from a non-interactive context: \
+                 tmux would switch another attached client's window. Run from \
+                 a terminal, or set AOE_FORCE_ATTACH=1 to override.",
+                self.name
+            );
+        }
         if !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
@@ -2314,6 +2322,20 @@ mod tests {
         panic!(
             "{what} for {} never painted {needle:?}; last seen: {last:?}",
             session.name
+        );
+    }
+
+    #[test]
+    fn attach_refuses_without_interactive_terminal() {
+        // Under the cargo test harness stdin/stdout are pipes, so the
+        // interactivity guard must fire before any tmux lookup — a
+        // scripted attach would otherwise `switch-client` whatever
+        // client happens to be attached (hijacking the user's window).
+        let session = Session::new("nonexistent-attach-guard", "attach-guard").unwrap();
+        let err = session.attach().unwrap_err().to_string();
+        assert!(
+            err.contains("non-interactive"),
+            "expected non-interactive refusal, got: {err}"
         );
     }
 

@@ -1270,7 +1270,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
-                if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                if crate::tmux::interactive_client_available() {
                     tmux_session.attach()?;
                 } else {
                     // No controlling terminal (LaunchAgent, cron, or any

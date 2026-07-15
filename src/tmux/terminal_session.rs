@@ -272,6 +272,14 @@ impl PairedTerminal {
     }
 
     fn attach(&self) -> Result<()> {
+        if !crate::tmux::interactive_client_available() {
+            bail!(
+                "refusing to attach to '{}' from a non-interactive context: \
+                 tmux would switch another attached client's window. Run from \
+                 a terminal, or set AOE_FORCE_ATTACH=1 to override.",
+                self.name
+            );
+        }
         if !self.exists() {
             bail!("{} does not exist: {}", self.kind.label(), self.name);
         }
