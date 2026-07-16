@@ -972,8 +972,13 @@ pub(crate) fn claude_trust_dialog_visible(raw_content: &str) -> bool {
             }
             // Option line in its numbered-menu shape: "1. Yes, I trust this
             // folder", optionally behind the `❯` selection cursor.
-            let choice = trimmed.strip_prefix('❯').map(str::trim_start).unwrap_or(trimmed);
-            choice.to_lowercase().starts_with("1. yes, i trust this folder")
+            let choice = trimmed
+                .strip_prefix('❯')
+                .map(str::trim_start)
+                .unwrap_or(trimmed);
+            choice
+                .to_lowercase()
+                .starts_with("1. yes, i trust this folder")
         })
 }
 
