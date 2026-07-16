@@ -343,13 +343,22 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             // Line-anchored banner prefixes plus the generalized personal-cap
             // sentence ("You've hit/reached your <X> limit", any <X>), so new
             // model names never need a rule edit. Prefix anchoring keeps
-            // scrollback prose that merely mentions a limit from firing.
-            pattern: r"(?i)^(?:claude usage limit reached|usage limit reached|session limit reached|5-hour limit reached|weekly limit reached|stop and wait for limit|switch to usage credits|switch to team plan|run /usage-credits|switch models with /model|(?:you'?re |you are )?out of usage credits|your limit will reset|(?:you'?ve|you have) (?:hit|reached) your .*limit)".into(),
+            // scrollback prose that merely mentions a limit from firing. An
+            // optional error prefix covers a capacity-capped /compact, which
+            // renders the same cap sentence behind "Error during compaction:"
+            // (WO #362: five Fable sessions failed /compact silently).
+            pattern: r"(?i)^(?:(?:api )?error(?: during compaction)?\W{0,10})?(?:claude usage limit reached|usage limit reached|session limit reached|5-hour limit reached|weekly limit reached|stop and wait for limit|switch to usage credits|switch to team plan|run /usage-credits|switch models with /model|(?:you'?re |you are )?out of usage credits|your limit will reset|(?:you'?ve|you have) (?:hit|reached) your .*limit)".into(),
             // The transient server-side 429 banner and the Fable promo blurb
             // both talk about usage limits without the account being capped.
             negative: vec![
                 r"(?i)not your usage limit".into(),
                 r"(?i)up to 50% of".into(),
+                // A quote character inside the leading decoration is template
+                // text quoting a banner (a WO or a session building this
+                // detector), never a real CLI banner. Checked on the RAW line;
+                // normalize would strip the quote and false-fire the anchor
+                // (same convention as the action-required quoted guard).
+                r#"^[^\p{L}\p{N}]*['"`\x{2018}\x{2019}\x{201C}\x{201D}]"#.into(),
             ],
             tail_lines: 30,
             scope: RuleScope::Line,

@@ -117,6 +117,27 @@ pub(crate) fn next_uncapped(current: &str, capped: &HashSet<String>) -> Option<S
         .map(str::to_string)
 }
 
+/// Commander page for a pool relocation of a capped session. An auto-move
+/// (or a failed one) must never be silent: capacity-capped sessions fail
+/// /compact invisibly, so the Commander verifies the landing (WO #362).
+pub(crate) fn capped_move_reason(
+    title: &str,
+    id: &str,
+    from: &str,
+    target: &str,
+    moved: bool,
+) -> String {
+    if moved {
+        format!(
+            "capped session '{title}' ({id}) on '{from}' auto-moved to '{target}'. Verify it resumed and is serving"
+        )
+    } else {
+        format!(
+            "capped session '{title}' ({id}) on '{from}' auto-move to '{target}' FAILED; needs a manual profile move"
+        )
+    }
+}
+
 /// How long an observed cap on a profile is trusted before it is assumed to
 /// have reset, and also the floor between repeated ALL-CAPPED escalations.
 const CAP_TTL: Duration = Duration::from_secs(60 * 60);
@@ -556,12 +577,24 @@ impl Watchdog {
                     to = %target,
                     "capped session detected; relocating down the draw order"
                 );
-                match aoe_command(&["session", "move", &scan.id, &target]).await {
-                    Ok(()) => {}
+                let moved = match aoe_command(&["session", "move", &scan.id, &target]).await {
+                    Ok(()) => true,
                     Err(e) => {
                         tracing::warn!(target: "server.pane_watchdog", session = %scan.id, error = %e, "session move failed");
+                        false
                     }
-                }
+                };
+                let kind = if moved {
+                    "capped-moved"
+                } else {
+                    "capped-move-failed"
+                };
+                wake(
+                    kind,
+                    &scan.id,
+                    capped_move_reason(&scan.title, &scan.id, &scan.profile, &target, moved),
+                )
+                .await;
             }
             None => {
                 let due = self
@@ -1075,6 +1108,60 @@ Your limit will reset at 8pm.
     }
 
     #[test]
+    fn cap_error_during_compaction_spend_limit() {
+        // WO #362: a capacity-capped /compact renders the cap sentence behind
+        // an "Error during compaction:" prefix. The anchored battery missed
+        // it; 5 Fable sessions failed /compact silently on 2026-07-15.
+        let pane = "⎿  Error during compaction: You've hit your monthly spend limit\n";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
+    }
+
+    #[test]
+    fn cap_error_during_compaction_model_limit() {
+        let pane = "Error during compaction: You've reached your Fable 5 limit\n";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
+    }
+
+    #[test]
+    fn cap_error_prefixed_out_of_usage_credits() {
+        // The credit-out sentence behind a bare "Error:" prefix must fire in
+        // the DEFAULT battery too; the fable battery only covers pinned
+        // sessions and the capped ones were not pinned.
+        let pane = "Error: out of usage credits\n";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
+    }
+
+    #[test]
+    fn noise_error_during_compaction_other_reason_is_not_cap() {
+        // The compaction-error prefix alone is not a cap; only a cap
+        // sentence after it fires.
+        let pane = "Error during compaction: request timed out\n";
+        assert_eq!(classify_pane_tail(pane), None);
+    }
+
+    #[test]
+    fn noise_quoted_cap_banner_is_not_cap() {
+        // Sessions building this detector, and Commander WOs describing it,
+        // quote the banner text. A quote character inside the leading
+        // decoration is the template signature (same convention as the
+        // action-required quoted-template guard); a real CLI banner is never
+        // quote-wrapped. Without this guard the watchdog would auto-move the
+        // very session working on the detector.
+        for line in [
+            "'Error during compaction: You've hit your monthly spend limit'\n",
+            "- \"Error during compaction: You've reached your Fable 5 limit\"\n",
+            "\u{2018}You've hit your monthly spend limit\u{2019} must fire, per the WO\n",
+            "`Error: out of usage credits` is the third shape\n",
+        ] {
+            assert_eq!(
+                classify_pane_tail(line),
+                None,
+                "quoted template text must not fire: {line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn noise_prose_mentioning_usage_credits_is_not_cap() {
         // Mid-sentence prose discussing the /usage-credits command (e.g. a
         // session building this very detector) must not fire — line anchor.
@@ -1281,6 +1368,23 @@ and enter the code H7Q2K9F4P to authenticate.
             next_uncapped("RAS-Main", &caps(&["forit-backup", "gna-main", "xce-main"])),
             Some("forit-main".to_string())
         );
+    }
+
+    // ── WO #362: a pool relocation pages the Commander with the outcome ─
+
+    #[test]
+    fn capped_move_reason_reports_outcome() {
+        let moved = capped_move_reason("for-Support", "abc123", "gna-main", "forit-main", true);
+        assert!(moved.contains("for-Support"));
+        assert!(moved.contains("abc123"));
+        assert!(moved.contains("gna-main"));
+        assert!(moved.contains("auto-moved to 'forit-main'"));
+        assert!(moved.to_lowercase().contains("verify"));
+
+        let failed = capped_move_reason("for-Support", "abc123", "gna-main", "forit-main", false);
+        assert!(failed.contains("FAILED"));
+        assert!(failed.contains("'forit-main'"));
+        assert!(failed.to_lowercase().contains("manual"));
     }
 
     // ── WO #139: ACTION REQUIRED re-fire is content-gated, not time-gated ──
