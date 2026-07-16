@@ -444,7 +444,6 @@ pub fn is_fable_pinned(extra_args: &str) -> bool {
         // Tolerate both `--model fable` and `--model=fable`.
         let after = after.strip_prefix('=').unwrap_or(after);
         let val = after
-            .trim_start()
             .split_whitespace()
             .next()
             .unwrap_or("")
@@ -455,6 +454,41 @@ pub fn is_fable_pinned(extra_args: &str) -> bool {
         rest = &rest[idx + "--model".len()..];
     }
     false
+}
+
+/// Extract the model a session's `extra_args` pins it to (`--model X` or
+/// `--model=X`, quotes stripped). The LAST occurrence wins, matching CLI
+/// override semantics. `None` when no `--model` carries a usable value, so a
+/// bare trailing flag or a value that is itself another flag never reports a
+/// pin. Surfaced through the sessions API (WO#414 capacity work): relocation
+/// must preserve the pin, so the pin has to be visible.
+pub fn model_pin(extra_args: &str) -> Option<String> {
+    let mut pin = None;
+    let mut rest = extra_args;
+    while let Some(idx) = rest.find("--model") {
+        let after = &rest[idx + "--model".len()..];
+        rest = after;
+        // Accept only `--model=X` or whitespace-separated `--model X`; a run-on
+        // token like `--modelfoo` is a different flag.
+        let after = match after.strip_prefix('=') {
+            Some(a) => a,
+            None => {
+                if !after.starts_with(|c: char| c.is_whitespace()) {
+                    continue;
+                }
+                after
+            }
+        };
+        let val = after
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| c == '"' || c == '\'');
+        if !val.is_empty() && !val.starts_with('-') {
+            pin = Some(val.to_string());
+        }
+    }
+    pin
 }
 
 /// The Fable model-drift rule battery (kind `"fable"`). Run as a SEPARATE pass,
@@ -472,6 +506,7 @@ pub fn is_fable_pinned(extra_args: &str) -> bool {
 ///   3. `fable-subagent-model` — a subagent / Task tool named adjacent to a
 ///      non-Fable model ("Sonnet subagents", "Task(build) running on
 ///      claude-sonnet-5") — condition (a), the subagent vector.
+///
 /// On a hit the watchdog PAGES the Commander (never auto-swaps the model), with
 /// a content-gated fingerprint dampener so a standing drift does not re-flood.
 pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
@@ -570,6 +605,43 @@ mod tests {
         assert!(!is_fable_pinned("--model=claude-sonnet-5 --resume q"));
         // A session merely mentioning fable in a non-model arg must NOT pin.
         assert!(!is_fable_pinned("--resume fable-notes-session"));
+    }
+
+    // ---- Model-pin extraction (WO#414 capacity API) ---------------------------
+
+    #[test]
+    fn model_pin_extracts_flag_value() {
+        assert_eq!(model_pin("--model fable"), Some("fable".to_string()));
+        assert_eq!(
+            model_pin("--model=claude-opus-4-8"),
+            Some("claude-opus-4-8".to_string())
+        );
+        assert_eq!(
+            model_pin("--model \"claude-fable-5\""),
+            Some("claude-fable-5".to_string())
+        );
+        assert_eq!(model_pin("--model='sonnet'"), Some("sonnet".to_string()));
+        assert_eq!(
+            model_pin("--dangerously-skip-permissions --model fable --resume abc123"),
+            Some("fable".to_string())
+        );
+    }
+
+    #[test]
+    fn model_pin_last_flag_wins() {
+        assert_eq!(
+            model_pin("--model opus --model fable"),
+            Some("fable".to_string())
+        );
+    }
+
+    #[test]
+    fn model_pin_none_when_absent_or_malformed() {
+        assert_eq!(model_pin(""), None);
+        assert_eq!(model_pin("--resume xyz"), None);
+        assert_eq!(model_pin("--model"), None);
+        assert_eq!(model_pin("--model --resume x"), None);
+        assert_eq!(model_pin("--modelfoo bar"), None);
     }
 
     #[test]

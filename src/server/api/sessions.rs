@@ -178,6 +178,15 @@ pub struct SessionResponse {
     #[serde(default)]
     pub default_name: bool,
     pub has_terminal: bool,
+    /// The model this session is pinned to, when known: the resolved
+    /// `agent_model` when set, else the explicit `--model` pin parsed from
+    /// `extra_args` (last flag wins). Omitted when the session runs its
+    /// account default. Relocation tooling reads this so an account move
+    /// preserves the pin (a Fable session must come back up on Fable); the
+    /// WO#414 thrash bounced pinned sessions without any API-visible record
+    /// of what they were pinned to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
     pub remote_owner: Option<String>,
@@ -458,6 +467,10 @@ impl SessionResponse {
             // Overlaid in list_sessions; single-session responses stay false.
             default_name: false,
             has_terminal: inst.terminal_info.is_some(),
+            model: inst
+                .agent_model
+                .clone()
+                .or_else(|| crate::pane_rules::model_pin(&inst.extra_args)),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
                 delete_worktree: true,
@@ -9399,6 +9412,27 @@ mod tests {
     }
 
     #[test]
+    fn session_response_surfaces_model_pin() {
+        let mut inst = make_test_instance();
+        // No pin anywhere: field omitted from the wire JSON.
+        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+        assert!(
+            json.get("model").is_none(),
+            "model should be omitted when unpinned, got: {json}"
+        );
+
+        // Terminal session pinned via extra_args.
+        inst.extra_args = "--dangerously-skip-permissions --model fable".to_string();
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert_eq!(resp.model.as_deref(), Some("fable"));
+
+        // A resolved agent_model wins over the flag parse.
+        inst.agent_model = Some("claude-fable-5".to_string());
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert_eq!(resp.model.as_deref(), Some("claude-fable-5"));
+    }
+
+    #[test]
     fn resolve_diff_base_prefers_override_then_worktree_then_config_then_auto() {
         let tmp = tempfile::tempdir().unwrap();
         // Override wins over everything.
@@ -11999,6 +12033,7 @@ mod workspace_ordering_tests {
             smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
             default_name: false,
             has_terminal: false,
+            model: None,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {
                 delete_worktree: false,

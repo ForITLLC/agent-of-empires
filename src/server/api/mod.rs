@@ -12,6 +12,7 @@ pub(super) use super::AppState;
 
 #[cfg(feature = "serve")]
 mod acp;
+mod capacity;
 #[cfg(feature = "serve")]
 mod client_log;
 #[cfg(feature = "serve")]
@@ -40,6 +41,7 @@ pub use acp::{
     switch_acp_agent,
 };
 
+pub use capacity::{get_capacity, patch_capacity};
 #[cfg(feature = "serve")]
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
 
@@ -342,6 +344,11 @@ mod tests {
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
             (
+                "api/capacity.rs",
+                include_str!("capacity.rs"),
+                &["patch_capacity"],
+            ),
+            (
                 "api/mcp.rs",
                 include_str!("mcp.rs"),
                 &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
@@ -539,6 +546,11 @@ mod tests {
                 ],
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
+            (
+                "api/capacity.rs",
+                include_str!("capacity.rs"),
+                &["patch_capacity"],
+            ),
             (
                 "api/mcp.rs",
                 include_str!("mcp.rs"),

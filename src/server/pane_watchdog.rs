@@ -19,7 +19,7 @@
 //! unwritable state file logs and skips; the daemon never crashes or stalls
 //! on watchdog work.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,6 +28,7 @@ use crate::file_watch::FileWatchService;
 use crate::pane_rules::{self, CompiledRule};
 
 use super::ben_gate_surface;
+use super::capacity;
 use super::charter_drift::{self, DriftHit};
 
 /// What a pane tail says the session is blocked on.
@@ -58,18 +59,22 @@ fn kind_to_signal(kind: &str) -> Option<PaneSignal> {
 
 /// The built-in battery, compiled once. Classification for callers outside
 /// the watchdog loop goes through this set, never through user config.
+/// Test-only since the loop itself compiles rules from config; kept as the
+/// harness for exercising the default battery.
+#[cfg(test)]
 static DEFAULT_COMPILED: LazyLock<Vec<CompiledRule>> =
     LazyLock::new(|| pane_rules::compile(&pane_rules::default_rules()));
 
 /// Classify a raw `capture-pane` tail against the built-in rules. Returns
 /// the highest-priority signal (Capped > DeviceCode > Overloaded >
 /// ActionRequired) or None for a healthy pane.
-pub(crate) fn classify_pane_tail(raw: &str) -> Option<PaneSignal> {
+#[cfg(test)]
+fn classify_pane_tail(raw: &str) -> Option<PaneSignal> {
     pane_rules::classify(raw, &DEFAULT_COMPILED).and_then(|r| kind_to_signal(&r.kind))
 }
 
 /// The Fable model-drift battery, compiled once. Built-in only (not user
-/// configurable), like [`DEFAULT_COMPILED`]. WO d6bcae49.
+/// configurable), like the default battery above. WO d6bcae49.
 static DEFAULT_FABLE_COMPILED: LazyLock<Vec<CompiledRule>> =
     LazyLock::new(|| pane_rules::compile(&pane_rules::fable_drift_rules()));
 
@@ -105,35 +110,48 @@ pub(crate) const DRAW_ORDER: [&str; 5] = [
 ];
 
 /// Pick the relocation target for a capped session: the first profile in
-/// [`DRAW_ORDER`] that is not the session's current profile and not itself
-/// capped. `None` when the session is not on a pool profile (gated / personal
-/// accounts are never touched) or when every other pool profile is capped
-/// (the ALL-CAPPED Ben-gate case).
-pub(crate) fn next_uncapped(current: &str, capped: &HashSet<String>) -> Option<String> {
+/// [`DRAW_ORDER`] that is not the session's current profile and holds a
+/// FRESH POSITIVE headroom claim in the shared capacity state. `None` when
+/// the session is not on a pool profile (gated / personal accounts are never
+/// touched) or when no other pool profile has verified headroom (park and
+/// escalate instead of moving).
+///
+/// WO#414 thrash fix: the old selector treated "no cap observed" as a
+/// target, but absence of an observation is not headroom, and it bounced
+/// sessions capped-to-capped across accounts that were all out of credit.
+/// Unknown now parks; only an empirically probed claim (PATCH /api/capacity)
+/// re-opens relocation.
+pub(crate) fn next_verified_headroom(
+    current: &str,
+    state: &capacity::CapacityState,
+    now_secs: u64,
+) -> Option<String> {
     let pos = DRAW_ORDER.iter().position(|p| *p == current)?;
     (1..DRAW_ORDER.len())
         .map(|i| DRAW_ORDER[(pos + i) % DRAW_ORDER.len()])
-        .find(|cand| !capped.contains(*cand))
+        .find(|cand| state.verified_headroom(cand, now_secs))
         .map(str::to_string)
 }
 
 /// Commander page for a pool relocation of a capped session. An auto-move
 /// (or a failed one) must never be silent: capacity-capped sessions fail
 /// /compact invisibly, so the Commander verifies the landing (WO #362).
+/// Names the cap family so the Commander knows which clock fired (WO#414).
 pub(crate) fn capped_move_reason(
     title: &str,
     id: &str,
     from: &str,
     target: &str,
+    kind: &str,
     moved: bool,
 ) -> String {
     if moved {
         format!(
-            "capped session '{title}' ({id}) on '{from}' auto-moved to '{target}'. Verify it resumed and is serving"
+            "capped [{kind}] session '{title}' ({id}) on '{from}' auto-moved to '{target}'. Verify it resumed and is serving"
         )
     } else {
         format!(
-            "capped session '{title}' ({id}) on '{from}' auto-move to '{target}' FAILED; needs a manual profile move"
+            "capped [{kind}] session '{title}' ({id}) on '{from}' auto-move to '{target}' FAILED; needs a manual profile move"
         )
     }
 }
@@ -238,6 +256,12 @@ struct PaneScan {
     title: String,
     profile: String,
     signal: Option<PaneSignal>,
+    /// Which cap family the pane banner names when `signal` is `Capped`
+    /// (classified once at scan time), else `None`. Rides into the shared
+    /// capacity state and the Commander pages so escalations name WHICH
+    /// clock fired (fable credit vs weekly vs monthly spend vs session
+    /// window). WO#414.
+    cap_kind: Option<capacity::CapKind>,
     /// Content fingerprint of the winning rule's match when `signal` is
     /// `ActionRequired`, else `None`. Drives the WO #139 content dampener:
     /// an unchanged fingerprint is the same already-surfaced gate.
@@ -279,6 +303,10 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
             // signal (the sole content-gated path, WO #139).
             let hit = pane_rules::classify_fp(&content, rules);
             let signal = hit.as_ref().and_then(|(r, _)| kind_to_signal(&r.kind));
+            let cap_kind = match signal {
+                Some(PaneSignal::Capped) => Some(capacity::classify_cap_kind(&content)),
+                _ => None,
+            };
             let action_fp = match (signal, &hit) {
                 (Some(PaneSignal::ActionRequired), Some((_, fp))) => Some(fp.clone()),
                 _ => None,
@@ -304,6 +332,7 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
                 title: inst.title.clone(),
                 profile: inst.source_profile.clone(),
                 signal,
+                cap_kind,
                 action_fp,
                 surface_key,
                 drift,
@@ -385,6 +414,30 @@ impl Watchdog {
             }
         }
         self.persist_cap_state();
+        // Fold every observed cap into the shared capacity state: a pane
+        // showing a cap banner drops that profile out of the relocation pool
+        // immediately, no matter how fresh its last positive probe was.
+        // Observation beats a standing claim (WO#414).
+        let observed_caps: Vec<(String, capacity::CapKind)> = scans
+            .iter()
+            .filter(|s| s.signal == Some(PaneSignal::Capped))
+            .map(|s| {
+                (
+                    s.profile.clone(),
+                    s.cap_kind.unwrap_or(capacity::CapKind::Unknown),
+                )
+            })
+            .collect();
+        if !observed_caps.is_empty() {
+            if let Some(path) = capacity::capacity_path() {
+                let now_secs = unix_secs();
+                let mut cap_state = capacity::CapacityState::load(&path);
+                for (profile, kind) in observed_caps {
+                    cap_state.revoke_headroom(&profile, kind, now_secs);
+                }
+                cap_state.save(&path);
+            }
+        }
 
         for scan in scans {
             if let Some(hit) = scan.drift.clone() {
@@ -565,8 +618,16 @@ impl Watchdog {
             .await;
             return;
         }
-        let capped: HashSet<String> = self.capped_profiles.keys().cloned().collect();
-        match next_uncapped(&scan.profile, &capped) {
+        let cap_kind = scan.cap_kind.unwrap_or(capacity::CapKind::Unknown);
+        // The relocation gate reads the SHARED capacity state, not the
+        // in-memory cap map: only a fresh positive claim (written by a
+        // Commander probe via PATCH /api/capacity) makes a profile a target.
+        // Unknown parks (WO#414).
+        let state = match capacity::capacity_path() {
+            Some(path) => capacity::CapacityState::load(&path),
+            None => capacity::CapacityState::default(),
+        };
+        match next_verified_headroom(&scan.profile, &state, unix_secs()) {
             Some(target) => {
                 self.last_session_action.insert(scan.id.clone(), now);
                 tracing::warn!(
@@ -575,8 +636,11 @@ impl Watchdog {
                     title = %scan.title,
                     from = %scan.profile,
                     to = %target,
-                    "capped session detected; relocating down the draw order"
+                    cap_kind = cap_kind.as_str(),
+                    "capped session detected; relocating to verified-headroom profile"
                 );
+                // `session move` carries the instance record whole, including
+                // extra_args, so a --model pin survives the relocation.
                 let moved = match aoe_command(&["session", "move", &scan.id, &target]).await {
                     Ok(()) => true,
                     Err(e) => {
@@ -592,7 +656,14 @@ impl Watchdog {
                 wake(
                     kind,
                     &scan.id,
-                    capped_move_reason(&scan.title, &scan.id, &scan.profile, &target, moved),
+                    capped_move_reason(
+                        &scan.title,
+                        &scan.id,
+                        &scan.profile,
+                        &target,
+                        cap_kind.as_str(),
+                        moved,
+                    ),
                 )
                 .await;
             }
@@ -603,13 +674,14 @@ impl Watchdog {
                 if due {
                     self.last_all_capped_wake = Some(now);
                     wake(
-                        "all-capped",
+                        "capped-parked",
                         &scan.id,
                         format!(
-                            "ALL pool profiles are capped ({}); session '{}' ({}) is stranded — Ben-gate",
-                            DRAW_ORDER.join(", "),
+                            "capped [{}] session '{}' ({}) on '{}' PARKED: no pool profile holds a fresh verified-headroom claim. Probe accounts empirically and PATCH /api/capacity to re-open relocation",
+                            cap_kind.as_str(),
                             scan.title,
-                            scan.id
+                            scan.id,
+                            scan.profile
                         ),
                     )
                     .await;
@@ -699,6 +771,16 @@ fn unix_now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// Wall-clock unix seconds for the capacity-state freshness gate. Fail-safe:
+/// an unresolvable clock yields 0, which makes every positive claim look
+/// stale, so the watchdog parks instead of moving.
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Resolve the ACTION REQUIRED fingerprint state file: `AOE_ACTION_FP_FILE`
@@ -973,9 +1055,28 @@ async fn wake(kind: &str, session: &str, reason: String) {
 mod tests {
     use super::*;
 
-    fn caps(profiles: &[&str]) -> HashSet<String> {
-        profiles.iter().map(|s| s.to_string()).collect()
+    /// Capacity state with one fresh claim per entry: (profile, headroom).
+    fn claims(entries: &[(&str, bool)]) -> capacity::CapacityState {
+        claims_at(entries, TEST_NOW)
     }
+
+    fn claims_at(entries: &[(&str, bool)], updated: u64) -> capacity::CapacityState {
+        let mut state = capacity::CapacityState::default();
+        for (profile, headroom) in entries {
+            state.profiles.insert(
+                (*profile).to_string(),
+                capacity::ProfileCapacity {
+                    headroom: *headroom,
+                    cap_kind: None,
+                    note: None,
+                    updated,
+                },
+            );
+        }
+        state
+    }
+
+    const TEST_NOW: u64 = 1_800_000_000;
 
     // ── commander resolution: cross-profile Commander wake target ───────
 
@@ -1317,72 +1418,117 @@ and enter the code H7Q2K9F4P to authenticate.
         assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
     }
 
-    // ── next_uncapped: draw order ───────────────────────────────────────
+    // ── WO#414: relocation requires VERIFIED headroom, never absence-of-cap ──
 
     #[test]
-    fn draw_order_first_hop() {
+    fn empty_capacity_state_never_moves() {
+        // THE thrash regression: the old selector treated "no cap observed"
+        // as a target, so with no capacity data at all it moved sessions onto
+        // accounts that were themselves capped. No claims -> no moves, park.
         assert_eq!(
-            next_uncapped("forit-main", &caps(&[])),
-            Some("forit-backup".to_string())
-        );
-    }
-
-    #[test]
-    fn draw_order_skips_capped() {
-        assert_eq!(
-            next_uncapped("forit-main", &caps(&["forit-backup"])),
-            Some("gna-main".to_string())
-        );
-    }
-
-    #[test]
-    fn draw_order_tier3_progression() {
-        assert_eq!(
-            next_uncapped("forit-backup", &caps(&["gna-main", "xce-main"])),
-            Some("RAS-Main".to_string())
-        );
-    }
-
-    #[test]
-    fn non_pool_profile_never_moves() {
-        assert_eq!(next_uncapped("aoe-wmw", &caps(&[])), None);
-        assert_eq!(next_uncapped("per-macbook", &caps(&[])), None);
-    }
-
-    #[test]
-    fn all_capped_returns_none() {
-        assert_eq!(
-            next_uncapped(
-                "forit-main",
-                &caps(&["forit-backup", "gna-main", "xce-main", "RAS-Main"])
-            ),
+            next_verified_headroom("forit-main", &capacity::CapacityState::default(), TEST_NOW),
             None
         );
     }
 
     #[test]
-    fn tail_profile_can_fall_back_to_reset_head() {
-        // Caps reset over time; a session stranded on RAS-Main may relocate
-        // back up to a now-uncapped head profile.
+    fn fresh_claim_picked_in_draw_order() {
+        let state = claims(&[("forit-backup", true), ("gna-main", true)]);
         assert_eq!(
-            next_uncapped("RAS-Main", &caps(&["forit-backup", "gna-main", "xce-main"])),
+            next_verified_headroom("forit-main", &state, TEST_NOW),
+            Some("forit-backup".to_string())
+        );
+    }
+
+    #[test]
+    fn unclaimed_profiles_are_skipped() {
+        // forit-backup has NO entry (unknown != headroom); gna-main has a
+        // fresh positive claim, so the selector skips to it.
+        let state = claims(&[("gna-main", true)]);
+        assert_eq!(
+            next_verified_headroom("forit-main", &state, TEST_NOW),
+            Some("gna-main".to_string())
+        );
+    }
+
+    #[test]
+    fn revoked_claim_is_skipped() {
+        let state = claims(&[("forit-backup", false), ("xce-main", true)]);
+        assert_eq!(
+            next_verified_headroom("forit-main", &state, TEST_NOW),
+            Some("xce-main".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_claim_is_skipped() {
+        // A positive claim past HEADROOM_TTL_SECS no longer counts: the
+        // Commander must re-probe before the profile re-enters the pool.
+        let state = claims_at(
+            &[("forit-backup", true)],
+            TEST_NOW - capacity::HEADROOM_TTL_SECS - 1,
+        );
+        assert_eq!(next_verified_headroom("forit-main", &state, TEST_NOW), None);
+    }
+
+    #[test]
+    fn non_pool_profile_never_moves() {
+        let state = claims(&[("forit-main", true), ("forit-backup", true)]);
+        assert_eq!(next_verified_headroom("aoe-wmw", &state, TEST_NOW), None);
+        assert_eq!(
+            next_verified_headroom("per-macbook", &state, TEST_NOW),
+            None
+        );
+    }
+
+    #[test]
+    fn tail_profile_wraps_to_claimed_head() {
+        // A session stranded on RAS-Main relocates back up to the head
+        // profile once the head holds a fresh verified claim.
+        let state = claims(&[("forit-main", true)]);
+        assert_eq!(
+            next_verified_headroom("RAS-Main", &state, TEST_NOW),
             Some("forit-main".to_string())
         );
     }
 
-    // ── WO #362: a pool relocation pages the Commander with the outcome ─
+    #[test]
+    fn current_profile_is_never_its_own_target() {
+        // A fresh claim on the CURRENT profile must not produce a self-move.
+        let state = claims(&[("forit-main", true)]);
+        assert_eq!(next_verified_headroom("forit-main", &state, TEST_NOW), None);
+    }
+
+    // ── WO #362 + WO#414: a pool relocation pages the Commander with the
+    // outcome AND the cap kind ──
 
     #[test]
-    fn capped_move_reason_reports_outcome() {
-        let moved = capped_move_reason("for-Support", "abc123", "gna-main", "forit-main", true);
+    fn capped_move_reason_reports_outcome_and_kind() {
+        let moved = capped_move_reason(
+            "for-Support",
+            "abc123",
+            "gna-main",
+            "forit-main",
+            "fable-credit",
+            true,
+        );
         assert!(moved.contains("for-Support"));
         assert!(moved.contains("abc123"));
         assert!(moved.contains("gna-main"));
+        assert!(moved.contains("[fable-credit]"));
         assert!(moved.contains("auto-moved to 'forit-main'"));
         assert!(moved.to_lowercase().contains("verify"));
 
-        let failed = capped_move_reason("for-Support", "abc123", "gna-main", "forit-main", false);
+        let failed = capped_move_reason(
+            "for-Support",
+            "abc123",
+            "gna-main",
+            "forit-main",
+            "weekly",
+            false,
+        );
         assert!(failed.contains("FAILED"));
+        assert!(failed.contains("[weekly]"));
         assert!(failed.contains("'forit-main'"));
         assert!(failed.to_lowercase().contains("manual"));
     }

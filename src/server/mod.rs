@@ -12,6 +12,7 @@ pub(crate) mod attach_project;
 pub mod auth;
 mod ben_gate_surface;
 pub mod callback;
+pub(crate) mod capacity;
 mod charter_drift;
 pub mod live_ws;
 pub mod login;
@@ -1975,6 +1976,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/log-level",
             get(api::get_log_level).patch(api::patch_log_level),
+        )
+        // Shared per-account capacity claims; the pane watchdog's
+        // relocation gate reads this state (WO#414).
+        .route(
+            "/api/capacity",
+            get(api::get_capacity).patch(api::patch_capacity),
         )
         .route("/api/client-log", post(api::post_client_log))
         // Telemetry consent (browser manages opt-in via the daemon; it never
