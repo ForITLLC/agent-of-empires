@@ -1309,6 +1309,71 @@ Fable responses use up to 50% of your plan's weekly usage limit.
         assert_eq!(classify_pane_tail(pane), None);
     }
 
+    // ── classify: REPLAYED cap banners never fire (false-revoke fix) ────
+    // A resumed/restarted pane replays old scrollback, including a cap
+    // banner the account has since recovered from. Activity rendered BELOW
+    // the banner (a tool call, a tool result, a running spinner) proves the
+    // session is serving again and the banner is history, so it must not
+    // classify as Capped; the watchdog would otherwise revoke headroom on
+    // an actively serving account (forit-main + xce-main, 2026-07-15).
+
+    #[test]
+    fn replayed_cap_banner_above_tool_activity_is_none() {
+        let pane = "\
+Claude usage limit reached. Your limit will reset at 1:50am (America/Chicago).
+⏺ Bash(git -C ~/GitProjects/per-dev status)
+  ⎿  On branch main, nothing to commit
+> │
+";
+        assert_eq!(classify_pane_tail(pane), None);
+    }
+
+    #[test]
+    fn replayed_cap_banner_above_running_spinner_is_none() {
+        let pane = "\
+You've reached your Fable 5 limit · resets 1:50am
+✻ Cerebrating… (esc to interrupt · 42s · 1.2k tokens)
+";
+        assert_eq!(classify_pane_tail(pane), None);
+    }
+
+    #[test]
+    fn replayed_cap_banner_above_tool_result_is_none() {
+        let pane = "\
+Session limit reached ∙ resets 11pm
+  ⎿  Read 214 lines
+> │
+";
+        assert_eq!(classify_pane_tail(pane), None);
+    }
+
+    #[test]
+    fn live_cap_banner_below_earlier_activity_still_fires() {
+        // Activity ABOVE the banner is the normal shape of a genuinely live
+        // cap: the session worked, then hit the wall. Only activity below
+        // voids the banner.
+        let pane = "\
+⏺ Task(long research sweep)
+  ⎿  Running…
+Claude usage limit reached. Your limit will reset at 1:50am (America/Chicago).
+> │
+";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
+    }
+
+    #[test]
+    fn live_cap_options_modal_still_fires() {
+        // The cap options modal renders option lines below the banner; none
+        // of that chrome is activity, so the banner stays live.
+        let pane = "\
+You've reached your Fable 5 limit · resets 1:50am
+❯ 1. Stop and wait for limit to reset
+  2. Switch to usage credits
+> │
+";
+        assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Capped));
+    }
+
     // ── classify: device-code ──────────────────────────────────────────
 
     #[test]

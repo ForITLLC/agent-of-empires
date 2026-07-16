@@ -58,6 +58,13 @@ pub struct PaneRuleConfig {
     /// (applied to the raw line or window before the pattern).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub negative: Vec<String>,
+    /// Liveness guards (Line scope only): regexes that mark a line as
+    /// ACTIVITY. A matched line is voided when any of these matches a line
+    /// BELOW it, because output rendered after the match proves the match is
+    /// replayed scrollback (a resumed pane re-shows old banners), not a
+    /// current blocking state. Empty keeps every match, the prior behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_below: Vec<String>,
     /// How many non-empty lines from the live edge of the pane are in scope.
     /// Small windows keep stale scrollback (a finished sign-in flow, a
     /// recovered error) from firing.
@@ -115,10 +122,24 @@ pub struct CompiledRule {
     pub kind: String,
     pattern: Regex,
     negative: Vec<Regex>,
+    stale_below: Vec<Regex>,
     tail_lines: usize,
     scope: RuleScope,
     strip_decoration: bool,
     pub priority: u32,
+}
+
+impl CompiledRule {
+    /// A Line-scope match only counts while nothing below it looks alive:
+    /// when any `stale_below` guard matches a line rendered after the
+    /// matched one, the match is replayed scrollback (the session resumed
+    /// and kept working), not a current blocking state.
+    fn match_is_current(&self, below: &[&str]) -> bool {
+        self.stale_below.is_empty()
+            || !below
+                .iter()
+                .any(|l| self.stale_below.iter().any(|g| g.is_match(l)))
+    }
 }
 
 /// Compile a rule list, dropping disabled entries and (with a warning) any
@@ -156,11 +177,27 @@ pub fn compile(rules: &[PaneRuleConfig]) -> Vec<CompiledRule> {
                     }
                 }
             }
+            let mut stale_below = Vec::with_capacity(r.stale_below.len());
+            for s in &r.stale_below {
+                match Regex::new(s) {
+                    Ok(g) => stale_below.push(g),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "pane_rules",
+                            rule = %r.name,
+                            error = %e,
+                            "invalid stale_below guard; rule dropped"
+                        );
+                        return None;
+                    }
+                }
+            }
             Some(CompiledRule {
                 name: r.name.clone(),
                 kind: r.kind.clone(),
                 pattern,
                 negative,
+                stale_below,
                 tail_lines: r.tail_lines.max(1),
                 scope: r.scope,
                 strip_decoration: r.strip_decoration,
@@ -206,7 +243,7 @@ pub fn classify<'a>(raw: &str, rules: &'a [CompiledRule]) -> Option<&'a Compiled
                 }
                 rule.pattern.is_match(&text)
             }
-            RuleScope::Line => window.iter().any(|line| {
+            RuleScope::Line => window.iter().enumerate().any(|(idx, line)| {
                 if rule.negative.iter().any(|g| g.is_match(line)) {
                     return false;
                 }
@@ -215,7 +252,7 @@ pub fn classify<'a>(raw: &str, rules: &'a [CompiledRule]) -> Option<&'a Compiled
                 } else {
                     line
                 };
-                rule.pattern.is_match(candidate)
+                rule.pattern.is_match(candidate) && rule.match_is_current(&window[idx + 1..])
             }),
         }
     })
@@ -249,7 +286,7 @@ pub fn classify_fp<'a>(raw: &str, rules: &'a [CompiledRule]) -> Option<(&'a Comp
                     .find(&text)
                     .map(|m| (rule, gate_fingerprint(rule, m.as_str())))
             }
-            RuleScope::Line => window.iter().find_map(|line| {
+            RuleScope::Line => window.iter().enumerate().find_map(|(idx, line)| {
                 if rule.negative.iter().any(|g| g.is_match(line)) {
                     return None;
                 }
@@ -258,8 +295,7 @@ pub fn classify_fp<'a>(raw: &str, rules: &'a [CompiledRule]) -> Option<(&'a Comp
                 } else {
                     line
                 };
-                rule.pattern
-                    .is_match(candidate)
+                (rule.pattern.is_match(candidate) && rule.match_is_current(&window[idx + 1..]))
                     .then(|| (rule, gate_fingerprint(rule, candidate)))
             }),
         }
@@ -360,6 +396,18 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
                 // (same convention as the action-required quoted guard).
                 r#"^[^\p{L}\p{N}]*['"`\x{2018}\x{2019}\x{201C}\x{201D}]"#.into(),
             ],
+            // Liveness: a cap banner is authoritative only while it is the
+            // last substantive thing in the pane. A tool-call bullet, a
+            // tool-result elbow, or a running spinner rendered below it means
+            // the session resumed and is serving again, so the banner is
+            // replayed scrollback from before a restart and must not revoke
+            // the account's headroom (the forit-main and xce-main false
+            // revokes of 2026-07-15).
+            stale_below: vec![
+                r"^\s*[⏺●]".into(),
+                r"^\s*⎿".into(),
+                r"(?i)\besc to interrupt\b".into(),
+            ],
             tail_lines: 30,
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -375,6 +423,7 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             // finished flow.
             pattern: r"(?i)microsoft\.com/devicelogin|/login/device|first copy your one-time code|to sign in, use a web browser|enter the code[\s\S]*to authenticate|to authenticate[\s\S]*enter the code".into(),
             negative: Vec::new(),
+            stale_below: Vec::new(),
             tail_lines: 8,
             scope: RuleScope::Window,
             strip_decoration: false,
@@ -389,6 +438,7 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             // and plain prose about overload never fire. Live-edge only.
             pattern: r"(?i)overloaded_error|api error\W{0,8}529\b|\b529\b.{0,40}overload|overload.{0,40}\b529\b".into(),
             negative: Vec::new(),
+            stale_below: Vec::new(),
             tail_lines: 8,
             scope: RuleScope::Line,
             strip_decoration: false,
@@ -421,6 +471,7 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
                 // ("run `git push`") is not at line-start and still fires.
                 r#"^\s*[`'"\x{2018}\x{2019}\x{201C}\x{201D}]\s*ACTION REQUIRED"#.into(),
             ],
+            stale_below: Vec::new(),
             tail_lines: 15,
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -523,6 +574,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
                 r"(?i)up to 50% of".into(),
                 r"(?i)try claude fable".into(),
             ],
+            stale_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Window,
             strip_decoration: false,
@@ -539,6 +591,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
             // sonnet'").
             pattern: r"(?i)\b(?:re-?launch(?:ed|ing)?|restart(?:ed|ing)?|fell back|fall(?:ing)? back|fallback|drop(?:ped|ping)? (?:down |back )?to|switch(?:ed|ing)? (?:to|onto)|revert(?:ed|ing)? to|downgrad(?:ed|e|ing)? to|bumped? down to|kicked (?:it )?(?:down|over) to|moved? (?:down |back )?to)\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus)\b".into(),
             negative: Vec::new(),
+            stale_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -553,6 +606,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
             // a model literal with NO subagent (app code) never fires.
             pattern: r"(?i)(?:\b(?:claude-)?(?:sonnet|opus)\b[^\n]{0,20}\bsub-?agents?\b|\bsub-?agents?\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus)\b|task\([^\n]{0,60}\b(?:claude-)?(?:sonnet|opus)\b)".into(),
             negative: Vec::new(),
+            stale_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -572,6 +626,7 @@ mod tests {
             kind: "cap".into(),
             pattern: pattern.into(),
             negative: Vec::new(),
+            stale_below: Vec::new(),
             tail_lines: default_tail_lines(),
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -816,6 +871,70 @@ mod tests {
         let compiled = compile(&[r]);
         assert!(classify("Usage limit reached ∙ resets 3pm\n", &compiled).is_some());
         assert!(classify("usage limit reached (not your usage limit)\n", &compiled).is_none());
+    }
+
+    #[test]
+    fn stale_below_voids_match_with_activity_below() {
+        let mut r = rule("cap-live", r"(?i)^usage limit reached");
+        r.stale_below = vec![r"^\s*[⏺●]".into()];
+        let compiled = compile(&[r]);
+        // Banner at the live edge: current, fires.
+        assert!(classify("earlier output\nUsage limit reached ∙ resets 3pm\n", &compiled).is_some());
+        // Activity rendered BELOW the banner: replayed scrollback, voided.
+        let replayed = "Usage limit reached ∙ resets 3pm\n⏺ Bash(cargo test)\n";
+        assert!(classify(replayed, &compiled).is_none());
+        assert!(classify_fp(replayed, &compiled).is_none());
+    }
+
+    #[test]
+    fn stale_below_ignores_activity_above_the_match() {
+        let mut r = rule("cap-live", r"(?i)^usage limit reached");
+        r.stale_below = vec![r"^\s*[⏺●]".into()];
+        let compiled = compile(&[r]);
+        // Activity ABOVE the banner is history, not liveness evidence.
+        assert!(classify("⏺ Bash(cargo test)\nUsage limit reached\n", &compiled).is_some());
+    }
+
+    #[test]
+    fn default_usage_cap_voided_by_replayed_scrollback() {
+        let compiled = compile(&default_rules());
+        let replayed = "You've reached your usage limit\n⏺ Read(src/main.rs)\n  ⎿ Read 40 lines\n";
+        assert!(
+            classify(replayed, &compiled).is_none(),
+            "cap banner with tool activity below must not revoke headroom"
+        );
+        assert!(
+            classify("You've reached your usage limit ∙ resets 3pm\n", &compiled).is_some(),
+            "cap banner at the live edge must still fire"
+        );
+    }
+
+    #[test]
+    fn toml_stale_below_parses_and_defaults_empty() {
+        let cfg: WatchdogConfig = toml::from_str(
+            r#"
+            [[rules]]
+            name = "bare"
+            kind = "cap"
+            pattern = "^x"
+
+            [[rules]]
+            name = "guarded"
+            kind = "cap"
+            pattern = "^y"
+            stale_below = ["^z"]
+            "#,
+        )
+        .expect("parses");
+        assert!(cfg.rules[0].stale_below.is_empty());
+        assert_eq!(cfg.rules[1].stale_below, vec!["^z".to_string()]);
+    }
+
+    #[test]
+    fn invalid_stale_below_guard_drops_rule() {
+        let mut r = rule("bad-guard", r"^x");
+        r.stale_below = vec![r"(unclosed".into()];
+        assert!(compile(&[r]).is_empty());
     }
 
     #[test]
