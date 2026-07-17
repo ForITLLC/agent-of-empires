@@ -133,6 +133,49 @@ pub(crate) fn next_verified_headroom(
         .map(str::to_string)
 }
 
+/// Whether EVERY pool profile holds a FRESH probed NEGATIVE headroom claim.
+/// Only then is "all accounts capped" empirically proven. An absent entry, a
+/// positive claim, or a stale negative all leave the pool state unknown: the
+/// parked escalation must then demand a probe, never assert a credits outage
+/// (the WO#449 phantom top-up pages came from equating "no verified target"
+/// with "all accounts out of credits").
+pub(crate) fn all_pool_probed_capped(state: &capacity::CapacityState, now_secs: u64) -> bool {
+    DRAW_ORDER.iter().all(|p| {
+        state.profiles.get(*p).is_some_and(|e| {
+            !e.headroom && now_secs.saturating_sub(e.updated) <= capacity::HEADROOM_TTL_SECS
+        })
+    })
+}
+
+/// The (kind, reason) for a parked capped session's Commander wake, split on
+/// whether the all-capped state is PROBED (every pool profile fresh-negative)
+/// or merely unknown. Only the probed shape may talk about credits; the
+/// unknown shape demands an empirical probe and explicitly forbids relaying a
+/// credits/money gate to Ben off this wake alone. WO#449 directive 4.
+pub(crate) fn parked_wake(
+    all_probed: bool,
+    kind: &str,
+    title: &str,
+    id: &str,
+    profile: &str,
+) -> (&'static str, String) {
+    if all_probed {
+        (
+            "capped-all-accounts",
+            format!(
+                "capped [{kind}] session '{title}' ({id}) on '{profile}' PARKED: ALL 5 pool accounts hold fresh probed NEGATIVE headroom claims. A credits escalation is warranted"
+            ),
+        )
+    } else {
+        (
+            "capped-parked",
+            format!(
+                "capped [{kind}] session '{title}' ({id}) on '{profile}' PARKED: no pool profile holds a fresh verified-headroom claim. Probe accounts empirically and PATCH /api/capacity to re-open relocation; do NOT surface a credits/money gate to Ben from this alone"
+            ),
+        )
+    }
+}
+
 /// Commander page for a pool relocation of a capped session. An auto-move
 /// (or a failed one) must never be silent: capacity-capped sessions fail
 /// /compact invisibly, so the Commander verifies the landing (WO #362).
@@ -495,7 +538,7 @@ impl Watchdog {
         Self {
             rules,
             capped_profiles: HashMap::new(),
-            last_session_action: HashMap::new(),
+            last_session_action: load_last_action(),
             last_all_capped_wake: None,
             last_drift_wake: HashMap::new(),
             last_action_fp: load_action_fp(),
@@ -730,6 +773,11 @@ impl Watchdog {
                 PaneSignal::ActionRequired => {}
             }
         }
+        // WO#449 anti-bounce: the ACTION_COOLDOWN map must survive a daemon
+        // bounce (launchd KeepAlive respawn), else every restart wipes the
+        // cooldown and a still-capped pane is re-acted-on immediately —
+        // the move/bounce loop Ben saw.
+        self.persist_last_action();
     }
 
     /// Escalate a scope/charter drift: the session's pane shows sustained
@@ -857,18 +905,19 @@ impl Watchdog {
                     .is_none_or(|t| now.duration_since(t) >= CAP_TTL);
                 if due {
                     self.last_all_capped_wake = Some(now);
-                    wake(
-                        "capped-parked",
+                    // WO#449 directive 4: only a fresh probed NEGATIVE on
+                    // EVERY pool profile justifies a credits-flavored
+                    // escalation; anything less is "state unknown — probe",
+                    // never a money gate.
+                    let all_probed = all_pool_probed_capped(&state, unix_secs());
+                    let (kind, reason) = parked_wake(
+                        all_probed,
+                        cap_kind.as_str(),
+                        &scan.title,
                         &scan.id,
-                        format!(
-                            "capped [{}] session '{}' ({}) on '{}' PARKED: no pool profile holds a fresh verified-headroom claim. Probe accounts empirically and PATCH /api/capacity to re-open relocation",
-                            cap_kind.as_str(),
-                            scan.title,
-                            scan.id,
-                            scan.profile
-                        ),
-                    )
-                    .await;
+                        &scan.profile,
+                    );
+                    wake(kind, &scan.id, reason).await;
                 }
             }
         }
@@ -971,6 +1020,32 @@ impl Watchdog {
             tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "cap-fp state write failed");
         }
     }
+
+    /// Persist the per-session ACTION_COOLDOWN map as wall-clock unix seconds
+    /// (`{"actions": {id: acted_at_secs}}`) so a daemon bounce resumes the
+    /// cooldown instead of resetting it — the WO#449 anti-bounce state.
+    /// Monotonic `Instant`s can't be serialized, so each entry is converted to
+    /// wall-clock by subtracting its elapsed age from now.
+    fn persist_last_action(&self) {
+        let Some(path) = last_action_path() else { return };
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let now_inst = Instant::now();
+        let actions: HashMap<&str, u64> = self
+            .last_session_action
+            .iter()
+            .map(|(id, acted)| {
+                let age = now_inst.duration_since(*acted).as_secs();
+                (id.as_str(), now_secs.saturating_sub(age))
+            })
+            .collect();
+        let json = serde_json::json!({ "updated": now_secs, "actions": actions });
+        if let Err(e) = std::fs::write(&path, json.to_string()) {
+            tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "last-action state write failed");
+        }
+    }
 }
 
 /// Wall-clock unix seconds as f64, matching the py lanes' `time.time()`. Used
@@ -1025,6 +1100,66 @@ fn load_action_fp() -> HashMap<String, ActionFp> {
         tracing::warn!(target: "server.pane_watchdog", path = %path.display(), "action-fp state unparseable; starting empty");
     }
     parse_action_fp(&raw, Instant::now())
+}
+
+/// Resolve the ACTION_COOLDOWN persistence file: `AOE_LAST_ACTION_FILE`
+/// override, else `<app_dir>/last-action-state.json`. `None` when no app dir
+/// is resolvable (fail-open: the cooldown degrades to in-memory-only). WO#449.
+fn last_action_path() -> Option<PathBuf> {
+    match std::env::var("AOE_LAST_ACTION_FILE") {
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => match crate::session::get_app_dir() {
+            Ok(dir) => Some(dir.join("last-action-state.json")),
+            Err(e) => {
+                tracing::warn!(target: "server.pane_watchdog", error = %e, "no app dir; last-action state not persisted");
+                None
+            }
+        },
+    }
+}
+
+/// Parse the persisted `{"actions": {id: acted_at_secs}}` document back into
+/// the in-memory cooldown map, backdating each entry by its wall-clock elapsed
+/// so the remaining cooldown carries across a daemon bounce. Entries already
+/// past [`ACTION_COOLDOWN`] (and non-numeric values) are dropped; malformed
+/// input yields an empty map. Pure for testability. WO#449.
+fn parse_last_action(raw: &str, now: Instant, now_secs: u64) -> HashMap<String, Instant> {
+    let mut map = HashMap::new();
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return map;
+    };
+    let Some(actions) = val.get("actions").and_then(|a| a.as_object()) else {
+        return map;
+    };
+    for (id, acted_at) in actions {
+        let Some(acted_secs) = acted_at.as_u64() else {
+            continue;
+        };
+        let elapsed = now_secs.saturating_sub(acted_secs);
+        if elapsed >= ACTION_COOLDOWN.as_secs() {
+            continue;
+        }
+        if let Some(backdated) = now.checked_sub(Duration::from_secs(elapsed)) {
+            map.insert(id.clone(), backdated);
+        }
+    }
+    map
+}
+
+/// Load the persisted ACTION_COOLDOWN map on daemon start. Missing /
+/// unreadable / malformed file yields an empty map (fail-open — worst case is
+/// one extra action, same as before WO#449, not a crash).
+fn load_last_action() -> HashMap<String, Instant> {
+    let Some(path) = last_action_path() else {
+        return HashMap::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+        tracing::warn!(target: "server.pane_watchdog", path = %path.display(), "last-action state unparseable; starting empty");
+    }
+    parse_last_action(&raw, Instant::now(), unix_secs())
 }
 
 /// Resolve the Fable-drift fingerprint state file: `AOE_FABLE_FP_FILE` override,
@@ -2105,5 +2240,117 @@ and enter the code H7Q2K9F4P to authenticate.
             parse_cap_fp(r#"{"caps":{"sess-a":{"fp":7}}}"#, Instant::now()).is_empty(),
             "entry with non-string fp must be skipped"
         );
+    }
+
+    // ── WO#449: anti-bounce cooldown survives a daemon bounce ───────────
+
+    #[test]
+    fn parse_last_action_round_trip_preserves_elapsed() {
+        // A session acted on 60s before the daemon bounced must come back
+        // with ~60s of its ACTION_COOLDOWN already spent, not a reset clock:
+        // launchd KeepAlive respawns the daemon in ~1s, and a wiped map is
+        // what let the for-tasks/for-Support pair re-move every bounce.
+        let now = Instant::now();
+        let raw = format!(
+            r#"{{"updated":{TEST_NOW},"actions":{{"sess-fresh":{},"sess-expired":{}}}}}"#,
+            TEST_NOW - 60,
+            TEST_NOW - ACTION_COOLDOWN.as_secs() - 10,
+        );
+        let map = parse_last_action(&raw, now, TEST_NOW);
+        let fresh = map.get("sess-fresh").expect("fresh entry kept");
+        let elapsed = now.duration_since(*fresh).as_secs();
+        assert!(
+            (59..=61).contains(&elapsed),
+            "backdated ~60s, got {elapsed}s"
+        );
+        assert!(
+            !map.contains_key("sess-expired"),
+            "entry past ACTION_COOLDOWN must be dropped on load"
+        );
+    }
+
+    #[test]
+    fn parse_last_action_malformed_yields_empty() {
+        let now = Instant::now();
+        assert!(parse_last_action("not json", now, TEST_NOW).is_empty());
+        assert!(parse_last_action(r#"{"actions": 42}"#, now, TEST_NOW).is_empty());
+        assert!(
+            parse_last_action(r#"{"actions":{"sess-a":"soon"}}"#, now, TEST_NOW).is_empty(),
+            "entry with non-numeric timestamp must be skipped"
+        );
+    }
+
+    // ── WO#449: credits escalation only when ALL pool accounts probed capped ──
+
+    #[test]
+    fn all_pool_probed_capped_requires_every_profile_fresh_negative() {
+        // True ONLY when every DRAW_ORDER profile holds a FRESH probed
+        // negative claim. Absence of an observation, a positive claim, or a
+        // stale negative all mean "not proven": the Commander must probe,
+        // not surface a credits/money gate to Ben.
+        let all_neg: Vec<(&str, bool)> = DRAW_ORDER.iter().map(|p| (*p, false)).collect();
+        assert!(all_pool_probed_capped(&claims(&all_neg), TEST_NOW));
+
+        let missing_one: Vec<(&str, bool)> = DRAW_ORDER[1..].iter().map(|p| (*p, false)).collect();
+        assert!(
+            !all_pool_probed_capped(&claims(&missing_one), TEST_NOW),
+            "an unprobed profile is unknown, not capped"
+        );
+
+        let one_positive: Vec<(&str, bool)> = DRAW_ORDER
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (*p, i == 2))
+            .collect();
+        assert!(!all_pool_probed_capped(&claims(&one_positive), TEST_NOW));
+
+        let mut mixed = claims(&DRAW_ORDER[1..].iter().map(|p| (*p, false)).collect::<Vec<_>>());
+        mixed.profiles.extend(
+            claims_at(
+                &[(DRAW_ORDER[0], false)],
+                TEST_NOW - capacity::HEADROOM_TTL_SECS - 1,
+            )
+            .profiles,
+        );
+        assert!(
+            !all_pool_probed_capped(&mixed, TEST_NOW),
+            "a stale negative probe is unknown again, not capped"
+        );
+    }
+
+    #[test]
+    fn parked_wake_distinguishes_probed_all_capped_from_unknown() {
+        // Probed-all-capped is the ONLY parked state allowed to talk about
+        // credits; the unknown-park wake must demand an empirical probe and
+        // must never carry credits/money-gate language the Commander could
+        // relay to Ben (the WO#449 phantom top-up pages).
+        let (kind, reason) = parked_wake(true, "credit", "for-tasks", "381b98ed", "xce-main");
+        assert_eq!(kind, "capped-all-accounts");
+        assert!(reason.contains("ALL 5 pool accounts"), "{reason}");
+        assert!(reason.to_lowercase().contains("probed"), "{reason}");
+
+        let (kind, reason) = parked_wake(false, "credit", "for-tasks", "381b98ed", "xce-main");
+        assert_eq!(kind, "capped-parked");
+        assert!(reason.contains("PATCH /api/capacity"), "{reason}");
+        assert!(
+            reason.contains("do NOT surface a credits/money gate to Ben"),
+            "{reason}"
+        );
+        let lower = reason.to_lowercase();
+        assert!(
+            !lower.contains("top up") && !lower.contains("out of credits"),
+            "unknown-park wake must not carry credits language: {reason}"
+        );
+    }
+
+    #[test]
+    fn all_negative_claims_park() {
+        // Every pool profile probed negative → no relocation target. The
+        // selector parks; escalation shape is parked_wake's job.
+        let all_neg: Vec<(&str, bool)> = DRAW_ORDER.iter().map(|p| (*p, false)).collect();
+        let state = claims(&all_neg);
+        for profile in DRAW_ORDER {
+            assert_eq!(next_verified_headroom(profile, &state, TEST_NOW), None);
+        }
     }
 }

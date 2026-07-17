@@ -443,6 +443,13 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
                 r"^\s*[⏺●]".into(),
                 r"^\s*⎿".into(),
                 r"(?i)\besc to interrupt\b".into(),
+                // A bare ready prompt (optionally box-bordered) below the
+                // banner means the CLI is idle at its input line, so the
+                // banner is replayed scrollback carried across an
+                // `aoe session move` (the WO#449 bounce loop). The live cap
+                // options modal renders `❯ 1. <option>` with text after the
+                // chevron and never matches this.
+                r"^\s*│?\s*❯\s*│?\s*$".into(),
             ],
             require_below: Vec::new(),
             tail_lines: 30,
@@ -966,6 +973,54 @@ mod tests {
         assert!(
             classify("You've reached your usage limit ∙ resets 3pm\n", &compiled).is_some(),
             "cap banner at the live edge must still fire"
+        );
+    }
+
+    #[test]
+    fn default_usage_cap_voided_by_ready_prompt_below() {
+        // WO#449 bounce loop: `aoe session move` preserves tmux scrollback,
+        // so a credit-out banner travels with the session and re-renders on
+        // the NEW profile above a settled ready prompt. A bare `❯` input
+        // prompt below the banner means the CLI is idle-and-ready, not
+        // blocked mid-request — the banner is history and must not re-cap
+        // the landing profile (the for-tasks/for-Support xce-main ↔
+        // forit-backup ping-pong of 2026-07-17). Fixture shape captured live
+        // from pane aoe_for-tasks_381b98ed.
+        let compiled = compile(&default_rules());
+        let replayed = "❯ wake up: pick up what you were doing\n\
+                        \x20 ⎿  You've reached your Fable 5 limit. Run /usage-credits to continue or switch\n\
+                        \x20    models with /model.\n\
+                        \n\
+                        ✢ Cogitated for 0s\n\
+                        ──────\n\
+                        ❯ \n\
+                        ──────\n\
+                        \x20 ⏵⏵ bypass permissions on (shift+tab to cycle) · ctrl+t to show tasks\n";
+        assert!(
+            classify(replayed, &compiled).is_none(),
+            "credit-out banner above a bare ready prompt must not fire"
+        );
+        // Box-bordered prompt variant renders the chevron between `│` walls.
+        let boxed = "You're out of usage credits\n│ ❯ │\n";
+        assert!(
+            classify(boxed, &compiled).is_none(),
+            "credit-out banner above a boxed ready prompt must not fire"
+        );
+    }
+
+    #[test]
+    fn default_usage_cap_options_modal_selector_still_fires() {
+        // The LIVE cap options modal renders selector chevrons WITH text
+        // (`❯ 1. Run /usage-credits…`). Those must not read as a bare ready
+        // prompt: this is the genuinely blocked state and must keep firing.
+        let compiled = compile(&default_rules());
+        let modal = "You've reached your Fable 5 limit.\n\
+                     ❯ 1. Run /usage-credits to continue\n\
+                     \x20 2. Switch models with /model\n";
+        assert_eq!(
+            classify(modal, &compiled).map(|m| m.name.as_str()),
+            Some("usage-cap"),
+            "live cap options modal must still fire"
         );
     }
 
