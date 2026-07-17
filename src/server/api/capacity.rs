@@ -20,7 +20,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::server::capacity::{capacity_path, CapacityState};
+use crate::server::capacity::{capacity_path, CapacityState, ProfileCapacity};
 
 use super::AppState;
 
@@ -76,6 +76,21 @@ fn apply_patch(state: &mut CapacityState, profiles: HashMap<String, ProfilePatch
     state.updated = now_secs;
 }
 
+/// Merge one profile's PATCH into the state and return the resulting
+/// entry. Same semantics as [`apply_patch`] for a single profile; backs
+/// `PATCH /api/capacity/{profile}` (WO#445 — before it existed the
+/// per-profile URL fell through to the SPA fallback and answered 405,
+/// so the Commander could not re-open relocation).
+fn apply_profile_patch(
+    state: &mut CapacityState,
+    name: &str,
+    patch: ProfilePatch,
+    now_secs: u64,
+) -> ProfileCapacity {
+    apply_patch(state, HashMap::from([(name.to_string(), patch)]), now_secs);
+    state.profiles.get(name).cloned().unwrap_or_default()
+}
+
 pub async fn get_capacity(
     State(_state): State<Arc<AppState>>,
 ) -> Result<Json<CapacityState>, (StatusCode, String)> {
@@ -107,6 +122,47 @@ pub async fn patch_capacity(
         "capacity state patched"
     );
     Ok(Json(cap))
+}
+
+/// GET /api/capacity/{profile} — one profile's entry, 404 when absent.
+pub async fn get_capacity_profile(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Path(profile): axum::extract::Path<String>,
+) -> Result<Json<ProfileCapacity>, (StatusCode, String)> {
+    let path = capacity_path().ok_or_else(no_app_dir)?;
+    CapacityState::load(&path)
+        .profiles
+        .get(&profile)
+        .cloned()
+        .map(Json)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("no capacity entry for profile '{profile}'"),
+        ))
+}
+
+/// PATCH /api/capacity/{profile} — merge one profile's claim and return
+/// the resulting entry (WO#445: the Commander grant path).
+pub async fn patch_capacity_profile(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(profile): axum::extract::Path<String>,
+    req: Result<Json<ProfilePatch>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<ProfileCapacity>, (StatusCode, String)> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "Server is in read-only mode".into()));
+    }
+    let Json(patch) = req.map_err(|rej| (rej.status(), rej.body_text()))?;
+    let path = capacity_path().ok_or_else(no_app_dir)?;
+    let mut cap = CapacityState::load(&path);
+    let entry = apply_profile_patch(&mut cap, &profile, patch, now_secs());
+    cap.save(&path);
+    tracing::info!(
+        target: "server.capacity",
+        profile = %profile,
+        headroom = entry.headroom,
+        "capacity profile patched"
+    );
+    Ok(Json(entry))
 }
 
 #[cfg(test)]
@@ -200,6 +256,43 @@ mod tests {
             NOW,
         );
         let entry = &state.profiles["xce-main"];
+        assert!(entry.headroom);
+        assert_eq!(entry.cap_kind.as_deref(), Some("fable-credit"));
+        assert_eq!(entry.note.as_deref(), Some("watchdog observed"));
+        assert_eq!(entry.updated, NOW);
+    }
+
+    // ── WO#445: per-profile PATCH (Commander grant path) ─────────────
+
+    #[test]
+    fn profile_patch_grants_headroom_and_returns_entry() {
+        let mut state = CapacityState::default();
+        let entry = apply_profile_patch(
+            &mut state,
+            "forit-main",
+            patch(true, None, Some("WO#445 probe")),
+            NOW,
+        );
+        assert!(entry.headroom);
+        assert_eq!(entry.updated, NOW);
+        assert_eq!(entry.note.as_deref(), Some("WO#445 probe"));
+        assert!(state.verified_headroom("forit-main", NOW));
+        assert_eq!(state.updated, NOW);
+    }
+
+    #[test]
+    fn profile_patch_keeps_kind_and_note_when_omitted() {
+        let mut state = CapacityState::default();
+        state.profiles.insert(
+            "xce-main".to_string(),
+            ProfileCapacity {
+                headroom: false,
+                cap_kind: Some("fable-credit".to_string()),
+                note: Some("watchdog observed".to_string()),
+                updated: NOW - 100,
+            },
+        );
+        let entry = apply_profile_patch(&mut state, "xce-main", patch(true, None, None), NOW);
         assert!(entry.headroom);
         assert_eq!(entry.cap_kind.as_deref(), Some("fable-credit"));
         assert_eq!(entry.note.as_deref(), Some("watchdog observed"));

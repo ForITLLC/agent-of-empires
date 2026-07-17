@@ -19,7 +19,7 @@
 //! unwritable state file logs and skips; the daemon never crashes or stalls
 //! on watchdog work.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -196,6 +196,98 @@ fn action_should_wake(last_fp: Option<&str>, current_fp: &str) -> bool {
     last_fp != Some(current_fp)
 }
 
+/// Last observed cap-banner fingerprint for a session, with when that exact
+/// banner content was FIRST seen (wall clock, for comparison against a
+/// capacity grant's `updated`) and last observed (monotonic, for TTL
+/// pruning). Backs the WO#445 replayed-banner gate: a banner whose content
+/// predates the Commander's verified grant is stale scrollback, not a fresh
+/// cap observation, so it must not eat the grant.
+#[derive(Clone)]
+struct CapFp {
+    fp: String,
+    first_seen_secs: u64,
+    seen: Instant,
+}
+
+/// True when the pane's LIVE EDGE (the last few non-empty lines) shows the
+/// running footer ("esc to interrupt") — the account is empirically serving
+/// a request right now, whatever stale banners sit above in scrollback.
+/// The window is deliberately small: the footer only renders at the very
+/// bottom while working (spinner + input box + status ≈ 5 lines), so a
+/// replayed footer buried under real output stays outside it.
+fn pane_is_actively_working(content: &str) -> bool {
+    content
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(8)
+        .any(|l| l.to_ascii_lowercase().contains("esc to interrupt"))
+}
+
+/// Unix-secs first-seen for a session's current cap-banner fingerprint:
+/// sticky while the banner content is unchanged (`prev` fp matches), reset
+/// to `now_secs` when the banner changes or was never seen.
+fn cap_first_seen(prev: Option<(&str, u64)>, current_fp: &str, now_secs: u64) -> u64 {
+    match prev {
+        Some((fp, first)) if fp == current_fp => first,
+        _ => now_secs,
+    }
+}
+
+/// Whether an observed cap banner must NOT revoke the profile's headroom
+/// (returns the suppression reason) — the WO#445 false-revoke gate:
+/// (a) `profile-serving`: another pane on the profile (or this one) is
+///     empirically serving right now, so the account is not capped;
+/// (b) `pre-grant-banner`: the profile holds a verified grant and this exact
+///     banner content was first seen at-or-before the grant's `updated` —
+///     the Commander granted with the banner already on screen, so it is
+///     stale scrollback, not a new observation.
+/// `None` = observation beats claim as before (WO#414): revoke.
+fn cap_revoke_suppressed(
+    profile_serving: bool,
+    verified_headroom: bool,
+    grant_updated_secs: u64,
+    banner_first_seen_secs: u64,
+) -> Option<&'static str> {
+    if profile_serving {
+        return Some("profile-serving");
+    }
+    if verified_headroom && banner_first_seen_secs <= grant_updated_secs {
+        return Some("pre-grant-banner");
+    }
+    None
+}
+
+/// Parse the persisted `{"caps": {id: {"fp": …, "first_seen": …}}}` document
+/// into the in-memory map, stamping every entry's `seen` with `now`. Pure,
+/// like [`parse_action_fp`]; malformed input yields an empty map. WO#445.
+fn parse_cap_fp(raw: &str, now: Instant) -> HashMap<String, CapFp> {
+    let mut map = HashMap::new();
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return map;
+    };
+    if let Some(caps) = val.get("caps").and_then(|c| c.as_object()) {
+        for (id, entry) in caps {
+            let Some(fp) = entry.get("fp").and_then(|f| f.as_str()) else {
+                continue;
+            };
+            let first_seen_secs = entry
+                .get("first_seen")
+                .and_then(|f| f.as_u64())
+                .unwrap_or(0);
+            map.insert(
+                id.clone(),
+                CapFp {
+                    fp: fp.to_string(),
+                    first_seen_secs,
+                    seen: now,
+                },
+            );
+        }
+    }
+    map
+}
+
 /// Spawn the supervised watchdog interval task. No-op when disabled by env
 /// or config. Env overrides win over the `[watchdog]` config section, which
 /// wins over the built-in interval/rule defaults.
@@ -263,6 +355,11 @@ struct PaneScan {
     /// window). WO#414.
     cap_kind: Option<capacity::CapKind>,
     /// Content fingerprint of the winning rule's match when `signal` is
+    /// `Capped`, else `None`. Backs the replayed-banner discriminator: an
+    /// unchanged fingerprint that predates the profile's current headroom
+    /// grant is stale scrollback, not fresh cap evidence. WO#445.
+    cap_fp: Option<String>,
+    /// Content fingerprint of the winning rule's match when `signal` is
     /// `ActionRequired`, else `None`. Drives the WO #139 content dampener:
     /// an unchanged fingerprint is the same already-surfaced gate.
     action_fp: Option<String>,
@@ -280,16 +377,23 @@ struct PaneScan {
 }
 
 /// Capture and classify every registered non-structured session's pane tail.
-/// Blocking (tmux subprocesses + storage reads); run under `spawn_blocking`.
-fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec<PaneScan> {
+/// Also returns the set of profiles with at least one pane actively working
+/// ("esc to interrupt" at the live edge) — empirical serving evidence that
+/// outranks a replayed cap banner on a sibling pane (WO#445). Blocking (tmux
+/// subprocesses + storage reads); run under `spawn_blocking`.
+fn scan_panes(
+    file_watch: &Arc<FileWatchService>,
+    rules: &[CompiledRule],
+) -> (Vec<PaneScan>, HashSet<String>) {
     let instances = match super::load_all_instances(file_watch) {
         Ok(i) => i,
         Err(e) => {
             tracing::warn!(target: "server.pane_watchdog", error = %e, "load_all_instances failed; skipping tick");
-            return Vec::new();
+            return (Vec::new(), HashSet::new());
         }
     };
-    instances
+    let mut serving: HashSet<String> = HashSet::new();
+    let scans = instances
         .iter()
         .filter(|inst| !inst.is_structured())
         .filter_map(|inst| {
@@ -298,13 +402,24 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
                 return None;
             }
             let content = sess.capture_pane(60).ok()?;
+            // Serving evidence is collected for EVERY captured pane, before
+            // the signal filter: a working pane with no signal at all is
+            // exactly the proof that its profile serves (WO#445).
+            if pane_is_actively_working(&content) {
+                serving.insert(inst.source_profile.clone());
+            }
             // classify_fp yields the winning rule AND its churn-stable content
             // fingerprint in one pass; keep the fp only for the ActionRequired
-            // signal (the sole content-gated path, WO #139).
+            // signal (the sole content-gated path, WO #139) and the Capped
+            // signal (the replayed-banner discriminator, WO#445).
             let hit = pane_rules::classify_fp(&content, rules);
             let signal = hit.as_ref().and_then(|(r, _)| kind_to_signal(&r.kind));
             let cap_kind = match signal {
                 Some(PaneSignal::Capped) => Some(capacity::classify_cap_kind(&content)),
+                _ => None,
+            };
+            let cap_fp = match (signal, &hit) {
+                (Some(PaneSignal::Capped), Some((_, fp))) => Some(fp.clone()),
                 _ => None,
             };
             let action_fp = match (signal, &hit) {
@@ -333,13 +448,15 @@ fn scan_panes(file_watch: &Arc<FileWatchService>, rules: &[CompiledRule]) -> Vec
                 profile: inst.source_profile.clone(),
                 signal,
                 cap_kind,
+                cap_fp,
                 action_fp,
                 surface_key,
                 drift,
                 fable_hit,
             })
         })
-        .collect()
+        .collect();
+    (scans, serving)
 }
 
 struct Watchdog {
@@ -366,6 +483,11 @@ struct Watchdog {
     /// unchanged drift fingerprint is suppressed, a new/changed one pages the
     /// Commander immediately. WO d6bcae49.
     last_fable_fp: HashMap<String, ActionFp>,
+    /// Last observed cap-banner fingerprint per session with its wall-clock
+    /// first-seen, persisted across restarts. Backs the WO#445 replayed-banner
+    /// gate: a banner whose unchanged content predates the profile's verified
+    /// headroom grant is stale scrollback and must not revoke the grant.
+    last_cap_fp: HashMap<String, CapFp>,
 }
 
 impl Watchdog {
@@ -378,14 +500,15 @@ impl Watchdog {
             last_drift_wake: HashMap::new(),
             last_action_fp: load_action_fp(),
             last_fable_fp: load_fable_fp(),
+            last_cap_fp: load_cap_fp(),
         }
     }
 
     async fn tick(&mut self, state: &Arc<super::AppState>) {
         let file_watch = state.file_watch.clone();
         let rules = self.rules.clone();
-        let scans = match tokio::task::spawn_blocking(move || scan_panes(&file_watch, &rules))
-            .await
+        let (scans, serving) =
+            match tokio::task::spawn_blocking(move || scan_panes(&file_watch, &rules)).await
         {
             Ok(s) => s,
             Err(e) => {
@@ -408,8 +531,63 @@ impl Watchdog {
         // observed ages out so a genuinely new one later pages again. WO d6bcae49.
         self.last_fable_fp
             .retain(|_, a| now.duration_since(a.seen) < ACTION_FP_TTL);
+        // Cap-banner fingerprints age out on the same TTL so a long-cleared
+        // banner's first-seen doesn't linger to misdate a future one. WO#445.
+        self.last_cap_fp
+            .retain(|_, c| now.duration_since(c.seen) < ACTION_FP_TTL);
+
+        // WO#445: discriminate LIVE cap banners from replayed scrollback
+        // BEFORE any revocation. The capacity state is loaded once here so
+        // every suppression verdict this tick compares the banner's
+        // first-seen against the same pre-revocation grant timestamps.
+        let now_secs = unix_secs();
+        let cap_state_pre = capacity::capacity_path()
+            .map(|p| capacity::CapacityState::load(&p))
+            .unwrap_or_default();
+        let mut suppressed_caps: HashSet<String> = HashSet::new();
         for scan in &scans {
-            if scan.signal == Some(PaneSignal::Capped) {
+            if scan.signal != Some(PaneSignal::Capped) {
+                continue;
+            }
+            let current_fp = scan.cap_fp.clone().unwrap_or_default();
+            let prev = self
+                .last_cap_fp
+                .get(&scan.id)
+                .map(|c| (c.fp.as_str(), c.first_seen_secs));
+            let first_seen = cap_first_seen(prev, &current_fp, now_secs);
+            self.last_cap_fp.insert(
+                scan.id.clone(),
+                CapFp {
+                    fp: current_fp,
+                    first_seen_secs: first_seen,
+                    seen: now,
+                },
+            );
+            let grant_updated = cap_state_pre
+                .profiles
+                .get(&scan.profile)
+                .map(|e| e.updated)
+                .unwrap_or(0);
+            if let Some(reason) = cap_revoke_suppressed(
+                serving.contains(&scan.profile),
+                cap_state_pre.verified_headroom(&scan.profile, now_secs),
+                grant_updated,
+                first_seen,
+            ) {
+                tracing::info!(
+                    target: "server.pane_watchdog",
+                    id = %scan.id,
+                    profile = %scan.profile,
+                    reason,
+                    "cap banner suppressed: not live cap evidence, headroom kept (WO#445)"
+                );
+                suppressed_caps.insert(scan.id.clone());
+            }
+        }
+        self.persist_cap_fp();
+
+        for scan in &scans {
+            if scan.signal == Some(PaneSignal::Capped) && !suppressed_caps.contains(&scan.id) {
                 self.capped_profiles.insert(scan.profile.clone(), now);
             }
         }
@@ -417,10 +595,11 @@ impl Watchdog {
         // Fold every observed cap into the shared capacity state: a pane
         // showing a cap banner drops that profile out of the relocation pool
         // immediately, no matter how fresh its last positive probe was.
-        // Observation beats a standing claim (WO#414).
+        // Observation beats a standing claim (WO#414) — unless the WO#445
+        // discriminator proved the banner stale/contradicted above.
         let observed_caps: Vec<(String, capacity::CapKind)> = scans
             .iter()
-            .filter(|s| s.signal == Some(PaneSignal::Capped))
+            .filter(|s| s.signal == Some(PaneSignal::Capped) && !suppressed_caps.contains(&s.id))
             .map(|s| {
                 (
                     s.profile.clone(),
@@ -450,6 +629,11 @@ impl Watchdog {
                 self.handle_fable_drift(&scan, &rule, &fp, now).await;
             }
             let Some(signal) = scan.signal else { continue };
+            // A suppressed cap banner is stale scrollback or contradicted by
+            // live serving evidence (WO#445): no red row, no relocation.
+            if signal == PaneSignal::Capped && suppressed_caps.contains(&scan.id) {
+                continue;
+            }
             // Mirror the observed block into the instance's attention.json so
             // the TUI/FleetView red row reflects pane truth without any
             // agent-side text scanning (the watchdog is the SOLE text
@@ -760,6 +944,33 @@ impl Watchdog {
             tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "fable-fp state write failed");
         }
     }
+
+    /// Persist the cap-banner fingerprint map (fp + wall-clock first-seen per
+    /// session) so a daemon restart keeps knowing which banner content
+    /// predates which headroom grant. Without this, every restart would reset
+    /// first-seen to "now" and a standing stale banner would immediately eat
+    /// a fresh grant again. WO#445.
+    fn persist_cap_fp(&self) {
+        let Some(path) = cap_fp_path() else { return };
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let caps: HashMap<&str, serde_json::Value> = self
+            .last_cap_fp
+            .iter()
+            .map(|(id, c)| {
+                (
+                    id.as_str(),
+                    serde_json::json!({ "fp": c.fp, "first_seen": c.first_seen_secs }),
+                )
+            })
+            .collect();
+        let json = serde_json::json!({ "updated": now_secs, "caps": caps });
+        if let Err(e) = std::fs::write(&path, json.to_string()) {
+            tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "cap-fp state write failed");
+        }
+    }
 }
 
 /// Wall-clock unix seconds as f64, matching the py lanes' `time.time()`. Used
@@ -843,6 +1054,35 @@ fn load_fable_fp() -> HashMap<String, ActionFp> {
         return HashMap::new();
     };
     parse_action_fp(&raw, Instant::now())
+}
+
+/// Resolve the cap-banner fingerprint state file: `AOE_CAP_FP_FILE` override,
+/// else `<app_dir>/cap-fp-state.json`. Separate file from the other dampeners
+/// because its entries carry a wall-clock first-seen, not just a fp. WO#445.
+fn cap_fp_path() -> Option<PathBuf> {
+    match std::env::var("AOE_CAP_FP_FILE") {
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => match crate::session::get_app_dir() {
+            Ok(dir) => Some(dir.join("cap-fp-state.json")),
+            Err(e) => {
+                tracing::warn!(target: "server.pane_watchdog", error = %e, "no app dir; cap-fp state not persisted");
+                None
+            }
+        },
+    }
+}
+
+/// Load the persisted cap-banner fingerprint map on daemon start via the pure
+/// [`parse_cap_fp`]. Missing / malformed yields an empty map (fail-open: the
+/// first post-restart sighting just re-dates first-seen to now). WO#445.
+fn load_cap_fp() -> HashMap<String, CapFp> {
+    let Some(path) = cap_fp_path() else {
+        return HashMap::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    parse_cap_fp(&raw, Instant::now())
 }
 
 /// Parse the persisted `{"gates": {id: fp}}` document into the in-memory map,
@@ -1733,6 +1973,137 @@ and enter the code H7Q2K9F4P to authenticate.
         assert_eq!(
             fable_scan_hit("--model fable", BAT_SUMMIT_TAIL),
             classify_fable_drift(BAT_SUMMIT_TAIL)
+        );
+    }
+
+    // ── WO#445: replayed-banner false-revoke gate ───────────────────────
+
+    #[test]
+    fn working_footer_at_live_edge_is_actively_working() {
+        let pane = "\
+⏺ earlier tool output
+⏺ more output
+
+✻ Cerebrating… (esc to interrupt · 42s · 1.2k tokens)
+
+╭──────────────────────────╮
+│ >                        │
+╰──────────────────────────╯
+  ⏵⏵ bypass permissions on
+";
+        assert!(pane_is_actively_working(pane));
+    }
+
+    #[test]
+    fn idle_prompt_is_not_actively_working() {
+        let pane = "\
+⏺ Done — committed as cb5027b.
+
+╭──────────────────────────╮
+│ >                        │
+╰──────────────────────────╯
+  ⏵⏵ bypass permissions on
+";
+        assert!(!pane_is_actively_working(pane));
+    }
+
+    #[test]
+    fn footer_deep_in_scrollback_is_not_actively_working() {
+        // A replayed working footer buried above real output is history,
+        // not evidence the account is serving now.
+        let mut pane = String::from("✻ Cerebrating… (esc to interrupt · 42s)\n");
+        for i in 0..12 {
+            pane.push_str(&format!("⏺ output line {i}\n"));
+        }
+        assert!(!pane_is_actively_working(&pane));
+    }
+
+    #[test]
+    fn cap_first_seen_first_sighting_is_now() {
+        assert_eq!(cap_first_seen(None, "fp-a", TEST_NOW), TEST_NOW);
+    }
+
+    #[test]
+    fn cap_first_seen_sticky_while_fp_unchanged() {
+        assert_eq!(
+            cap_first_seen(Some(("fp-a", TEST_NOW - 900)), "fp-a", TEST_NOW),
+            TEST_NOW - 900
+        );
+    }
+
+    #[test]
+    fn cap_first_seen_resets_on_changed_fp() {
+        assert_eq!(
+            cap_first_seen(Some(("fp-a", TEST_NOW - 900)), "fp-b", TEST_NOW),
+            TEST_NOW
+        );
+    }
+
+    #[test]
+    fn revoke_suppressed_while_profile_serving() {
+        // Empirical serving beats a banner regardless of claim state: the
+        // session is not blocked, so revoke+park would be wrong.
+        assert_eq!(
+            cap_revoke_suppressed(true, false, 0, TEST_NOW),
+            Some("profile-serving")
+        );
+        assert_eq!(
+            cap_revoke_suppressed(true, true, TEST_NOW - 300, TEST_NOW),
+            Some("profile-serving")
+        );
+    }
+
+    #[test]
+    fn revoke_suppressed_for_pre_grant_banner() {
+        // Banner content first seen at-or-before the verified grant: the
+        // Commander granted with this very banner on screen (same-second
+        // included — the xce-main re-revoke landed the same second as the
+        // grant), so it is stale scrollback.
+        assert_eq!(
+            cap_revoke_suppressed(false, true, TEST_NOW, TEST_NOW),
+            Some("pre-grant-banner")
+        );
+        assert_eq!(
+            cap_revoke_suppressed(false, true, TEST_NOW, TEST_NOW - 300),
+            Some("pre-grant-banner")
+        );
+    }
+
+    #[test]
+    fn new_banner_after_grant_still_revokes() {
+        // A banner whose content changed AFTER the grant is a fresh cap
+        // observation — observation beats claim (WO#414 invariant intact).
+        assert_eq!(
+            cap_revoke_suppressed(false, true, TEST_NOW - 300, TEST_NOW),
+            None
+        );
+    }
+
+    #[test]
+    fn banner_without_verified_claim_still_revokes() {
+        // No standing grant to protect → plain WO#414 behavior.
+        assert_eq!(cap_revoke_suppressed(false, false, 0, TEST_NOW - 900), None);
+    }
+
+    #[test]
+    fn parse_cap_fp_roundtrip() {
+        let now = Instant::now();
+        let raw =
+            r#"{"updated":1800000000,"caps":{"sess-a":{"fp":"fp-a","first_seen":1799999000}}}"#;
+        let map = parse_cap_fp(raw, now);
+        let a = map.get("sess-a").expect("entry parsed");
+        assert_eq!(a.fp, "fp-a");
+        assert_eq!(a.first_seen_secs, 1_799_999_000);
+        assert_eq!(a.seen, now);
+    }
+
+    #[test]
+    fn parse_cap_fp_malformed_yields_empty() {
+        assert!(parse_cap_fp("not json", Instant::now()).is_empty());
+        assert!(parse_cap_fp(r#"{"caps": 42}"#, Instant::now()).is_empty());
+        assert!(
+            parse_cap_fp(r#"{"caps":{"sess-a":{"fp":7}}}"#, Instant::now()).is_empty(),
+            "entry with non-string fp must be skipped"
         );
     }
 }

@@ -1983,6 +1983,12 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/capacity",
             get(api::get_capacity).patch(api::patch_capacity),
         )
+        // Per-profile capacity claim (WO#445): the Commander grant path.
+        // Without this the URL fell through to the SPA fallback → 405.
+        .route(
+            "/api/capacity/{profile}",
+            get(api::get_capacity_profile).patch(api::patch_capacity_profile),
+        )
         // Durable send audit log; rows are written best-effort by the send
         // paths (CLI `aoe send` and POST /api/sessions/{id}/send).
         .route("/api/messages", get(api::get_messages))

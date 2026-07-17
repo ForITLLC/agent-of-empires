@@ -42,7 +42,7 @@ pub use acp::{
     switch_acp_agent,
 };
 
-pub use capacity::{get_capacity, patch_capacity};
+pub use capacity::{get_capacity, get_capacity_profile, patch_capacity, patch_capacity_profile};
 #[cfg(feature = "serve")]
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
 
@@ -348,7 +348,7 @@ mod tests {
             (
                 "api/capacity.rs",
                 include_str!("capacity.rs"),
-                &["patch_capacity"],
+                &["patch_capacity", "patch_capacity_profile"],
             ),
             (
                 "api/mcp.rs",
@@ -551,7 +551,7 @@ mod tests {
             (
                 "api/capacity.rs",
                 include_str!("capacity.rs"),
-                &["patch_capacity"],
+                &["patch_capacity", "patch_capacity_profile"],
             ),
             (
                 "api/mcp.rs",
