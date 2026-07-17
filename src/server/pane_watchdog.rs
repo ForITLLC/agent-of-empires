@@ -331,6 +331,284 @@ fn parse_cap_fp(raw: &str, now: Instant) -> HashMap<String, CapFp> {
     map
 }
 
+/// What the watchdog DID about a live cap this tick (WO#450 classification).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CapAction {
+    /// Relocated (or tried to relocate) the session to a verified-headroom
+    /// pool profile. `ok` false means the move command failed.
+    Moved { target: String, ok: bool },
+    /// Still capped but inside the per-session action cooldown: no new
+    /// action, the state is logged so the hold is auditable.
+    Cooldown,
+    /// Capped on a non-pool profile: never auto-moved, paged instead.
+    NonPool,
+}
+
+/// Per-session per-tick classification: what state the pane is in, what the
+/// watchdog decided, and why. EVERY live session gets exactly one disposition
+/// per tick, healthy or not, so silent misses are visible in the log (WO#450).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Healthy pane: no signal, no drift, nothing suppressed.
+    Serving,
+    /// A LIVE cap banner (survived the WO#445/#449 replayed-banner gate).
+    LiveCap {
+        kind: &'static str,
+        action: CapAction,
+    },
+    /// A cap banner proven to be replayed scrollback or contradicted by live
+    /// serving evidence: ignored, headroom kept, never a page.
+    ReplayedBanner { why: &'static str },
+    /// A Fable-pinned session showing off-Fable drift (silent limit,
+    /// downgrade announcement, or non-Fable subagent).
+    FableDrift { rule: String, paged: bool },
+    /// Capped with no verified-headroom relocation target: parked.
+    Parked {
+        kind: &'static str,
+        all_probed: bool,
+    },
+    /// An ACTION REQUIRED gate line. `suppressed` names why the page was
+    /// withheld (commander-exempt / pane-actively-working); `None` means the
+    /// gate is genuine and `paged` says whether this tick woke the Commander.
+    ActionGate {
+        paged: bool,
+        suppressed: Option<&'static str>,
+    },
+    /// A device-code sign-in prompt at the pane edge.
+    DeviceCode { paged: bool },
+    /// A transient 529 overload banner: red row only, self-clearing.
+    Overloaded,
+}
+
+impl Disposition {
+    /// The classification STATE column. A suppressed action gate reads
+    /// SERVING: the matched text is not a live bottom-of-pane gate.
+    pub(crate) fn state(&self) -> String {
+        match self {
+            Disposition::Serving => "SERVING".into(),
+            Disposition::LiveCap { kind, .. } => format!("LIVE-CAP-{kind}"),
+            Disposition::ReplayedBanner { .. } => "REPLAYED-banner-ignored".into(),
+            Disposition::FableDrift { .. } => "SUBAGENT-model-drift".into(),
+            Disposition::Parked { .. } => "PARKED".into(),
+            Disposition::ActionGate { suppressed, .. } => match suppressed {
+                Some(_) => "SERVING".into(),
+                None => "ACTION-REQUIRED".into(),
+            },
+            Disposition::DeviceCode { .. } => "DEVICE-CODE".into(),
+            Disposition::Overloaded => "OVERLOADED".into(),
+        }
+    }
+
+    /// The classification DECISION column: none, page-commander, or park.
+    pub(crate) fn decision(&self) -> &'static str {
+        match self {
+            Disposition::Serving | Disposition::ReplayedBanner { .. } | Disposition::Overloaded => {
+                "none"
+            }
+            Disposition::LiveCap { action, .. } => match action {
+                CapAction::Moved { .. } | CapAction::NonPool => "page-commander",
+                CapAction::Cooldown => "none",
+            },
+            Disposition::FableDrift { paged, .. }
+            | Disposition::ActionGate {
+                paged,
+                suppressed: None,
+            }
+            | Disposition::DeviceCode { paged } => {
+                if *paged {
+                    "page-commander"
+                } else {
+                    "none"
+                }
+            }
+            Disposition::ActionGate {
+                suppressed: Some(_),
+                ..
+            } => "none",
+            Disposition::Parked { .. } => "park",
+        }
+    }
+
+    /// The classification REASON column: one human-readable sentence.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Disposition::Serving => "healthy pane, no signal".into(),
+            Disposition::LiveCap { action, .. } => match action {
+                CapAction::Moved { target, ok: true } => {
+                    format!("live cap, auto-moved to '{target}', verify it resumed")
+                }
+                CapAction::Moved { target, ok: false } => {
+                    format!("live cap, auto-move to '{target}' FAILED, needs manual move")
+                }
+                CapAction::Cooldown => "still capped, holding within action cooldown".into(),
+                CapAction::NonPool => {
+                    "capped on a non-pool profile, never auto-moved, paged".into()
+                }
+            },
+            Disposition::ReplayedBanner { why } => {
+                format!("replayed scrollback banner ({why}), headroom kept, no page")
+            }
+            Disposition::FableDrift { rule, paged } => {
+                if *paged {
+                    format!("off-Fable drift [{rule}], Commander paged")
+                } else {
+                    format!("off-Fable drift [{rule}], already surfaced, holding")
+                }
+            }
+            Disposition::Parked { all_probed, .. } => {
+                if *all_probed {
+                    "all pool accounts hold fresh probed negative claims, parked".into()
+                } else {
+                    "no verified headroom target, parked, probe accounts and PATCH /api/capacity"
+                        .into()
+                }
+            }
+            Disposition::ActionGate { suppressed, paged } => match suppressed {
+                Some("commander-exempt") => {
+                    "matched string is scrollback+hook-injection, not bottom-of-pane gate".into()
+                }
+                Some(why) => format!("gate text is scrollback ({why}), not a parked gate"),
+                None => {
+                    if *paged {
+                        "open ACTION REQUIRED gate at pane bottom, Commander paged".into()
+                    } else {
+                        "gate already surfaced (unchanged fingerprint or cross-surfacer claim)"
+                            .into()
+                    }
+                }
+            },
+            Disposition::DeviceCode { paged } => {
+                if *paged {
+                    "waiting on device-code sign-in, Commander paged".into()
+                } else {
+                    "waiting on device-code sign-in, within action cooldown".into()
+                }
+            }
+            Disposition::Overloaded => "transient 529 overload, red row only".into(),
+        }
+    }
+}
+
+/// One tailable classification line: `ts title · id · profile · model ·
+/// STATE · DECISION · reason`. Pure so tests assert the emitted line, not
+/// just the decision (WO#450 acceptance).
+pub(crate) fn class_line(
+    ts: u64,
+    title: &str,
+    id: &str,
+    profile: &str,
+    model: &str,
+    disp: &Disposition,
+) -> String {
+    format!(
+        "{ts} {title} · {id} · {profile} · {model} · {} · {} · {}",
+        disp.state(),
+        disp.decision(),
+        disp.reason()
+    )
+}
+
+/// The same row as JSON for the snapshot file behind
+/// `GET /api/watchdog/classifications`.
+pub(crate) fn classification_json(
+    ts: u64,
+    title: &str,
+    id: &str,
+    profile: &str,
+    model: &str,
+    disp: &Disposition,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ts": ts,
+        "title": title,
+        "id": id,
+        "profile": profile,
+        "model": model,
+        "state": disp.state(),
+        "decision": disp.decision(),
+        "reason": disp.reason(),
+    })
+}
+
+/// Why an observed ACTION REQUIRED match must NOT page the Commander
+/// (WO#450 ADDENDUM). Single API-side source of truth:
+/// (a) `commander-exempt`: the pane IS the AoE-Commander session. Its own
+///     outward-comms escalations to Ben legitimately contain the literal
+///     "ACTION REQUIRED (Ben):" (plus stop-hook injected guidance quoting
+///     it), and paging the Commander about the Commander is always noise.
+///     WO#444 exempted only the badge; this exempts the page, keyed on the
+///     same [`COMMANDER_TITLE`] identity the send fallback resolves.
+/// (b) `pane-actively-working`: the live edge shows the running footer, so
+///     the matched text is scrollback, not a parked bottom-of-pane gate.
+/// `None` means a genuine worker gate: page as before.
+pub(crate) fn action_page_suppressed(title: &str, working: bool) -> Option<&'static str> {
+    if title == COMMANDER_TITLE {
+        return Some("commander-exempt");
+    }
+    if working {
+        return Some("pane-actively-working");
+    }
+    None
+}
+
+/// Whether a Fable-drift hit must NOT page because live evidence contradicts
+/// it (WO#450). Only BLOCKAGE-class rules (the limit paraphrases) are voided:
+/// they claim the account cannot serve, so a pane actively serving, or a
+/// WO#445-suppressed replayed banner on the same pane, disproves them.
+/// Drift-class rules (subagent model, downgrade announcements) describe live
+/// work on the wrong model and page regardless of serving evidence.
+pub(crate) fn fable_page_suppressed(rule: &str, working: bool, banner_suppressed: bool) -> bool {
+    let blockage = matches!(rule, "fable-limit-paraphrase" | "fable-credit-out");
+    blockage && (working || banner_suppressed)
+}
+
+/// Byte cap for the classification log before it rotates to `.log.1`.
+const CLASS_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Append one entry to the classification log, rotating the file aside to
+/// `<name>.log.1` (replacing any previous rotation) when the append would
+/// push it past `max_bytes`. Fail-open: any IO error logs and skips.
+pub(crate) fn append_class_log(path: &std::path::Path, entry: &str, max_bytes: u64) {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if size > 0 && size + entry.len() as u64 > max_bytes {
+        if let Err(e) = std::fs::rename(path, path.with_extension("log.1")) {
+            tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "classification log rotation failed");
+        }
+    }
+    let write = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
+    if let Err(e) = write {
+        tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "classification log append failed");
+    }
+}
+
+/// Resolve the tailable classification log: `AOE_WATCHDOG_CLASS_LOG`
+/// override, else `<app_dir>/watchdog-classifications.log`. `None` when no
+/// app dir resolves (fail-open, classification degrades to tracing only).
+fn class_log_path() -> Option<PathBuf> {
+    match std::env::var("AOE_WATCHDOG_CLASS_LOG") {
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => crate::session::get_app_dir()
+            .ok()
+            .map(|d| d.join("watchdog-classifications.log")),
+    }
+}
+
+/// Resolve the latest-tick JSON snapshot read by
+/// `GET /api/watchdog/classifications`: `AOE_WATCHDOG_CLASS_FILE` override,
+/// else `<app_dir>/watchdog-classifications.json`.
+pub(crate) fn class_snapshot_path() -> Option<PathBuf> {
+    match std::env::var("AOE_WATCHDOG_CLASS_FILE") {
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => crate::session::get_app_dir()
+            .ok()
+            .map(|d| d.join("watchdog-classifications.json")),
+    }
+}
+
 /// Spawn the supervised watchdog interval task. No-op when disabled by env
 /// or config. Env overrides win over the `[watchdog]` config section, which
 /// wins over the built-in interval/rule defaults.
@@ -417,6 +695,13 @@ struct PaneScan {
     /// on its own fingerprint dampener (mirror of `action_fp`), pages the
     /// Commander, never auto-swaps. WO d6bcae49.
     fable_hit: Option<(String, String)>,
+    /// The session's `--model` pin from extra_args, `-` when unpinned.
+    /// Classification-log column only (WO#450).
+    model: String,
+    /// Whether THIS pane's live edge shows the running footer. Feeds the
+    /// WO#450 ADDENDUM scrollback discriminators (`action_page_suppressed`,
+    /// `fable_page_suppressed`).
+    working: bool,
 }
 
 /// Capture and classify every registered non-structured session's pane tail.
@@ -446,9 +731,10 @@ fn scan_panes(
             }
             let content = sess.capture_pane(60).ok()?;
             // Serving evidence is collected for EVERY captured pane, before
-            // the signal filter: a working pane with no signal at all is
+            // any signal handling: a working pane with no signal at all is
             // exactly the proof that its profile serves (WO#445).
-            if pane_is_actively_working(&content) {
+            let working = pane_is_actively_working(&content);
+            if working {
                 serving.insert(inst.source_profile.clone());
             }
             // classify_fp yields the winning rule AND its churn-stable content
@@ -482,9 +768,9 @@ fn scan_panes(
             // Fable model-drift is gated on the session's own model pin, so a
             // non-Fable session's Sonnet/Opus subagent never fires here.
             let fable_hit = fable_scan_hit(&inst.extra_args, &content);
-            if signal.is_none() && drift.is_none() && fable_hit.is_none() {
-                return None;
-            }
+            // EVERY captured live session yields a scan row, healthy or not:
+            // the per-tick classification log must show a line per session so
+            // silent misses are visible, not inferred from absence (WO#450).
             Some(PaneScan {
                 id: inst.id.clone(),
                 title: inst.title.clone(),
@@ -496,6 +782,8 @@ fn scan_panes(
                 surface_key,
                 drift,
                 fable_hit,
+                model: pane_rules::model_pin(&inst.extra_args).unwrap_or_else(|| "-".into()),
+                working,
             })
         })
         .collect();
@@ -587,7 +875,7 @@ impl Watchdog {
         let cap_state_pre = capacity::capacity_path()
             .map(|p| capacity::CapacityState::load(&p))
             .unwrap_or_default();
-        let mut suppressed_caps: HashSet<String> = HashSet::new();
+        let mut suppressed_caps: HashMap<String, &'static str> = HashMap::new();
         for scan in &scans {
             if scan.signal != Some(PaneSignal::Capped) {
                 continue;
@@ -624,13 +912,13 @@ impl Watchdog {
                     reason,
                     "cap banner suppressed: not live cap evidence, headroom kept (WO#445)"
                 );
-                suppressed_caps.insert(scan.id.clone());
+                suppressed_caps.insert(scan.id.clone(), reason);
             }
         }
         self.persist_cap_fp();
 
         for scan in &scans {
-            if scan.signal == Some(PaneSignal::Capped) && !suppressed_caps.contains(&scan.id) {
+            if scan.signal == Some(PaneSignal::Capped) && !suppressed_caps.contains_key(&scan.id) {
                 self.capped_profiles.insert(scan.profile.clone(), now);
             }
         }
@@ -642,7 +930,9 @@ impl Watchdog {
         // discriminator proved the banner stale/contradicted above.
         let observed_caps: Vec<(String, capacity::CapKind)> = scans
             .iter()
-            .filter(|s| s.signal == Some(PaneSignal::Capped) && !suppressed_caps.contains(&s.id))
+            .filter(|s| {
+                s.signal == Some(PaneSignal::Capped) && !suppressed_caps.contains_key(&s.id)
+            })
             .map(|s| {
                 (
                     s.profile.clone(),
@@ -661,116 +951,66 @@ impl Watchdog {
             }
         }
 
+        // WO#450: every live session gets exactly one classification row per
+        // tick — state, decision, reason — appended to the tailable log and
+        // snapshotted for GET /api/watchdog/classifications.
+        let ts = unix_secs();
+        let mut class_lines = String::new();
+        let mut class_rows: Vec<serde_json::Value> = Vec::new();
         for scan in scans {
             if let Some(hit) = scan.drift.clone() {
                 self.handle_drift(&scan, &hit, now).await;
             }
+            let banner_suppressed = suppressed_caps.contains_key(&scan.id);
             // Fable model-drift is independent of the general signal (a
             // Fable-pinned session can drift with no cap/auth signal), so handle
-            // it before the `signal` guard, content-gated on its own dampener.
-            if let Some((rule, fp)) = scan.fable_hit.clone() {
-                self.handle_fable_drift(&scan, &rule, &fp, now).await;
-            }
-            let Some(signal) = scan.signal else { continue };
-            // A suppressed cap banner is stale scrollback or contradicted by
-            // live serving evidence (WO#445): no red row, no relocation.
-            if signal == PaneSignal::Capped && suppressed_caps.contains(&scan.id) {
-                continue;
-            }
-            // Mirror the observed block into the instance's attention.json so
-            // the TUI/FleetView red row reflects pane truth without any
-            // agent-side text scanning (the watchdog is the SOLE text
-            // authority for urgency). Every tick refreshes the TTL while the
-            // pane stays blocked; expiry clears it after recovery. Runs
-            // BEFORE the action cooldown — the row must stay red even when
-            // the escalation is rate-limited.
-            mirror_urgent(&scan, signal);
-
-            // ACTION REQUIRED gates are CONTENT-gated, not time-gated: an
-            // unchanged, already-surfaced gate must never re-wake (the flood
-            // WO #139 fixes), but a new/changed gate wakes immediately with no
-            // cooldown wait. This path runs BEFORE the temporal ACTION_COOLDOWN
-            // that still governs cap/auth re-escalation. Every observation
-            // refreshes the fingerprint's `seen` (TTL) and persists the map so
-            // a daemon restart cannot re-page a standing gate.
-            if signal == PaneSignal::ActionRequired {
-                let current_fp = scan.action_fp.clone().unwrap_or_default();
-                let last_fp = self.last_action_fp.get(&scan.id).map(|a| a.fp.as_str());
-                let should = action_should_wake(last_fp, &current_fp);
-                self.last_action_fp.insert(
-                    scan.id.clone(),
-                    ActionFp {
-                        fp: current_fp,
-                        seen: now,
-                    },
-                );
-                if should {
-                    // Cross-surfacer dedup (MISTAKE-f9e3f8d8 MIT-1): even when
-                    // this gate is new/changed for the watchdog's own WO#139
-                    // dampener, suppress the wake if another notifier (worker
-                    // Stop-hook, worker->Commander report, fleet-tick page)
-                    // already surfaced this exact gate-state to Ben. The claim
-                    // is content-keyed (`gate:<id>`) so all four lanes converge;
-                    // a live claim held by a DIFFERENT surfacer suppresses, the
-                    // same surfacer refreshes. Fail-open: any ledger error ->
-                    // claim returns true and the wake proceeds.
-                    let cross_ok = match &scan.surface_key {
-                        Some(key) => ben_gate_surface::claim_surface(
-                            key,
-                            "pane-watchdog",
-                            ACTION_FP_TTL.as_secs(),
-                            unix_now(),
-                        ),
-                        None => true,
-                    };
-                    if cross_ok {
-                        wake(
-                            "action-required",
-                            &scan.id,
-                            format!(
-                                "session '{}' ({}) has an open ACTION REQUIRED gate",
-                                scan.title, scan.id
-                            ),
-                        )
-                        .await;
-                    } else {
-                        tracing::debug!(
-                            target: "server.pane_watchdog",
-                            id = %scan.id,
-                            "ACTION REQUIRED gate already surfaced by another notifier; cross-surfacer deduped (MIT-1)"
-                        );
-                    }
-                }
-                self.persist_action_fp();
-                continue;
-            }
-
-            if let Some(last) = self.last_session_action.get(&scan.id) {
-                if now.duration_since(*last) < ACTION_COOLDOWN {
-                    continue;
-                }
-            }
-            match signal {
-                PaneSignal::Capped => self.handle_capped(&scan, now).await,
-                PaneSignal::DeviceCode => {
-                    self.last_session_action.insert(scan.id.clone(), now);
-                    wake(
-                        "device-code",
-                        &scan.id,
-                        format!(
-                            "session '{}' ({}) is waiting on a device-code sign-in",
-                            scan.title, scan.id
-                        ),
-                    )
-                    .await;
-                }
-                // Transient server-side overload: red row only (mirrored
-                // above); relocation/wake would thrash on a condition that
-                // clears itself.
-                PaneSignal::Overloaded => {}
-                // Handled by the content-gated branch above (which `continue`s
-                // before reaching this match), so it is unreachable here.
-                PaneSignal::ActionRequired => {}
+            // it before the `signal` dispatch, content-gated on its own dampener.
+            let fable_disp = match scan.fable_hit.clone() {
+                Some((rule, fp)) => Some(
+                    self.handle_fable_drift(&scan, &rule, &fp, now, banner_suppressed)
+                        .await,
+                ),
+                None => None,
+            };
+            let disp = match scan.signal {
+                // A signal-bearing pane's disposition wins the row; a pure
+                // Fable drift (no cap/auth/gate signal) reports as drift.
+                None => fable_disp.unwrap_or(Disposition::Serving),
+                // A suppressed cap banner is stale scrollback or contradicted
+                // by live serving evidence (WO#445): no red row, no relocation.
+                Some(PaneSignal::Capped) if banner_suppressed => Disposition::ReplayedBanner {
+                    why: suppressed_caps
+                        .get(&scan.id)
+                        .copied()
+                        .unwrap_or("suppressed"),
+                },
+                Some(signal) => self.handle_signal(&scan, signal, now).await,
+            };
+            class_lines.push_str(&class_line(
+                ts,
+                &scan.title,
+                &scan.id,
+                &scan.profile,
+                &scan.model,
+                &disp,
+            ));
+            class_lines.push('\n');
+            class_rows.push(classification_json(
+                ts,
+                &scan.title,
+                &scan.id,
+                &scan.profile,
+                &scan.model,
+                &disp,
+            ));
+        }
+        if let Some(path) = class_log_path() {
+            append_class_log(&path, &class_lines, CLASS_LOG_MAX_BYTES);
+        }
+        if let Some(path) = class_snapshot_path() {
+            let snap = serde_json::json!({ "updated": ts, "sessions": class_rows });
+            if let Err(e) = std::fs::write(&path, snap.to_string()) {
+                tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "classification snapshot write failed");
             }
         }
         // WO#449 anti-bounce: the ACTION_COOLDOWN map must survive a daemon
@@ -778,6 +1018,144 @@ impl Watchdog {
         // cooldown and a still-capped pane is re-acted-on immediately —
         // the move/bounce loop Ben saw.
         self.persist_last_action();
+    }
+
+    /// Dispatch one live (non-suppressed) pane signal and return the tick's
+    /// classification for the row (WO#450).
+    async fn handle_signal(
+        &mut self,
+        scan: &PaneScan,
+        signal: PaneSignal,
+        now: Instant,
+    ) -> Disposition {
+        // WO#450 ADDENDUM: the action-required PAGE has the same exemptions
+        // as the badge (WO#444) — the Commander's own pane text and any
+        // actively-working pane's scrollback are not parked worker gates.
+        // Resolved BEFORE the urgent mirror and the fingerprint dampener so a
+        // suppressed match leaves no state behind.
+        if signal == PaneSignal::ActionRequired {
+            if let Some(why) = action_page_suppressed(&scan.title, scan.working) {
+                tracing::debug!(
+                    target: "server.pane_watchdog",
+                    id = %scan.id,
+                    title = %scan.title,
+                    why,
+                    "ACTION REQUIRED match suppressed; not a bottom-of-pane worker gate (WO#450)"
+                );
+                return Disposition::ActionGate {
+                    paged: false,
+                    suppressed: Some(why),
+                };
+            }
+        }
+        // Mirror the observed block into the instance's attention.json so
+        // the TUI/FleetView red row reflects pane truth without any
+        // agent-side text scanning (the watchdog is the SOLE text
+        // authority for urgency). Every tick refreshes the TTL while the
+        // pane stays blocked; expiry clears it after recovery. Runs
+        // BEFORE the action cooldown — the row must stay red even when
+        // the escalation is rate-limited.
+        mirror_urgent(scan, signal);
+
+        // ACTION REQUIRED gates are CONTENT-gated, not time-gated: an
+        // unchanged, already-surfaced gate must never re-wake (the flood
+        // WO #139 fixes), but a new/changed gate wakes immediately with no
+        // cooldown wait. This path runs BEFORE the temporal ACTION_COOLDOWN
+        // that still governs cap/auth re-escalation. Every observation
+        // refreshes the fingerprint's `seen` (TTL) and persists the map so
+        // a daemon restart cannot re-page a standing gate.
+        if signal == PaneSignal::ActionRequired {
+            let current_fp = scan.action_fp.clone().unwrap_or_default();
+            let last_fp = self.last_action_fp.get(&scan.id).map(|a| a.fp.as_str());
+            let should = action_should_wake(last_fp, &current_fp);
+            self.last_action_fp.insert(
+                scan.id.clone(),
+                ActionFp {
+                    fp: current_fp,
+                    seen: now,
+                },
+            );
+            let mut paged = false;
+            if should {
+                // Cross-surfacer dedup (MISTAKE-f9e3f8d8 MIT-1): even when
+                // this gate is new/changed for the watchdog's own WO#139
+                // dampener, suppress the wake if another notifier (worker
+                // Stop-hook, worker->Commander report, fleet-tick page)
+                // already surfaced this exact gate-state to Ben. The claim
+                // is content-keyed (`gate:<id>`) so all four lanes converge;
+                // a live claim held by a DIFFERENT surfacer suppresses, the
+                // same surfacer refreshes. Fail-open: any ledger error ->
+                // claim returns true and the wake proceeds.
+                let cross_ok = match &scan.surface_key {
+                    Some(key) => ben_gate_surface::claim_surface(
+                        key,
+                        "pane-watchdog",
+                        ACTION_FP_TTL.as_secs(),
+                        unix_now(),
+                    ),
+                    None => true,
+                };
+                if cross_ok {
+                    wake(
+                        "action-required",
+                        &scan.id,
+                        format!(
+                            "session '{}' ({}) has an open ACTION REQUIRED gate",
+                            scan.title, scan.id
+                        ),
+                    )
+                    .await;
+                    paged = true;
+                } else {
+                    tracing::debug!(
+                        target: "server.pane_watchdog",
+                        id = %scan.id,
+                        "ACTION REQUIRED gate already surfaced by another notifier; cross-surfacer deduped (MIT-1)"
+                    );
+                }
+            }
+            self.persist_action_fp();
+            return Disposition::ActionGate {
+                paged,
+                suppressed: None,
+            };
+        }
+
+        let cooling = self
+            .last_session_action
+            .get(&scan.id)
+            .is_some_and(|last| now.duration_since(*last) < ACTION_COOLDOWN);
+        match signal {
+            PaneSignal::Capped if cooling => Disposition::LiveCap {
+                kind: scan.cap_kind.unwrap_or(capacity::CapKind::Unknown).as_str(),
+                action: CapAction::Cooldown,
+            },
+            PaneSignal::Capped => self.handle_capped(scan, now).await,
+            PaneSignal::DeviceCode if cooling => Disposition::DeviceCode { paged: false },
+            PaneSignal::DeviceCode => {
+                self.last_session_action.insert(scan.id.clone(), now);
+                wake(
+                    "device-code",
+                    &scan.id,
+                    format!(
+                        "session '{}' ({}) is waiting on a device-code sign-in",
+                        scan.title, scan.id
+                    ),
+                )
+                .await;
+                Disposition::DeviceCode { paged: true }
+            }
+            // Transient server-side overload: red row only (mirrored
+            // above); relocation/wake would thrash on a condition that
+            // clears itself.
+            PaneSignal::Overloaded => Disposition::Overloaded,
+            // Handled by the content-gated branch above (which returns
+            // before reaching this match), so it is unreachable here.
+            PaneSignal::ActionRequired => Disposition::ActionGate {
+                paged: false,
+                suppressed: None,
+            },
+        }
     }
 
     /// Escalate a scope/charter drift: the session's pane shows sustained
@@ -812,7 +1190,31 @@ impl Watchdog {
     /// swaps the model — the Commander decides. Every observation refreshes the
     /// fingerprint's `seen` (TTL) and persists the map so a daemon restart
     /// cannot re-page a standing drift.
-    async fn handle_fable_drift(&mut self, scan: &PaneScan, rule: &str, fp: &str, now: Instant) {
+    async fn handle_fable_drift(
+        &mut self,
+        scan: &PaneScan,
+        rule: &str,
+        fp: &str,
+        now: Instant,
+        banner_suppressed: bool,
+    ) -> Disposition {
+        // WO#450: a BLOCKAGE-class hit (limit paraphrase / credit-out) claims
+        // the account cannot serve, so live serving evidence on this pane, or
+        // a WO#445 replayed-banner suppression for it, disproves the claim.
+        // No wake and NO fingerprint record — when the contradicting evidence
+        // later disappears the same content must still be able to page.
+        if fable_page_suppressed(rule, scan.working, banner_suppressed) {
+            tracing::debug!(
+                target: "server.pane_watchdog",
+                id = %scan.id,
+                rule,
+                "Fable blockage-class hit contradicted by live evidence; page voided (WO#450)"
+            );
+            return Disposition::FableDrift {
+                rule: rule.to_string(),
+                paged: false,
+            };
+        }
         let last_fp = self.last_fable_fp.get(&scan.id).map(|a| a.fp.as_str());
         let should = action_should_wake(last_fp, fp);
         self.last_fable_fp.insert(
@@ -834,9 +1236,14 @@ impl Watchdog {
             .await;
         }
         self.persist_fable_fp();
+        Disposition::FableDrift {
+            rule: rule.to_string(),
+            paged: should,
+        }
     }
 
-    async fn handle_capped(&mut self, scan: &PaneScan, now: Instant) {
+    async fn handle_capped(&mut self, scan: &PaneScan, now: Instant) -> Disposition {
+        let cap_kind = scan.cap_kind.unwrap_or(capacity::CapKind::Unknown);
         if !DRAW_ORDER.contains(&scan.profile.as_str()) {
             self.last_session_action.insert(scan.id.clone(), now);
             wake(
@@ -848,9 +1255,11 @@ impl Watchdog {
                 ),
             )
             .await;
-            return;
+            return Disposition::LiveCap {
+                kind: cap_kind.as_str(),
+                action: CapAction::NonPool,
+            };
         }
-        let cap_kind = scan.cap_kind.unwrap_or(capacity::CapKind::Unknown);
         // The relocation gate reads the SHARED capacity state, not the
         // in-memory cap map: only a fresh positive claim (written by a
         // Commander probe via PATCH /api/capacity) makes a profile a target.
@@ -898,18 +1307,22 @@ impl Watchdog {
                     ),
                 )
                 .await;
+                Disposition::LiveCap {
+                    kind: cap_kind.as_str(),
+                    action: CapAction::Moved { target, ok: moved },
+                }
             }
             None => {
+                // WO#449 directive 4: only a fresh probed NEGATIVE on
+                // EVERY pool profile justifies a credits-flavored
+                // escalation; anything less is "state unknown — probe",
+                // never a money gate.
+                let all_probed = all_pool_probed_capped(&state, unix_secs());
                 let due = self
                     .last_all_capped_wake
                     .is_none_or(|t| now.duration_since(t) >= CAP_TTL);
                 if due {
                     self.last_all_capped_wake = Some(now);
-                    // WO#449 directive 4: only a fresh probed NEGATIVE on
-                    // EVERY pool profile justifies a credits-flavored
-                    // escalation; anything less is "state unknown — probe",
-                    // never a money gate.
-                    let all_probed = all_pool_probed_capped(&state, unix_secs());
                     let (kind, reason) = parked_wake(
                         all_probed,
                         cap_kind.as_str(),
@@ -918,6 +1331,10 @@ impl Watchdog {
                         &scan.profile,
                     );
                     wake(kind, &scan.id, reason).await;
+                }
+                Disposition::Parked {
+                    kind: cap_kind.as_str(),
+                    all_probed,
                 }
             }
         }
@@ -1027,7 +1444,9 @@ impl Watchdog {
     /// Monotonic `Instant`s can't be serialized, so each entry is converted to
     /// wall-clock by subtracting its elapsed age from now.
     fn persist_last_action(&self) {
-        let Some(path) = last_action_path() else { return };
+        let Some(path) = last_action_path() else {
+            return;
+        };
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -2304,7 +2723,12 @@ and enter the code H7Q2K9F4P to authenticate.
             .collect();
         assert!(!all_pool_probed_capped(&claims(&one_positive), TEST_NOW));
 
-        let mut mixed = claims(&DRAW_ORDER[1..].iter().map(|p| (*p, false)).collect::<Vec<_>>());
+        let mut mixed = claims(
+            &DRAW_ORDER[1..]
+                .iter()
+                .map(|p| (*p, false))
+                .collect::<Vec<_>>(),
+        );
         mixed.profiles.extend(
             claims_at(
                 &[(DRAW_ORDER[0], false)],
@@ -2352,5 +2776,341 @@ and enter the code H7Q2K9F4P to authenticate.
         for profile in DRAW_ORDER {
             assert_eq!(next_verified_headroom(profile, &state, TEST_NOW), None);
         }
+    }
+
+    // ── WO#450: per-tick classification, every live session gets one line ──
+
+    fn disp_line(disp: &Disposition) -> String {
+        class_line(TEST_NOW, "for-tasks", "381b98ed", "xce-main", "fable", disp)
+    }
+
+    #[test]
+    fn serving_session_logs_serving_no_page() {
+        // Case (e): a healthy pane still gets a per-tick row, with no action.
+        let disp = Disposition::Serving;
+        assert_eq!(disp.state(), "SERVING");
+        assert_eq!(disp.decision(), "none");
+        let line = disp_line(&disp);
+        for needle in [
+            "for-tasks",
+            "381b98ed",
+            "xce-main",
+            "fable",
+            "SERVING",
+            "none",
+        ] {
+            assert!(line.contains(needle), "line missing {needle}: {line}");
+        }
+    }
+
+    #[test]
+    fn live_cap_moved_pages_commander() {
+        // Case (a): a live session-window cap that auto-moved must page.
+        let disp = Disposition::LiveCap {
+            kind: "session",
+            action: CapAction::Moved {
+                target: "forit-backup".into(),
+                ok: true,
+            },
+        };
+        assert_eq!(disp.state(), "LIVE-CAP-session");
+        assert_eq!(disp.decision(), "page-commander");
+        assert!(disp.reason().contains("forit-backup"), "{}", disp.reason());
+        let line = disp_line(&disp);
+        assert!(line.contains("LIVE-CAP-session"), "{line}");
+        assert!(line.contains("page-commander"), "{line}");
+    }
+
+    #[test]
+    fn live_cap_failed_move_still_pages() {
+        let disp = Disposition::LiveCap {
+            kind: "fable-credit",
+            action: CapAction::Moved {
+                target: "gna-main".into(),
+                ok: false,
+            },
+        };
+        assert_eq!(disp.state(), "LIVE-CAP-fable-credit");
+        assert_eq!(disp.decision(), "page-commander");
+        assert!(disp.reason().contains("FAILED"), "{}", disp.reason());
+    }
+
+    #[test]
+    fn live_cap_under_cooldown_logs_but_holds() {
+        // A still-capped pane inside ACTION_COOLDOWN keeps its LIVE-CAP state
+        // in the log while taking no new action, so the row is auditable.
+        let disp = Disposition::LiveCap {
+            kind: "session",
+            action: CapAction::Cooldown,
+        };
+        assert_eq!(disp.state(), "LIVE-CAP-session");
+        assert_eq!(disp.decision(), "none");
+        assert!(
+            disp.reason().to_lowercase().contains("cooldown"),
+            "{}",
+            disp.reason()
+        );
+    }
+
+    #[test]
+    fn replayed_banner_logs_ignored_no_page() {
+        // Case (b): a replayed credit-out banner (WO#445 suppression) is a
+        // REPLAYED-banner-ignored row with decision none, never a page.
+        for why in ["pre-grant-banner", "profile-serving"] {
+            let disp = Disposition::ReplayedBanner { why };
+            assert_eq!(disp.state(), "REPLAYED-banner-ignored");
+            assert_eq!(disp.decision(), "none");
+            assert!(disp.reason().contains(why), "{}", disp.reason());
+            let line = disp_line(&disp);
+            assert!(line.contains("REPLAYED-banner-ignored"), "{line}");
+        }
+    }
+
+    #[test]
+    fn fable_drift_logs_subagent_model_drift_and_pages() {
+        // Case (d): a Fable-pinned session spawning a non-Fable subagent.
+        let disp = Disposition::FableDrift {
+            rule: "fable-subagent-model".into(),
+            paged: true,
+        };
+        assert_eq!(disp.state(), "SUBAGENT-model-drift");
+        assert_eq!(disp.decision(), "page-commander");
+        assert!(
+            disp.reason().contains("fable-subagent-model"),
+            "{}",
+            disp.reason()
+        );
+        // A standing, already-paged drift keeps the state but holds the page.
+        let held = Disposition::FableDrift {
+            rule: "fable-subagent-model".into(),
+            paged: false,
+        };
+        assert_eq!(held.state(), "SUBAGENT-model-drift");
+        assert_eq!(held.decision(), "none");
+    }
+
+    #[test]
+    fn parked_capped_session_logs_park() {
+        // Case (f): capped with no verified-headroom target parks; the
+        // unknown-pool shape must demand a probe, not assert a credits outage.
+        let disp = Disposition::Parked {
+            kind: "fable-credit",
+            all_probed: false,
+        };
+        assert_eq!(disp.state(), "PARKED");
+        assert_eq!(disp.decision(), "park");
+        assert!(
+            disp.reason().to_lowercase().contains("probe"),
+            "{}",
+            disp.reason()
+        );
+
+        let probed = Disposition::Parked {
+            kind: "fable-credit",
+            all_probed: true,
+        };
+        assert_eq!(probed.decision(), "park");
+        assert!(
+            probed.reason().to_lowercase().contains("all"),
+            "{}",
+            probed.reason()
+        );
+    }
+
+    #[test]
+    fn genuine_worker_gate_still_pages() {
+        // ADDENDUM guard in the other direction: a real bottom-of-pane worker
+        // gate keeps paging; the exemption is Commander/working-pane only.
+        assert_eq!(action_page_suppressed("for-Migrator", false), None);
+        let disp = Disposition::ActionGate {
+            paged: true,
+            suppressed: None,
+        };
+        assert_eq!(disp.state(), "ACTION-REQUIRED");
+        assert_eq!(disp.decision(), "page-commander");
+    }
+
+    #[test]
+    fn classification_json_carries_every_column() {
+        let disp = Disposition::Serving;
+        let row = classification_json(
+            TEST_NOW,
+            "for-tasks",
+            "381b98ed",
+            "xce-main",
+            "fable",
+            &disp,
+        );
+        assert_eq!(row["ts"], TEST_NOW);
+        assert_eq!(row["title"], "for-tasks");
+        assert_eq!(row["id"], "381b98ed");
+        assert_eq!(row["profile"], "xce-main");
+        assert_eq!(row["model"], "fable");
+        assert_eq!(row["state"], "SERVING");
+        assert_eq!(row["decision"], "none");
+        assert!(row["reason"].is_string());
+    }
+
+    #[test]
+    fn class_log_rotates_at_byte_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("watchdog-classifications.log");
+        append_class_log(&path, "first line\n", 100);
+        append_class_log(&path, "second line\n", 100);
+        let filler = "x".repeat(80) + "\n";
+        append_class_log(&path, &filler, 100);
+        append_class_log(&path, "after rotate\n", 100);
+        let rotated =
+            std::fs::read_to_string(path.with_extension("log.1")).expect("rotated file exists");
+        assert!(rotated.contains("first line"), "{rotated}");
+        let live = std::fs::read_to_string(&path).expect("live file exists");
+        assert!(live.contains("after rotate"), "{live}");
+        assert!(
+            !live.contains("first line"),
+            "rotation must start a fresh file"
+        );
+    }
+
+    // ── WO#450 ADDENDUM: Commander is EXEMPT from the action-required PAGE ──
+    // Live repro 2026-07-17: the watchdog action-paged the Commander because
+    // the Commander's OWN outward-comms escalation to Ben contained the
+    // literal "ACTION REQUIRED (Ben): ..." (plus stop-hook injected guidance
+    // quoting the phrase). WO#444 exempted only the BADGE path; the PAGE path
+    // must use the same single is-commander source of truth (COMMANDER_TITLE).
+
+    #[test]
+    fn commander_action_gate_never_pages_reads_serving() {
+        assert_eq!(
+            action_page_suppressed(COMMANDER_TITLE, false),
+            Some("commander-exempt")
+        );
+        // Even a working Commander pane resolves commander-first.
+        assert_eq!(
+            action_page_suppressed(COMMANDER_TITLE, true),
+            Some("commander-exempt")
+        );
+        let disp = Disposition::ActionGate {
+            paged: false,
+            suppressed: Some("commander-exempt"),
+        };
+        assert_eq!(disp.state(), "SERVING");
+        assert_eq!(disp.decision(), "none");
+        assert_eq!(
+            disp.reason(),
+            "matched string is scrollback+hook-injection, not bottom-of-pane gate"
+        );
+    }
+
+    #[test]
+    fn commander_pane_with_action_required_ben_produces_no_page() {
+        // The Commander repro content DOES match the action rule (it is a real
+        // `^ACTION REQUIRED` line), proving suppression comes from the
+        // commander exemption, not from the rule failing to fire.
+        let pane = "\
+⏺ Escalating to Ben now.
+ACTION REQUIRED (Ben): approve the Ramp device login for gna-finance
+> │
+";
+        assert_eq!(
+            classify_pane_tail(pane),
+            Some(PaneSignal::ActionRequired),
+            "rule must still fire on the content; suppression is title-keyed"
+        );
+        assert_eq!(
+            action_page_suppressed(COMMANDER_TITLE, false),
+            Some("commander-exempt"),
+            "the Commander session is never action-paged for its own text"
+        );
+    }
+
+    #[test]
+    fn actively_working_pane_action_gate_is_scrollback() {
+        // ADDENDUM (2): "ACTION REQUIRED" text on a pane whose live edge shows
+        // the running footer is scrollback, not a parked bottom-of-pane gate.
+        assert_eq!(
+            action_page_suppressed("for-Migrator", true),
+            Some("pane-actively-working")
+        );
+        let disp = Disposition::ActionGate {
+            paged: false,
+            suppressed: Some("pane-actively-working"),
+        };
+        assert_eq!(disp.state(), "SERVING");
+        assert_eq!(disp.decision(), "none");
+    }
+
+    // ── WO#450: zero-miss Fable-limit paraphrases + silent downgrade ────────
+
+    #[test]
+    fn fable_paraphrase_out_of_credits_alone_fires() {
+        // A credit-out paraphrase with no "Fable" word in proximity still
+        // means the Fable pool on a Fable-pinned session (zero-miss).
+        let tail = "\
+⏺ The request failed: you are out of usage credits.
+> │
+";
+        assert!(
+            fable_scan_hit("--model fable", tail).is_some(),
+            "standalone credit-out must fire on a Fable-pinned session"
+        );
+        assert_eq!(
+            fable_scan_hit("--model claude-opus-4-8", tail),
+            None,
+            "non-Fable sessions stay gated out"
+        );
+    }
+
+    #[test]
+    fn fable_paraphrase_reached_fable_limit_fires() {
+        let tail = "\
+⏺ You've reached your Fable limit for this billing period.
+> │
+";
+        assert!(
+            fable_scan_hit("--model fable", tail).is_some(),
+            "generic 'Fable limit' phrasing must fire"
+        );
+    }
+
+    #[test]
+    fn fable_silent_downgrade_now_using_sonnet_fires() {
+        // A bottom-of-pane "now using Sonnet" announcement has no strong
+        // downgrade verb but is still a downgrade on a Fable-pinned session.
+        let tail = "\
+⏺ Model changed. Now using Sonnet 5 for this session.
+> │
+";
+        assert!(
+            fable_scan_hit("--model fable", tail).is_some(),
+            "silent 'now using <model>' announcement must fire"
+        );
+    }
+
+    #[test]
+    fn fable_quoted_using_sonnet_does_not_fire() {
+        // Quoted/reported prose describing the string is not a downgrade.
+        let tail = "\
+⏺ The hook docs say 'using sonnet' should be flagged by the watchdog.
+> │
+";
+        assert_eq!(fable_scan_hit("--model fable", tail), None);
+    }
+
+    #[test]
+    fn fable_limit_paraphrase_page_gated_on_live_evidence() {
+        // WO#450 (3): the limit-paraphrase claims BLOCKAGE, so it is voided by
+        // live serving evidence (working pane) or a WO#445-suppressed replayed
+        // banner on the same pane. Drift rules that describe live work (a
+        // non-Fable subagent, a downgrade announcement) are NOT voided by a
+        // working pane, because the session is working on the wrong model.
+        assert!(fable_page_suppressed("fable-limit-paraphrase", true, false));
+        assert!(fable_page_suppressed("fable-limit-paraphrase", false, true));
+        assert!(!fable_page_suppressed(
+            "fable-limit-paraphrase",
+            false,
+            false
+        ));
+        assert!(!fable_page_suppressed("fable-subagent-model", true, false));
+        assert!(!fable_page_suppressed("fable-downgrade-verb", true, false));
     }
 }

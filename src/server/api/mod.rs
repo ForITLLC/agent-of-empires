@@ -30,6 +30,7 @@ pub(crate) mod sessions;
 mod skills;
 pub(crate) mod system;
 mod telemetry;
+mod watchdog;
 
 #[cfg(feature = "serve")]
 pub(crate) use acp::structured_spawn_error_message;
@@ -97,6 +98,7 @@ pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
     set_telemetry_consent,
 };
+pub use watchdog::get_watchdog_classifications;
 
 /// Canonical 404 for a session id that does not resolve to a live instance.
 /// Body shape (`error` discriminator + human `message`) matches the rest of

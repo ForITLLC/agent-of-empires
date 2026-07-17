@@ -1992,6 +1992,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Durable send audit log; rows are written best-effort by the send
         // paths (CLI `aoe send` and POST /api/sessions/{id}/send).
         .route("/api/messages", get(api::get_messages))
+        // Latest pane-watchdog per-tick classification snapshot (WO#450).
+        .route(
+            "/api/watchdog/classifications",
+            get(api::get_watchdog_classifications),
+        )
         .route("/api/client-log", post(api::post_client_log))
         // Telemetry consent (browser manages opt-in via the daemon; it never
         // posts to the telemetry backend directly).

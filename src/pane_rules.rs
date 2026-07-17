@@ -642,6 +642,49 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
             enabled: true,
         },
         PaneRuleConfig {
+            name: "fable-credit-out".into(),
+            kind: "fable".into(),
+            // WO#450 zero-miss: a credit-out / limit-reached paraphrase with NO
+            // "Fable" word in proximity. On a Fable-pinned session (the only
+            // place this battery runs) a bare "out of credits" still means the
+            // Fable pool. Blockage-class rule: the watchdog voids it against
+            // live serving evidence (see pane_watchdog::fable_page_suppressed).
+            pattern: r"(?i)\bout of (?:usage )?credits?\b|\breached your (?:\w+ ){0,2}limit\b".into(),
+            negative: vec![
+                r"(?i)up to 50% of".into(),
+                r"(?i)try claude fable".into(),
+                // Quoted / template prose describing the phrase, not stating it.
+                r#"(?i)["'`][^"'`\n]{0,30}out of (?:usage )?credits"#.into(),
+            ],
+            stale_below: Vec::new(),
+            require_below: Vec::new(),
+            tail_lines: 25,
+            scope: RuleScope::Window,
+            strip_decoration: false,
+            priority: 3,
+            enabled: true,
+        },
+        PaneRuleConfig {
+            name: "fable-silent-downgrade".into(),
+            kind: "fable".into(),
+            // WO#450 zero-miss: a bottom-of-pane "now using <model>" style
+            // announcement carries no strong downgrade verb but is still a
+            // downgrade on a Fable-pinned session. "now" anchors it to a live
+            // state announcement, so quoted prose ("say 'using sonnet'") and
+            // app-building text never fire.
+            pattern: r"(?i)\bnow (?:using|running(?: on)?|on)\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus|haiku)\b".into(),
+            negative: vec![
+                r#"(?i)["'`][^"'`\n]{0,40}\bnow (?:using|running|on)\b"#.into(),
+            ],
+            stale_below: Vec::new(),
+            require_below: Vec::new(),
+            tail_lines: 25,
+            scope: RuleScope::Line,
+            strip_decoration: true,
+            priority: 4,
+            enabled: true,
+        },
+        PaneRuleConfig {
             name: "fable-downgrade-verb".into(),
             kind: "fable".into(),
             // A strong runtime-downgrade verb within 25 chars of a non-Fable
