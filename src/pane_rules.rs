@@ -619,6 +619,22 @@ pub fn model_pin(extra_args: &str) -> Option<String> {
 ///
 /// On a hit the watchdog PAGES the Commander (never auto-swaps the model), with
 /// a content-gated fingerprint dampener so a standing drift does not re-flood.
+///
+/// WO#452: the downgrade-family rules (silent-downgrade / downgrade-verb /
+/// subagent-model) additionally skip MANDATED-WARNING text — the Commander's
+/// own anti-downgrade instruction ("do not fall back to Sonnet/Opus
+/// subagents. — AoE-Commander") names the forbidden models and matched the
+/// verbs verbatim (live false positive on bat-CRM, 2026-07-17). Two guards:
+/// negated context on the matched line (`do not` / `don't` / `never` before
+/// the model word), and the signed "— AoE-Commander (…)" block — the
+/// signature on the matched line voids it, and a signature BELOW the match
+/// (`stale_below`) voids the lines of a multi-line signed message. A
+/// signature ABOVE a drift line shields nothing, so genuine drift stated
+/// after a Commander order still pages.
+const FABLE_NEGATED_CONTEXT: &str =
+    r"(?i)\b(?:do not|don'?t|never)\b[^\n]*\b(?:claude-)?(?:sonnet|opus|haiku)\b";
+const COMMANDER_SIGNED_LINE: &str = r"(?i)[—–-]\s*AoE-Commander\b";
+
 pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
     vec![
         PaneRuleConfig {
@@ -675,8 +691,10 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
             pattern: r"(?i)\bnow (?:using|running(?: on)?|on)\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus|haiku)\b".into(),
             negative: vec![
                 r#"(?i)["'`][^"'`\n]{0,40}\bnow (?:using|running|on)\b"#.into(),
+                FABLE_NEGATED_CONTEXT.into(),
+                COMMANDER_SIGNED_LINE.into(),
             ],
-            stale_below: Vec::new(),
+            stale_below: vec![COMMANDER_SIGNED_LINE.into()],
             require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Line,
@@ -693,8 +711,8 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
             // context ("default to using Opus", "unless the user says 'use
             // sonnet'").
             pattern: r"(?i)\b(?:re-?launch(?:ed|ing)?|restart(?:ed|ing)?|fell back|fall(?:ing)? back|fallback|drop(?:ped|ping)? (?:down |back )?to|switch(?:ed|ing)? (?:to|onto)|revert(?:ed|ing)? to|downgrad(?:ed|e|ing)? to|bumped? down to|kicked (?:it )?(?:down|over) to|moved? (?:down |back )?to)\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus)\b".into(),
-            negative: Vec::new(),
-            stale_below: Vec::new(),
+            negative: vec![FABLE_NEGATED_CONTEXT.into(), COMMANDER_SIGNED_LINE.into()],
+            stale_below: vec![COMMANDER_SIGNED_LINE.into()],
             require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Line,
@@ -709,8 +727,8 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
             // order. A subagent with NO model named (a normal Fable subagent) or
             // a model literal with NO subagent (app code) never fires.
             pattern: r"(?i)(?:\b(?:claude-)?(?:sonnet|opus)\b[^\n]{0,20}\bsub-?agents?\b|\bsub-?agents?\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus)\b|task\([^\n]{0,60}\b(?:claude-)?(?:sonnet|opus)\b)".into(),
-            negative: Vec::new(),
-            stale_below: Vec::new(),
+            negative: vec![FABLE_NEGATED_CONTEXT.into(), COMMANDER_SIGNED_LINE.into()],
+            stale_below: vec![COMMANDER_SIGNED_LINE.into()],
             require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Line,
@@ -896,6 +914,68 @@ mod tests {
             )
             .is_none(),
             "fable promo line must NOT fire"
+        );
+    }
+
+    #[test]
+    fn fable_drift_ignores_negated_and_commander_signed_instructions() {
+        // WO#452: the Commander's own anti-downgrade instruction ("do not fall
+        // back to Sonnet/Opus subagents. — AoE-Commander") rendered in a worker
+        // pane is mandated warning text, not drift. Negated context and
+        // Commander-signed instruction blocks must never fire the downgrade
+        // family.
+        let compiled = compile(&fable_drift_rules());
+        // Single-line signed instruction (the live bat-CRM false positive).
+        assert!(
+            classify(
+                "Stay on Fable for ALL work; do not fall back to Sonnet/Opus subagents. — AoE-Commander (e2846188)\n",
+                &compiled
+            )
+            .is_none(),
+            "Commander anti-downgrade instruction must NOT fire"
+        );
+        // Multi-line signed block: negated instruction line, signature below.
+        assert!(
+            classify(
+                "WO#451 — keep building the CRM sync.\nStay on Fable; do not fall back to Sonnet/Opus subagents.\n— AoE-Commander (e2846188)\n",
+                &compiled
+            )
+            .is_none(),
+            "multi-line Commander-signed block must NOT fire"
+        );
+        // Non-negated instruction wording inside a signed block ("any drop to
+        // Sonnet must be reported") — still instruction text, not drift.
+        assert!(
+            classify(
+                "Any drop to Sonnet must be reported immediately. — AoE-Commander (e2846188)\n",
+                &compiled
+            )
+            .is_none(),
+            "signed non-negated instruction must NOT fire"
+        );
+        // Bare negation without a signature (hook/skill prose).
+        assert!(
+            classify("never switch to sonnet or opus subagents\n", &compiled).is_none(),
+            "negated 'never switch to sonnet' must NOT fire"
+        );
+        assert!(
+            classify("don't fall back to Opus for the heavy passes\n", &compiled).is_none(),
+            "negated \"don't fall back to Opus\" must NOT fire"
+        );
+        // TRUE positive stays: a genuine worker downgrade statement.
+        assert!(
+            classify("relaunched on Sonnet to keep momentum\n", &compiled).is_some(),
+            "genuine 'relaunched on Sonnet' must STILL fire"
+        );
+        // A Commander signature ABOVE the drift line does not shield it — only
+        // text inside the signed block (signature at or below) is instruction.
+        assert!(
+            classify(
+                "— AoE-Commander (e2846188)\n⏺ relaunched on Sonnet to keep momentum\n",
+                &compiled
+            )
+            .is_some(),
+            "drift BELOW a Commander signature must STILL fire"
         );
     }
 
