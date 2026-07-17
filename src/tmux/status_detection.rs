@@ -3158,7 +3158,7 @@ enter to select · esc to cancel";
   ❯ why does the support get the notification on the duplicate vendor?
   ⏵⏵ bypass permissions on · 2 shells · esc to interrupt · ← for agents";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Running
         );
     }
@@ -3208,7 +3208,7 @@ enter to select · esc to cancel";
         let pane = "  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.\n\
   ❯ 1. Resume from summary (recommended)\n    2. Resume full session as-is";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Waiting
         );
     }
@@ -3227,7 +3227,7 @@ enter to select · esc to cancel";
   esc to interrupt";
         assert_eq!(detect_claude_status(prose), Status::Running);
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, prose),
+            reconcile_claude_hook_status(Status::Running, prose, None),
             Status::Running
         );
     }
@@ -3478,7 +3478,7 @@ enter to select · esc to cancel";
         // preserved to exercise the strip path live capture goes through.
         let pane = "\x1b[2m  Claude usage limit reached. Your limit will reset at 3pm.\x1b[0m";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Waiting
         );
     }
@@ -3487,7 +3487,7 @@ enter to select · esc to cancel";
     fn test_reconcile_claude_hook_status_waiting_on_device_code() {
         let pane = "  To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code F7X9K2Q2 to authenticate.";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Waiting
         );
     }
@@ -3507,7 +3507,7 @@ enter to select · esc to cancel";
   esc to interrupt";
         assert_eq!(detect_claude_status(content), Status::Running);
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, content),
+            reconcile_claude_hook_status(Status::Running, content, None),
             Status::Running
         );
     }

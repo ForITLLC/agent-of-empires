@@ -65,6 +65,15 @@ pub struct PaneRuleConfig {
     /// current blocking state. Empty keeps every match, the prior behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_below: Vec<String>,
+    /// Required-liveness guards (Line scope only): the mirror of
+    /// `stale_below`. A matched line is voided UNLESS at least one of these
+    /// matches a line BELOW it. Use for banners that are only actionable
+    /// while the pane is still doing something — e.g. a 529 banner is a live
+    /// block only while the running footer renders below it; a recovered
+    /// pane idling at the prompt keeps the banner in its tail but no longer
+    /// satisfies the guard. Empty keeps every match, the prior behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub require_below: Vec<String>,
     /// How many non-empty lines from the live edge of the pane are in scope.
     /// Small windows keep stale scrollback (a finished sign-in flow, a
     /// recovered error) from firing.
@@ -123,6 +132,7 @@ pub struct CompiledRule {
     pattern: Regex,
     negative: Vec<Regex>,
     stale_below: Vec<Regex>,
+    require_below: Vec<Regex>,
     tail_lines: usize,
     scope: RuleScope,
     strip_decoration: bool,
@@ -133,12 +143,22 @@ impl CompiledRule {
     /// A Line-scope match only counts while nothing below it looks alive:
     /// when any `stale_below` guard matches a line rendered after the
     /// matched one, the match is replayed scrollback (the session resumed
-    /// and kept working), not a current blocking state.
+    /// and kept working), not a current blocking state. Symmetrically, when
+    /// `require_below` guards are set, the match only counts while at least
+    /// one line below satisfies one — proof the pane is still in the state
+    /// that makes the banner actionable. A match on the very last line has
+    /// nothing below it, so it cannot satisfy a `require_below` guard and is
+    /// voided; the next scan sees the settled pane.
     fn match_is_current(&self, below: &[&str]) -> bool {
-        self.stale_below.is_empty()
+        let not_stale = self.stale_below.is_empty()
             || !below
                 .iter()
-                .any(|l| self.stale_below.iter().any(|g| g.is_match(l)))
+                .any(|l| self.stale_below.iter().any(|g| g.is_match(l)));
+        let required_alive = self.require_below.is_empty()
+            || below
+                .iter()
+                .any(|l| self.require_below.iter().any(|g| g.is_match(l)));
+        not_stale && required_alive
     }
 }
 
@@ -192,12 +212,28 @@ pub fn compile(rules: &[PaneRuleConfig]) -> Vec<CompiledRule> {
                     }
                 }
             }
+            let mut require_below = Vec::with_capacity(r.require_below.len());
+            for s in &r.require_below {
+                match Regex::new(s) {
+                    Ok(g) => require_below.push(g),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "pane_rules",
+                            rule = %r.name,
+                            error = %e,
+                            "invalid require_below guard; rule dropped"
+                        );
+                        return None;
+                    }
+                }
+            }
             Some(CompiledRule {
                 name: r.name.clone(),
                 kind: r.kind.clone(),
                 pattern,
                 negative,
                 stale_below,
+                require_below,
                 tail_lines: r.tail_lines.max(1),
                 scope: r.scope,
                 strip_decoration: r.strip_decoration,
@@ -408,6 +444,7 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
                 r"^\s*⎿".into(),
                 r"(?i)\besc to interrupt\b".into(),
             ],
+            require_below: Vec::new(),
             tail_lines: 30,
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -424,6 +461,7 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             pattern: r"(?i)microsoft\.com/devicelogin|/login/device|first copy your one-time code|to sign in, use a web browser|enter the code[\s\S]*to authenticate|to authenticate[\s\S]*enter the code".into(),
             negative: Vec::new(),
             stale_below: Vec::new(),
+            require_below: Vec::new(),
             tail_lines: 8,
             scope: RuleScope::Window,
             strip_decoration: false,
@@ -438,7 +476,20 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             // and plain prose about overload never fire. Live-edge only.
             pattern: r"(?i)overloaded_error|api error\W{0,8}529\b|\b529\b.{0,40}overload|overload.{0,40}\b529\b".into(),
             negative: Vec::new(),
-            stale_below: Vec::new(),
+            // Liveness both ways. stale_below: an assistant/tool bullet below
+            // the banner means the retry succeeded and the session kept
+            // working — replayed scrollback. require_below: a 529 is a live
+            // block only while the CLI is still in its retry loop, which
+            // renders the running footer ("esc to interrupt") below the
+            // banner. A recovered pane idling at the ready prompt keeps the
+            // banner in its 8-line tail forever but has no running footer, so
+            // it must not fire (the overloaded-then-idle false-fire that kept
+            // an URGENT Overloaded badge fresh past its TTL, 2026-07-16).
+            // Note the cap rule's guards do NOT transfer here: a live retry
+            // has a `⎿ Tip:` elbow and the running footer BELOW the banner,
+            // so cap-style stale guards would void exactly the live case.
+            stale_below: vec![r"^\s*[⏺●]".into()],
+            require_below: vec![r"(?i)\besc to interrupt\b".into()],
             tail_lines: 8,
             scope: RuleScope::Line,
             strip_decoration: false,
@@ -472,6 +523,7 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
                 r#"^\s*[`'"\x{2018}\x{2019}\x{201C}\x{201D}]\s*ACTION REQUIRED"#.into(),
             ],
             stale_below: Vec::new(),
+            require_below: Vec::new(),
             tail_lines: 15,
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -575,6 +627,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
                 r"(?i)try claude fable".into(),
             ],
             stale_below: Vec::new(),
+            require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Window,
             strip_decoration: false,
@@ -592,6 +645,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
             pattern: r"(?i)\b(?:re-?launch(?:ed|ing)?|restart(?:ed|ing)?|fell back|fall(?:ing)? back|fallback|drop(?:ped|ping)? (?:down |back )?to|switch(?:ed|ing)? (?:to|onto)|revert(?:ed|ing)? to|downgrad(?:ed|e|ing)? to|bumped? down to|kicked (?:it )?(?:down|over) to|moved? (?:down |back )?to)\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus)\b".into(),
             negative: Vec::new(),
             stale_below: Vec::new(),
+            require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -607,6 +661,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
             pattern: r"(?i)(?:\b(?:claude-)?(?:sonnet|opus)\b[^\n]{0,20}\bsub-?agents?\b|\bsub-?agents?\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus)\b|task\([^\n]{0,60}\b(?:claude-)?(?:sonnet|opus)\b)".into(),
             negative: Vec::new(),
             stale_below: Vec::new(),
+            require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -627,6 +682,7 @@ mod tests {
             pattern: pattern.into(),
             negative: Vec::new(),
             stale_below: Vec::new(),
+            require_below: Vec::new(),
             tail_lines: default_tail_lines(),
             scope: RuleScope::Line,
             strip_decoration: true,
@@ -910,6 +966,59 @@ mod tests {
     }
 
     #[test]
+    fn default_overload_recovered_then_idle_is_none() {
+        // A 529 that the CLI finished past (turn ended, pane idle at the
+        // ready prompt, footer has no "esc to interrupt") is history, not a
+        // live block. The per-Website false-fire of 2026-07: the banner sat
+        // in the 8-line tail of an idle pane and re-fired every tick.
+        let compiled = compile(&default_rules());
+        let idle = "⏺ API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.\n\
+                    ✻ Crunched for 3m 22s\n\
+                    ──────\n\
+                    ❯\n\
+                    ──────\n\
+                    ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n";
+        assert!(
+            classify(idle, &compiled).is_none(),
+            "recovered 529 above an idle prompt must not fire"
+        );
+    }
+
+    #[test]
+    fn default_overload_live_retry_fires() {
+        // The CLI mid-retry: spinner banner at the live edge, running footer
+        // ("esc to interrupt") below. This is the real blocked state.
+        let compiled = compile(&default_rules());
+        let live = "✻ 529 Overloaded · Retrying in 2s · attempt 10/10\n\
+                    ⎿  Tip: Use /btw to ask a quick side question\n\
+                    ──────\n\
+                    ❯\n\
+                    ──────\n\
+                    ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents\n";
+        assert_eq!(
+            classify(live, &compiled).map(|m| m.name.as_str()),
+            Some("server-overload"),
+            "live 529 retry with a running footer must fire"
+        );
+    }
+
+    #[test]
+    fn default_overload_resumed_activity_is_none() {
+        // Retry succeeded and the session kept working: assistant/tool
+        // bullets below the banner prove it is replayed scrollback even
+        // though the running footer is present.
+        let compiled = compile(&default_rules());
+        let resumed = "⏺ API Error: 529 Overloaded. This is a server-side issue.\n\
+                       ⏺ Bash(cargo test)\n\
+                       ⎿  running 5 tests\n\
+                       ✻ Crunching… (esc to interrupt)\n";
+        assert!(
+            classify(resumed, &compiled).is_none(),
+            "529 with resumed activity below must not fire"
+        );
+    }
+
+    #[test]
     fn toml_stale_below_parses_and_defaults_empty() {
         let cfg: WatchdogConfig = toml::from_str(
             r#"
@@ -934,6 +1043,60 @@ mod tests {
     fn invalid_stale_below_guard_drops_rule() {
         let mut r = rule("bad-guard", r"^x");
         r.stale_below = vec![r"(unclosed".into()];
+        assert!(compile(&[r]).is_empty());
+    }
+
+    #[test]
+    fn require_below_voids_match_without_required_line() {
+        let mut r = rule("overload-live", r"(?i)^api error.*529");
+        r.require_below = vec![r"(?i)\besc to interrupt\b".into()];
+        let compiled = compile(&[r]);
+        // Running footer below the banner: required liveness present, fires.
+        let live = "API Error: 529 Overloaded\n  esc to interrupt\n";
+        assert!(classify(live, &compiled).is_some());
+        assert!(classify_fp(live, &compiled).is_some());
+        // Idle prompt below, no footer: guard unsatisfied, voided.
+        let idle = "API Error: 529 Overloaded\n❯\n";
+        assert!(classify(idle, &compiled).is_none());
+        assert!(classify_fp(idle, &compiled).is_none());
+        // Banner as the very last line: nothing below can satisfy the guard.
+        assert!(classify("API Error: 529 Overloaded\n", &compiled).is_none());
+    }
+
+    #[test]
+    fn require_below_ignores_required_line_above_the_match() {
+        let mut r = rule("overload-live", r"(?i)^api error.*529");
+        r.require_below = vec![r"(?i)\besc to interrupt\b".into()];
+        let compiled = compile(&[r]);
+        // The footer ABOVE the banner is history, not liveness evidence.
+        assert!(classify("  esc to interrupt\nAPI Error: 529 Overloaded\n", &compiled).is_none());
+    }
+
+    #[test]
+    fn toml_require_below_parses_and_defaults_empty() {
+        let cfg: WatchdogConfig = toml::from_str(
+            r#"
+            [[rules]]
+            name = "bare"
+            kind = "overload"
+            pattern = "^x"
+
+            [[rules]]
+            name = "guarded"
+            kind = "overload"
+            pattern = "^y"
+            require_below = ["^z"]
+            "#,
+        )
+        .expect("parses");
+        assert!(cfg.rules[0].require_below.is_empty());
+        assert_eq!(cfg.rules[1].require_below, vec!["^z".to_string()]);
+    }
+
+    #[test]
+    fn invalid_require_below_guard_drops_rule() {
+        let mut r = rule("bad-guard", r"^x");
+        r.require_below = vec![r"(unclosed".into()];
         assert!(compile(&[r]).is_empty());
     }
 

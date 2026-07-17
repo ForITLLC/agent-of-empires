@@ -1405,22 +1405,42 @@ and enter the code H7Q2K9F4P to authenticate.
 
     // ── classify: server overload (529) ────────────────────────────────
 
+    // Overload fires only while the CLI is still retrying, which renders the
+    // running footer ("esc to interrupt") below the banner — the rule's
+    // require_below guard. Each positive fixture carries that footer.
+
     #[test]
     fn overload_canonical_api_error_529_banner() {
-        let pane = "  ⎿  API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
+        let pane = "  ⎿  API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\
+                    ⏵⏵ bypass permissions on · esc to interrupt\n";
         assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Overloaded));
     }
 
     #[test]
     fn overload_529_parenthesized_with_retry_tail() {
-        let pane = "API Error (529 Overloaded) · Retrying in 4 seconds… (attempt 3/10)\n";
+        let pane = "API Error (529 Overloaded) · Retrying in 4 seconds… (attempt 3/10)\n\
+                    esc to interrupt\n";
         assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Overloaded));
     }
 
     #[test]
     fn overload_raw_overloaded_error_type() {
-        let pane = "  ⎿  {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n";
+        let pane = "  ⎿  {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\
+                    ⏵⏵ bypass permissions on · esc to interrupt\n";
         assert_eq!(classify_pane_tail(pane), Some(PaneSignal::Overloaded));
+    }
+
+    #[test]
+    fn overload_recovered_then_idle_is_none() {
+        // The CLI finished past the 529 (turn ended, pane idle at the ready
+        // prompt, footer without "esc to interrupt"). The banner sits in the
+        // 8-line tail forever; before the require_below guard this re-fired
+        // Overloaded every scan and kept the URGENT badge fresh past its TTL.
+        let pane = "⏺ API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.\n\
+                    ✻ Crunched for 3m 22s\n\
+                    ❯\n\
+                    ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n";
+        assert_eq!(classify_pane_tail(pane), None);
     }
 
     #[test]
