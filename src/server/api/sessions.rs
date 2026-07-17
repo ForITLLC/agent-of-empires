@@ -11447,6 +11447,7 @@ type SendKeysResult =
 pub async fn send_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     req: Result<Json<SendMessageRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -11490,6 +11491,7 @@ pub async fn send_message(
 
     let sync_base = instance.clone();
     let tool = instance.tool.clone();
+    let message_for_log = req.message.clone();
     let message = req.message;
     let revive = req.revive;
     let send_result = tokio::task::spawn_blocking(move || -> SendKeysResult {
@@ -11562,6 +11564,37 @@ pub async fn send_message(
         Ok((outcome, inst_owned))
     })
     .await;
+
+    // Durable audit row for GET /api/messages, written best-effort off the
+    // request path. Never affects the send result: log failures are
+    // swallowed inside log_best_effort.
+    {
+        let outcome = match &send_result {
+            Ok(Ok(_)) => "sent".to_string(),
+            Ok(Err(boxed)) => match &boxed.2 {
+                SendKeysError::NotRunning => "error: session_not_running".to_string(),
+                SendKeysError::ResumeFailed(_) => "error: resume_failed".to_string(),
+                SendKeysError::Transient(_) => "error: session_transient".to_string(),
+                SendKeysError::StructuredView => "error: acp_mode_unsupported".to_string(),
+                SendKeysError::Tmux(_) => "error: tmux_error".to_string(),
+            },
+            Err(_) => "error: internal".to_string(),
+        };
+        let rec = crate::messages::MessageRecord {
+            ts: chrono::Utc::now().timestamp(),
+            source: "api".to_string(),
+            sender: headers
+                .get("x-caller-session")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            target_session: id.clone(),
+            target_title: Some(sync_base.title.clone()),
+            message: message_for_log,
+            outcome,
+        };
+        tokio::task::spawn_blocking(move || crate::messages::log_best_effort(&rec));
+    }
 
     match send_result {
         Ok(Ok((outcome, started))) => {

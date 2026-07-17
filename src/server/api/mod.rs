@@ -20,6 +20,7 @@ mod file_provenance;
 mod git;
 mod log_level;
 mod mcp;
+mod messages;
 pub(crate) mod plugin_settings;
 pub mod plugins;
 mod projects;
@@ -50,6 +51,7 @@ pub use client_log::post_client_log;
 pub use git::{clone_repo, is_git_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
+pub use messages::get_messages;
 pub use plugin_settings::resolve_options;
 pub use plugins::{
     apply_plugin_update, dismiss_plugin_update, invoke_plugin_action, invoke_plugin_command,

@@ -935,7 +935,11 @@ mod tests {
         r.stale_below = vec![r"^\s*[⏺●]".into()];
         let compiled = compile(&[r]);
         // Banner at the live edge: current, fires.
-        assert!(classify("earlier output\nUsage limit reached ∙ resets 3pm\n", &compiled).is_some());
+        assert!(classify(
+            "earlier output\nUsage limit reached ∙ resets 3pm\n",
+            &compiled
+        )
+        .is_some());
         // Activity rendered BELOW the banner: replayed scrollback, voided.
         let replayed = "Usage limit reached ∙ resets 3pm\n⏺ Bash(cargo test)\n";
         assert!(classify(replayed, &compiled).is_none());

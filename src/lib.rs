@@ -20,6 +20,10 @@ pub mod git;
 pub mod github;
 pub mod hooks;
 pub mod logging;
+/// Durable fleet message log (every `aoe send` / API send, queryable via
+/// `GET /api/messages`). Rides the serve-gated events substrate.
+#[cfg(feature = "serve")]
+pub mod messages;
 pub mod migrations;
 pub mod pane_rules;
 pub mod plugin;

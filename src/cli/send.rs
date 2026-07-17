@@ -117,6 +117,23 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
         );
     }
 
+    // Durable audit row for the fleet message log (GET /api/messages). Best
+    // effort by contract: the message already reached the pane, so a failed
+    // audit write must never surface as a failed send.
+    #[cfg(feature = "serve")]
+    {
+        let rec = crate::messages::MessageRecord {
+            ts: chrono::Utc::now().timestamp(),
+            source: "cli".to_string(),
+            sender: None,
+            target_session: session_id.clone(),
+            target_title: Some(session_title.clone()),
+            message: args.message.clone(),
+            outcome: "sent".to_string(),
+        };
+        crate::messages::log_best_effort(&rec);
+    }
+
     println!("Sent message to '{}'", session_title);
     Ok(())
 }
