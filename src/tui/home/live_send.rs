@@ -415,6 +415,55 @@ pub(super) fn coalesce(batch: Vec<WorkerMsg>) -> Vec<TmuxAction> {
     out
 }
 
+/// xterm bracketed-paste start sequence: `ESC [ 2 0 0 ~`. An agent that
+/// has enabled bracketed paste mode (`\e[?2004h`) treats everything
+/// between this marker and the matching end marker as one paste rather
+/// than as keystrokes. Shared with `input.rs`'s multi-line paste split.
+pub(super) const BRACKETED_PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
+
+/// xterm bracketed-paste end sequence: `ESC [ 2 0 1 ~`. Pairs with
+/// [`BRACKETED_PASTE_START`].
+pub(super) const BRACKETED_PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
+
+/// A coalesced literal run at or over this many bytes is machine-speed
+/// input (dictation dump, terminal paste, a mosh burst), not typing:
+/// human keystrokes drain one key per batch because a send-keys fork is
+/// only milliseconds. Mirrors the daemon send path's
+/// `PASTE_BYTE_THRESHOLD` in `tmux::session` so both injection surfaces
+/// agree on what "paste-shaped" means.
+pub(super) const LIVE_SEND_PASTE_THRESHOLD: usize = 16;
+
+/// Frame machine-speed literal runs in bracketed-paste markers for an
+/// agent pane. An unframed burst trips the agent CLI's own paste-burst
+/// detector (Claude Code buffers rapid input to guess at pastes) and the
+/// user's submitting Enter arriving inside that window is coalesced into
+/// the buffered text as a newline instead of firing submit — the typed
+/// approval sits in the composer, never submitted. The daemon send path
+/// fixed the same phenomenon by routing paste-shaped payloads through
+/// `paste-buffer -p`; this is the TUI live-send equivalent. Framed, the
+/// agent treats the run as one explicit paste, and a following Enter
+/// (its own `Named` action, outside the markers) submits reliably.
+/// Applied only when the live target is the agent pane: bare shells and
+/// tools that never enabled `\e[?2004h` would render the markers as
+/// literal text, so terminal targets keep the plain `-l` path.
+pub(super) fn frame_agent_paste_bursts(actions: Vec<TmuxAction>) -> Vec<TmuxAction> {
+    actions
+        .into_iter()
+        .map(|action| match action {
+            TmuxAction::Literal(s) if s.len() >= LIVE_SEND_PASTE_THRESHOLD => {
+                let mut bytes = Vec::with_capacity(
+                    s.len() + BRACKETED_PASTE_START.len() + BRACKETED_PASTE_END.len(),
+                );
+                bytes.extend_from_slice(BRACKETED_PASTE_START);
+                bytes.extend_from_slice(s.as_bytes());
+                bytes.extend_from_slice(BRACKETED_PASTE_END);
+                TmuxAction::HexBytes(bytes)
+            }
+            other => other,
+        })
+        .collect()
+}
+
 /// Whether a drained batch must verify size ownership BEFORE dispatch.
 /// Only geometry changes need that ordering: a `resize-window` racing
 /// another surface's live grid is the flap the size-owner lock exists to
@@ -469,7 +518,16 @@ impl LiveSendWorker {
     /// batch, so the typed echo is captured immediately instead of waiting
     /// up to a full fast-cadence cycle. That ties echo latency to actual
     /// input rather than the background capture phase.
-    pub(super) fn spawn(tmux_name: String, capture_wake: Option<LiveCaptureWake>) -> Self {
+    /// `frame_pastes` is true when the live target is the agent pane:
+    /// machine-speed literal runs are then framed in bracketed-paste
+    /// markers (see `frame_agent_paste_bursts`) so the agent's paste-burst
+    /// detection can't swallow the submitting Enter. Terminal / tool
+    /// targets pass false and keep the plain literal path.
+    pub(super) fn spawn(
+        tmux_name: String,
+        capture_wake: Option<LiveCaptureWake>,
+        frame_pastes: bool,
+    ) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         let lock_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_lock_lost = std::sync::Arc::clone(&lock_lost);
@@ -572,7 +630,7 @@ impl LiveSendWorker {
                             batch.retain(|m| !matches!(m, WorkerMsg::Resize { .. }));
                         }
                         if !batch.is_empty() {
-                            dispatch_batch(&tmux_name, batch);
+                            dispatch_batch(&tmux_name, batch, frame_pastes);
                             if let Some(wake) = &capture_wake {
                                 wake.wake();
                             }
@@ -1579,8 +1637,11 @@ impl LiveCaptureWorker {
 /// named keys and resizes dispatch individually. Tests verify the
 /// coalescing ordering via `coalesce` directly without needing a real
 /// session.
-fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
-    let actions = coalesce(batch);
+fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>, frame_pastes: bool) {
+    let mut actions = coalesce(batch);
+    if frame_pastes {
+        actions = frame_agent_paste_bursts(actions);
+    }
     // A `Paste` can only go through tmux (`paste-buffer -p` is what decides
     // whether the pane gets bracketed-paste markers), so a batch holding one
     // would otherwise split across two writers: the paste via tmux and its
@@ -2674,6 +2735,66 @@ mod tests {
     #[test]
     fn coalesce_empty_batch_is_empty() {
         assert_eq!(coalesce(vec![]), vec![]);
+    }
+
+    #[test]
+    fn frame_paste_bursts_leaves_short_literals_alone() {
+        // Human-speed typing drains one key (or a few) per batch; those
+        // literal runs stay on the plain `-l` path so bare shells and
+        // agents without bracketed-paste keep working unchanged.
+        let out = frame_agent_paste_bursts(vec![TmuxAction::Literal("send h".into())]);
+        assert_eq!(out, vec![TmuxAction::Literal("send h".into())]);
+    }
+
+    #[test]
+    fn frame_paste_bursts_brackets_machine_speed_runs() {
+        // A dictation/paste burst arrives as one big coalesced literal.
+        // Unframed, the agent's paste-burst detector swallows the trailing
+        // Enter (the WO#453 submit bug); framed in bracketed-paste markers
+        // the agent treats it as a paste and the following Enter submits.
+        let text = "send h-1c2bc36f approve"; // 23 bytes >= threshold
+        let out = frame_agent_paste_bursts(vec![TmuxAction::Literal(text.into())]);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(BRACKETED_PASTE_START);
+        expected.extend_from_slice(text.as_bytes());
+        expected.extend_from_slice(BRACKETED_PASTE_END);
+        assert_eq!(out, vec![TmuxAction::HexBytes(expected)]);
+    }
+
+    #[test]
+    fn frame_paste_bursts_preserves_order_and_other_actions() {
+        // The submitting Enter after a burst must stay a separate Named
+        // key AFTER the framed payload; named keys, resizes, and
+        // already-framed HexBytes pass through untouched.
+        let text = "this is a long dictated approval line";
+        let out = frame_agent_paste_bursts(vec![
+            TmuxAction::Literal(text.into()),
+            TmuxAction::Named("Enter".into()),
+            TmuxAction::Resize { cols: 80, rows: 24 },
+            TmuxAction::HexBytes(vec![0x0d]),
+        ]);
+        assert_eq!(out.len(), 4);
+        assert!(matches!(&out[0], TmuxAction::HexBytes(b) if b.starts_with(BRACKETED_PASTE_START)));
+        assert_eq!(out[1], TmuxAction::Named("Enter".into()));
+        assert_eq!(out[2], TmuxAction::Resize { cols: 80, rows: 24 });
+        assert_eq!(out[3], TmuxAction::HexBytes(vec![0x0d]));
+    }
+
+    #[test]
+    fn frame_paste_bursts_threshold_matches_daemon_paste_threshold() {
+        // 15 bytes: below threshold, unframed. 16: framed. Mirrors the
+        // daemon send path's PASTE_BYTE_THRESHOLD so both injection
+        // surfaces agree on what "paste-shaped" means.
+        let fifteen = "123456789012345";
+        let sixteen = "1234567890123456";
+        assert_eq!(
+            frame_agent_paste_bursts(vec![TmuxAction::Literal(fifteen.into())]),
+            vec![TmuxAction::Literal(fifteen.into())]
+        );
+        assert!(matches!(
+            &frame_agent_paste_bursts(vec![TmuxAction::Literal(sixteen.into())])[0],
+            TmuxAction::HexBytes(_)
+        ));
     }
 
     #[test]

@@ -1434,7 +1434,8 @@ impl Session {
     /// Enter with a bare Enter resend. It never re-pastes: the text is already
     /// in the composer, so a re-paste would double it.
     ///
-    /// Blocking (bounded ~12s worst case); call from a blocking context.
+    /// Blocking (bounded ~22s worst case: ready wait + draft wait + verify);
+    /// call from a blocking context.
     pub fn send_keys_verified(&self, text: &str, enter_delay_ms: u64, tool: &str) -> Result<()> {
         if tool != "claude" {
             return self.send_keys_with_delay(text, enter_delay_ms);
@@ -1442,6 +1443,7 @@ impl Session {
 
         const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
         const READY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+        const DRAFT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         const VERIFY_SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
         const MAX_SUBMIT_RETRIES: u32 = 3;
         const VERIFY_CAPTURE_LINES: usize = 30;
@@ -1459,10 +1461,33 @@ impl Session {
         // rather than feed the message to a menu.
         let mut ready_deadline = std::time::Instant::now() + READY_TIMEOUT;
         let mut trust_answered = false;
+        // A composer holding an operator's half-typed draft counts as "ready"
+        // above, but pasting into it fuses the draft with this message and
+        // submits the merged blob under the operator's name. Wait, bounded
+        // separately from the ready window, for the draft to clear; if it
+        // does not, remember it so the payload carries an explicit boundary
+        // marker and the verify phase keys on the draft (which stays on the
+        // `❯` line) instead of this message.
+        let mut draft_deadline: Option<std::time::Instant> = None;
+        let mut interrupted_draft: Option<String> = None;
         loop {
             let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
             if super::status_detection::claude_pane_input_ready(&content) {
-                break;
+                let Some(draft) = super::status_detection::claude_composer_draft(&content) else {
+                    break;
+                };
+                let deadline = *draft_deadline
+                    .get_or_insert_with(|| std::time::Instant::now() + DRAFT_TIMEOUT);
+                if std::time::Instant::now() >= deadline {
+                    tracing::info!(target: "tmux.command",
+                        "send_keys_verified: operator draft still in composer after \
+                         {DRAFT_TIMEOUT:?}; injecting below it with a boundary marker"
+                    );
+                    interrupted_draft = Some(draft);
+                    break;
+                }
+                std::thread::sleep(READY_POLL);
+                continue;
             }
             let trust_blocking = super::status_detection::claude_trust_dialog_visible(&content);
             if trust_blocking && !trust_answered {
@@ -1485,12 +1510,29 @@ impl Session {
                 tracing::debug!(target: "tmux.command",
                     "send_keys_verified: composer not ready after {READY_TIMEOUT:?}; sending anyway"
                 );
+                // Defense in depth: a draft can be on screen even when the
+                // ready detector says no (a redraw flicker, or a composer
+                // shape the detector doesn't recognize — the WO#453 fusion
+                // rode exactly this branch). If the final capture shows one,
+                // still send with the boundary marker rather than fuse.
+                if let Some(draft) = super::status_detection::claude_composer_draft(&content) {
+                    interrupted_draft = Some(draft);
+                }
                 break;
             }
             std::thread::sleep(READY_POLL);
         }
 
-        self.send_keys_with_delay(text, enter_delay_ms)?;
+        let payload = if interrupted_draft.is_some() {
+            compose_injection_with_draft_marker(text)
+        } else {
+            text.to_string()
+        };
+        // When injecting below a parked draft, the `❯` line keeps showing the
+        // DRAFT (this message lands on continuation lines), so the stuck-check
+        // must key on the draft text or it would false-negative every time.
+        let verify_key: &str = interrupted_draft.as_deref().unwrap_or(text);
+        self.send_keys_with_delay(&payload, enter_delay_ms)?;
 
         // Phase 2: confirm the message left the composer. A matching draft
         // still parked at `❯` while the pane is not generating means the
@@ -1498,7 +1540,7 @@ impl Session {
         for _attempt in 0..MAX_SUBMIT_RETRIES {
             std::thread::sleep(VERIFY_SETTLE);
             let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
-            if !super::status_detection::claude_message_stuck_in_composer(&content, text) {
+            if !super::status_detection::claude_message_stuck_in_composer(&content, verify_key) {
                 return Ok(());
             }
             if super::status_detection::detect_status_from_content(&content, tool)
@@ -1515,7 +1557,7 @@ impl Session {
             self.send_raw_bytes(b"\r")?;
         }
         let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
-        if super::status_detection::claude_message_stuck_in_composer(&content, text) {
+        if super::status_detection::claude_message_stuck_in_composer(&content, verify_key) {
             tracing::warn!(target: "tmux.command",
                 "send_keys_verified: message still unsubmitted after {MAX_SUBMIT_RETRIES} Enter resends"
             );
@@ -2167,10 +2209,45 @@ pub(crate) fn build_create_args(
     args
 }
 
+/// Marker line separating an operator's interrupted composer draft from a
+/// machine-injected message pasted below it. When a draft is still parked at
+/// the `❯` prompt after the injection wait expires, the paste lands INSIDE
+/// the operator's half-typed text; without a visible boundary the human draft
+/// and the machine message read as one authored blob. The bracket glyphs keep
+/// the marker from colliding with anything a human would plausibly type.
+pub(crate) const INJECT_DRAFT_DELIMITER: &str =
+    "⟪AOE-INJECT: text above is an interrupted human draft; the machine-injected message follows⟫";
+
+/// Wraps `message` for injection into a composer that already holds an
+/// operator draft: a leading newline pushes the marker onto its own line
+/// below the draft, then the marker, then the message. The embedded newlines
+/// also force [`TmuxSession::send_keys_with_delay`] onto the bracketed
+/// paste-buffer path, so they accumulate in the draft instead of submitting
+/// line by line.
+pub(crate) fn compose_injection_with_draft_marker(message: &str) -> String {
+    format!("\n{INJECT_DRAFT_DELIMITER}\n{message}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::TmuxTestSession;
     use super::*;
+
+    #[test]
+    fn test_compose_injection_with_draft_marker_shape() {
+        // The delimiter payload lands INSIDE a composer that already holds
+        // the operator's draft: it must open with a newline (pushing the
+        // marker onto its own line below the draft), carry the marker, then
+        // the injected message. Containing a newline also guarantees
+        // `send_keys_with_delay` takes the bracketed paste-buffer path, so
+        // the interior newlines accumulate in the draft instead of
+        // submitting per line.
+        let out = compose_injection_with_draft_marker("STATUS: shipped");
+        assert!(out.starts_with('\n'), "must open with a newline: {out:?}");
+        assert!(out.contains(INJECT_DRAFT_DELIMITER));
+        assert!(out.ends_with("\nSTATUS: shipped"));
+        assert!(out.contains('\n'));
+    }
 
     /// Helper: check if tmux is available for tests that need it
     fn tmux_available() -> bool {

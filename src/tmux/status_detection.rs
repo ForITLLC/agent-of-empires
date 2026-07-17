@@ -909,8 +909,49 @@ pub(crate) fn claude_pane_input_ready(raw_content: &str) -> bool {
         .take(CLAUDE_COMPOSER_TAIL)
         .any(|line| {
             let trimmed = line.trim();
-            (trimmed == "❯" || trimmed.starts_with("❯ "))
-                && !claude_line_is_numbered_choice(trimmed)
+            // Claude Code renders the prompt as `❯` + U+00A0 NO-BREAK SPACE
+            // when text follows (captured live, WO#453), so a literal `"❯ "`
+            // match misses any composer holding a draft — accept `❯` followed
+            // by nothing or by any whitespace character.
+            trimmed.strip_prefix('❯').is_some_and(|rest| {
+                rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
+            }) && !claude_line_is_numbered_choice(trimmed)
+        })
+}
+
+/// The non-empty text a human has parked at the Claude composer's `❯`
+/// prompt, if any. `claude_pane_input_ready` counts a composer holding a
+/// half-typed draft as "ready", but injecting into it fuses the operator's
+/// text with the injected message and submits the blob under their name —
+/// the WO#453 collision. Callers use this to defer injection until the
+/// draft clears (or to mark the boundary when they can't wait). Numbered
+/// menu cursors (`❯ 1. ...`) are dialogs, not drafts, and return `None`,
+/// as does an empty or whitespace-only composer. `pub(crate)` for the
+/// daemon send path.
+pub(crate) fn claude_composer_draft(raw_content: &str) -> Option<String> {
+    let clean = strip_ansi(raw_content);
+    clean
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<&str>>()
+        .iter()
+        .rev()
+        .take(CLAUDE_COMPOSER_TAIL)
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if claude_line_is_numbered_choice(trimmed) {
+                return None;
+            }
+            let draft = trimmed.strip_prefix('❯')?.trim();
+            if draft.is_empty() {
+                return None;
+            }
+            // With messages queued, Claude Code parks this dim hint on the
+            // `❯` line (captured live, WO#453) — UI chrome, not a draft.
+            if draft == "Press up to edit queued messages" {
+                return None;
+            }
+            Some(draft.to_string())
         })
 }
 
@@ -3357,6 +3398,96 @@ enter to select · esc to cancel";
             pane,
             "RACE-PROBE-MESSAGE this text was pasted during boot"
         ));
+    }
+
+    #[test]
+    fn test_claude_composer_draft_returns_human_draft() {
+        // Ben's half-typed approval parked at the composer. An injection
+        // landing now would fuse with it; the daemon must see the draft.
+        let pane = "\
+────────────────────────────────────────────────────────
+ ❯ send h-1c2bc36f
+────────────────────────────────────────────────────────
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert_eq!(
+            claude_composer_draft(pane),
+            Some("send h-1c2bc36f".to_string())
+        );
+    }
+
+    #[test]
+    fn test_claude_composer_draft_none_on_empty_composer() {
+        let pane = "\
+────────────────────────────────\n ❯ \n────────────────────────────────";
+        assert_eq!(claude_composer_draft(pane), None);
+        let bare = "────────\n ❯\n────────";
+        assert_eq!(claude_composer_draft(bare), None);
+    }
+
+    #[test]
+    fn test_claude_composer_draft_none_on_numbered_menu() {
+        // The trust dialog / resume picker render `❯ 1. ...` — a menu
+        // cursor, not a draft.
+        let pane = "\
+ Do you trust the files in this folder?
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit";
+        assert_eq!(claude_composer_draft(pane), None);
+    }
+
+    #[test]
+    fn test_claude_composer_draft_none_without_composer() {
+        assert_eq!(claude_composer_draft(""), None);
+        assert_eq!(
+            claude_composer_draft(" ▐▛███▜▌   Claude Code v2.1.197"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_claude_composer_draft_strips_ansi() {
+        let pane = "\x1b[1m ❯ \x1b[0msend h-1c2bc36f\n   ⏵⏵ bypass permissions on";
+        assert_eq!(
+            claude_composer_draft(pane),
+            Some("send h-1c2bc36f".to_string())
+        );
+    }
+
+    #[test]
+    fn test_claude_pane_input_ready_nbsp_after_prompt() {
+        // Captured live (WO#453 probe2): when a draft is parked, Claude Code
+        // renders the composer prompt as `❯` + U+00A0 NO-BREAK SPACE, not an
+        // ASCII space. The ready check must not demand `"❯ "` literally, or
+        // a pane holding a draft is never "ready" — the send then rides the
+        // ready-timeout branch, which skips the draft check, and the paste
+        // fuses with the operator's text (the exact WO#453 fusion, twice).
+        let pane = "\
+────────────────────────────────────────────────────────
+\x1b[38;5;246m❯\u{a0}\x1b[39mBEN DRAFT WO453 probe2 half-typed
+────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_pane_input_ready(pane));
+        assert_eq!(
+            claude_composer_draft(pane),
+            Some("BEN DRAFT WO453 probe2 half-typed".to_string())
+        );
+    }
+
+    #[test]
+    fn test_claude_composer_draft_none_on_queued_hint() {
+        // With messages queued, Claude Code parks a dim hint on the `❯` line
+        // (same `❯` + U+00A0 shape, captured live). It is UI chrome, not an
+        // operator draft — treating it as one would add a bogus interrupted-
+        // draft marker to every send aimed at a queued pane. The composer IS
+        // ready in this state.
+        let pane = "\
+────────────────────────────────────────────────────────
+\x1b[38;5;246m❯\u{a0}\x1b[2m\x1b[39mPress up to edit queued messages\x1b[0m
+────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert_eq!(claude_composer_draft(pane), None);
+        assert!(claude_pane_input_ready(pane));
     }
 
     #[test]

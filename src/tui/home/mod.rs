@@ -6444,7 +6444,20 @@ impl HomeView {
         // pre-#1485 path; control-mode was tried as an optimization
         // but turned out to be unreliable on real-world tmux setups
         // and was removed in favor of this simpler model).
-        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name, capture_wake));
+        // Agent panes get bracketed-paste framing for machine-speed input
+        // bursts (dictation/paste): unframed, the agent CLI's paste-burst
+        // detector swallows the submitting Enter and the typed message
+        // sits unsubmitted in the composer. Terminal/tool targets keep
+        // the plain literal path (no `\e[?2004h` guarantee there).
+        let frame_pastes = matches!(
+            self.live_send.as_ref().map(|ls| &ls.target),
+            Some(live_send::LiveSendTarget::Agent)
+        );
+        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(
+            tmux_name,
+            capture_wake,
+            frame_pastes,
+        ));
         // Start every live-mode entry (including a switch from another
         // session) with a disarmed leader menu, so a half-entered chord
         // can't carry over from a prior target.

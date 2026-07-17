@@ -12913,7 +12913,7 @@ mod scroll_pane_isolation {
             ),
             leader: None,
         });
-        env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+        env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None, true));
         // Spawn the capture worker, then inject the cursor (set_target
         // clears it, so the injection must come after).
         env.view
