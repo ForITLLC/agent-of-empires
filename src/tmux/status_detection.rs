@@ -1097,16 +1097,6 @@ fn claude_has_blocking_status_banner(recent: &[&str]) -> bool {
     claude_has_device_code_prompt(&tail_lower)
 }
 
-/// Strip ANSI and scan the recent pane lines for a blocking status banner.
-/// Mirrors `claude_pane_has_resume_picker` for callers holding raw
-/// `capture-pane -e` output.
-fn claude_pane_has_blocking_status_banner(raw_content: &str) -> bool {
-    let clean = strip_ansi(raw_content);
-    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
-    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
-    claude_has_blocking_status_banner(&recent)
-}
-
 /// When Claude's status hook reports Running, the pane is consulted to catch
 /// the blocking states the hook stream can't express on its own:
 ///
