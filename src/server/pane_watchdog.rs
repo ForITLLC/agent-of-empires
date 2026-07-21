@@ -558,8 +558,24 @@ pub(crate) fn action_page_suppressed(title: &str, working: bool) -> Option<&'sta
 /// Drift-class rules (subagent model, downgrade announcements) describe live
 /// work on the wrong model and page regardless of serving evidence.
 pub(crate) fn fable_page_suppressed(rule: &str, working: bool, banner_suppressed: bool) -> bool {
-    let blockage = matches!(rule, "fable-limit-paraphrase" | "fable-credit-out");
-    blockage && (working || banner_suppressed)
+    is_fable_blockage_rule(rule) && (working || banner_suppressed)
+}
+
+/// Blockage-class Fable rules: the limit paraphrases claiming the account
+/// cannot serve, as opposed to drift-class rules describing live work on the
+/// wrong model.
+pub(crate) fn is_fable_blockage_rule(rule: &str) -> bool {
+    matches!(rule, "fable-limit-paraphrase" | "fable-credit-out")
+}
+
+/// Whether a blockage-class hit must stay silent because the capacity
+/// sentinel owns the reroute for cap classes (WO#535 defect 2). While any
+/// pool profile still holds a fresh positive headroom claim the sentinel can
+/// place the session, so the watchdog paging the Commander is a duplicate of
+/// the sentinel's own escalation. Only a fresh probed NEGATIVE on the whole
+/// pool, genuine all-dry the sentinel cannot place around, pages.
+pub(crate) fn fable_blockage_defers_to_sentinel(rule: &str, pool_all_probed_capped: bool) -> bool {
+    is_fable_blockage_rule(rule) && !pool_all_probed_capped
 }
 
 /// Byte cap for the classification log before it rotates to `.log.1`.
@@ -1214,6 +1230,29 @@ impl Watchdog {
                 rule: rule.to_string(),
                 paged: false,
             };
+        }
+        // WO#535 defect 2: cap-class hits belong to the capacity sentinel,
+        // which reroutes the session and fires its own single all-dry gate.
+        // No fingerprint record here either, so if the pool later drains the
+        // same content can still page.
+        if is_fable_blockage_rule(rule) {
+            let state = match capacity::capacity_path() {
+                Some(path) => capacity::CapacityState::load(&path),
+                None => capacity::CapacityState::default(),
+            };
+            if fable_blockage_defers_to_sentinel(rule, all_pool_probed_capped(&state, unix_secs()))
+            {
+                tracing::debug!(
+                    target: "server.pane_watchdog",
+                    id = %scan.id,
+                    rule,
+                    "Fable blockage-class hit deferred to capacity sentinel; pool not all-dry (WO#535)"
+                );
+                return Disposition::FableDrift {
+                    rule: rule.to_string(),
+                    paged: false,
+                };
+            }
         }
         let last_fp = self.last_fable_fp.get(&scan.id).map(|a| a.fp.as_str());
         let should = action_should_wake(last_fp, fp);
@@ -3112,5 +3151,32 @@ ACTION REQUIRED (Ben): approve the Ramp device login for gna-finance
         ));
         assert!(!fable_page_suppressed("fable-subagent-model", true, false));
         assert!(!fable_page_suppressed("fable-downgrade-verb", true, false));
+    }
+
+    #[test]
+    fn fable_blockage_defers_to_sentinel_unless_pool_all_dry() {
+        // WO#535 (defect 2): blockage-class hits are cap signals the capacity
+        // sentinel owns end to end (reroute plus its own single all-dry gate),
+        // so the watchdog stays silent on them while any pool profile can still
+        // serve. Only a fresh probed NEGATIVE on the whole pool, the case the
+        // sentinel cannot place, pages the Commander.
+        assert!(fable_blockage_defers_to_sentinel(
+            "fable-limit-paraphrase",
+            false
+        ));
+        assert!(fable_blockage_defers_to_sentinel("fable-credit-out", false));
+        assert!(!fable_blockage_defers_to_sentinel(
+            "fable-limit-paraphrase",
+            true
+        ));
+        assert!(!fable_blockage_defers_to_sentinel("fable-credit-out", true));
+        assert!(!fable_blockage_defers_to_sentinel(
+            "fable-subagent-model",
+            false
+        ));
+        assert!(!fable_blockage_defers_to_sentinel(
+            "fable-downgrade-verb",
+            false
+        ));
     }
 }
