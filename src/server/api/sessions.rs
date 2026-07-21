@@ -423,6 +423,26 @@ fn is_wo_shaped(message: &str) -> bool {
     })
 }
 
+/// True when the message is a terse status report rather than an assignment:
+/// the fleet report contract opens with a `STATUS:` line and cites WO numbers
+/// as evidence pointers. See per-dev WO #529.
+fn is_report_shaped(message: &str) -> bool {
+    message
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| {
+            let head = l.trim_start();
+            head.len() >= 7 && head[..7].eq_ignore_ascii_case("status:")
+        })
+}
+
+/// A send counts as a work-order dispatch only when it is WO shaped and not a
+/// status report; stamping reports flagged the manager goal_stale after every
+/// worker report. See per-dev WO #529.
+fn is_wo_dispatch(message: &str) -> bool {
+    is_wo_shaped(message) && !is_report_shaped(message)
+}
+
 impl SessionResponse {
     /// Build a response from a session instance plus the user's current
     /// Claude Code fullscreen-renderer preference.
@@ -9412,6 +9432,25 @@ mod tests {
     }
 
     #[test]
+    fn report_shaped_message_is_not_a_dispatch() {
+        // per-dev WO #529 defect: the terse report contract requires workers
+        // to cite WO numbers ("STATUS: shipped, WO#529 ..."), so stamping
+        // report-shaped sends as dispatches flagged the manager goal_stale
+        // after every worker report. A message whose first non-empty line
+        // opens with STATUS: is a report, never a dispatch.
+        assert!(!is_wo_dispatch(
+            "STATUS: shipped — WO#529 goal-enforcement\nEVIDENCE: fork 2614319d"
+        ));
+        assert!(!is_wo_dispatch("  status: blocked on WO#530 creds"));
+        assert!(!is_wo_dispatch(
+            "\nSTATUS: in-progress — work order underway"
+        ));
+        assert!(is_wo_dispatch("WO#530: build the thing"));
+        assert!(is_wo_dispatch("New work order: fix the STATUS page"));
+        assert!(!is_wo_dispatch("hello world"));
+    }
+
+    #[test]
     fn public_create_session_error_forwards_whitelisted_git_errors() {
         let dup: anyhow::Error =
             GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo"))
@@ -11634,10 +11673,10 @@ pub async fn send_message(
     let sync_base = instance.clone();
     let tool = instance.tool.clone();
     let message_for_log = req.message.clone();
-    // Work-order shaped sends stamp `last_wo_dispatch_at` on the success
+    // Work-order dispatches stamp `last_wo_dispatch_at` on the success
     // path so goal-staleness (WO #529) can compare dispatch time against
-    // the last goal write.
-    let wo_dispatch_at = is_wo_shaped(&req.message).then(chrono::Utc::now);
+    // the last goal write; status reports never count.
+    let wo_dispatch_at = is_wo_dispatch(&req.message).then(chrono::Utc::now);
     let message = req.message;
     let revive = req.revive;
     let send_result = tokio::task::spawn_blocking(move || -> SendKeysResult {
