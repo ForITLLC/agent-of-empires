@@ -1099,6 +1099,22 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
 
+    /// When `goal` was last set via `PATCH /api/sessions/{id}/goal`. `None`
+    /// for goals written before this field existed. Compared against
+    /// `last_wo_dispatch_at` to derive the wire-level `goal_stale` flag, so
+    /// a manager can see a worker still running under a pre-assignment
+    /// objective. See per-dev WO #529.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_updated_at: Option<DateTime<Utc>>,
+
+    /// When a work-order shaped message (`WO#<n>` or "work order" in the
+    /// body) last flowed to this session through the daemon's send API.
+    /// Stamped by `send_message`; a dispatch newer than `goal_updated_at`
+    /// that outlives the grace window marks the goal stale. See per-dev
+    /// WO #529.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_wo_dispatch_at: Option<DateTime<Utc>>,
+
     /// How this session is rendered: `Structured` (ACP native rendering) or
     /// `Terminal` (raw tmux pane). When `Structured`, aoe spawns an ACP agent
     /// subprocess and renders structured events natively; tmux integration is
@@ -1777,6 +1793,8 @@ impl Instance {
             base_branch_override: None,
             color: None,
             goal: None,
+            goal_updated_at: None,
+            last_wo_dispatch_at: None,
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
@@ -2335,6 +2353,12 @@ impl Instance {
         }
         if pre.goal != post.goal {
             self.goal = post.goal.clone();
+        }
+        if pre.goal_updated_at != post.goal_updated_at {
+            self.goal_updated_at = post.goal_updated_at;
+        }
+        if pre.last_wo_dispatch_at != post.last_wo_dispatch_at {
+            self.last_wo_dispatch_at = post.last_wo_dispatch_at;
         }
         // Worktree workdir edit (move dir / rename branch) mutates these two;
         // both the TUI and the CLI can write them, so they go through the

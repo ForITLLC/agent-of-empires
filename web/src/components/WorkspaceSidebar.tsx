@@ -1687,6 +1687,99 @@ export const SessionRow = memo(function SessionRow({
                   {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
                 </>
               )}
+              {hasDraft && (
+                <span title="Unsent draft" aria-label="Unsent draft" className="inline-flex shrink-0">
+                  <Pencil className="h-3 w-3 text-amber-400/90" />
+                </span>
+              )}
+              {workspace.sessions.some((s) => s.goal_missing || s.goal_stale) && (
+                <span
+                  title={
+                    workspace.sessions.some((s) => s.goal_missing)
+                      ? "No goal set for this active session"
+                      : "Goal predates the latest work-order dispatch"
+                  }
+                  aria-label={workspace.sessions.some((s) => s.goal_missing) ? "No goal" : "Stale goal"}
+                  data-testid="sidebar-session-goal-flag"
+                  className="inline-flex shrink-0 items-center rounded border border-rose-700/40 bg-rose-950/30 px-1 text-[10px] font-mono font-medium text-rose-300"
+                >
+                  {workspace.sessions.some((s) => s.goal_missing) ? "no goal" : "stale goal"}
+                </span>
+              )}
+              {queuedCount > 0 && (
+                <span
+                  title={`${queuedCount} queued prompt${queuedCount === 1 ? "" : "s"}`}
+                  aria-label={`${queuedCount} queued`}
+                  className="inline-flex shrink-0 items-center rounded border border-sky-700/40 bg-sky-950/30 px-1 text-[10px] font-mono font-medium tabular-nums text-sky-300"
+                >
+                  {queuedCount}
+                </span>
+              )}
+              {rateLimited && (
+                <span
+                  title={rateLimitTitle}
+                  aria-label={rateLimitTitle}
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-orange-700/40 bg-orange-950/30 px-1 text-[10px] font-mono font-medium text-orange-300"
+                >
+                  <Hourglass className="h-3 w-3" />
+                  {rateLimited.count > 1 && <span className="tabular-nums">{rateLimited.count}</span>}
+                  {rateLimitResetLabel && <span>{rateLimitResetLabel}</span>}
+                </span>
+              )}
+              {effectiveArchived && (
+                <span
+                  title="Archived"
+                  aria-label="Archived"
+                  className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                >
+                  <Archive className="h-3 w-3" />
+                  <span className="hidden sm:inline">archived</span>
+                </span>
+              )}
+              {!effectiveArchived && effectiveSnoozed && effectiveSnoozedUntil && (
+                <span
+                  title={`Snoozed until ${new Date(effectiveSnoozedUntil).toLocaleString()}`}
+                  aria-label="Snoozed"
+                  className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                >
+                  <Moon className="h-3 w-3" />
+                  <span>{formatSnoozeRemainingShort(effectiveSnoozedUntil)}</span>
+                </span>
+              )}
+              {firstSession?.view === "structured" && firstSession.acp_worker_state === "resuming" && (
+                <span
+                  title="Structured view worker is resuming"
+                  aria-label="Resuming"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
+                >
+                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
+                  Resuming
+                </span>
+              )}
+              {firstSession?.smart_rename === "pending" && (
+                <span
+                  title="Will auto-name this session from your first message"
+                  aria-label="Will auto-name"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                >
+                  <Sparkles className="h-3 w-3" />
+                  <span className="hidden sm:inline">Auto-name</span>
+                </span>
+              )}
+              {firstSession?.smart_rename === "running" && (
+                <span
+                  title="Generating a name from your first message"
+                  aria-label="Naming"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
+                >
+                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
+                  Naming…
+                </span>
+              )}
+              {firstSession?.next_wakeup_at && (
+                <WakeupCountdown wakeAt={firstSession.next_wakeup_at} reason={firstSession.next_wakeup_reason} />
+              )}
+              {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
             </span>
             {/* Sub-rows (plugin line, plan progress, multi-repo chips) add
                 height/clutter that does not belong in the slim rail (#2288). */}

@@ -81,6 +81,17 @@ pub struct SessionResponse {
     /// session list without a second round trip. See per-dev WO #70.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
+    /// True when an active (Running/Waiting/Idle, not archived or trashed)
+    /// session has no goal set. Always serialized, like `urgent`, so fleet
+    /// tooling can page on it without probing for field absence. See
+    /// per-dev WO #529.
+    pub goal_missing: bool,
+    /// True when the session has a goal but a work-order shaped message was
+    /// dispatched to it after the goal was last set, and that dispatch is
+    /// older than the grace window: the worker is running under a
+    /// pre-assignment objective. Always serialized, like `urgent`. See
+    /// per-dev WO #529.
+    pub goal_stale: bool,
     pub is_sandboxed: bool,
     /// True when the session was created with `--scratch`; the
     /// `project_path` points at an auto-provisioned directory under
@@ -362,6 +373,56 @@ pub struct CleanupDefaults {
     pub delete_to_trash: bool,
 }
 
+/// Grace window, in seconds, between a work-order dispatch and the
+/// `goal_stale` flag raising. Gives the worker time to record a goal for the
+/// new assignment before fleet tooling pages the manager. See per-dev
+/// WO #529.
+const GOAL_STALE_GRACE_SECS: i64 = 600;
+
+/// The goal flags only apply to sessions a manager expects to be working:
+/// alive lifecycle status, not archived, not trashed.
+fn goal_flags_apply(inst: &Instance) -> bool {
+    matches!(
+        inst.status,
+        Status::Running | Status::Waiting | Status::Idle
+    ) && inst.archived_at.is_none()
+        && inst.trashed_at.is_none()
+}
+
+/// True when the session has a goal but a work-order dispatch newer than the
+/// last goal write has outlived the grace window: the worker is running under
+/// a pre-assignment objective. A missing `goal_updated_at` (legacy record)
+/// reads as the epoch, so any aged dispatch flags it; records that never saw
+/// a dispatch never flag. See per-dev WO #529.
+fn goal_stale_at(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if inst.goal.is_none() || !goal_flags_apply(inst) {
+        return false;
+    }
+    let Some(dispatched) = inst.last_wo_dispatch_at else {
+        return false;
+    };
+    let goal_set = inst
+        .goal_updated_at
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+    dispatched > goal_set && (now - dispatched).num_seconds() >= GOAL_STALE_GRACE_SECS
+}
+
+/// A message is work-order shaped when it names a WO number (`wo#<digits>`,
+/// case-insensitive, at a word boundary) or says "work order". Deliberately
+/// narrow: the daemon has no WO registry, so message shape is the only
+/// dispatch signal available server-side. See per-dev WO #529.
+fn is_wo_shaped(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    if lower.contains("work order") {
+        return true;
+    }
+    let bytes = lower.as_bytes();
+    lower.match_indices("wo#").any(|(i, _)| {
+        let at_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        at_boundary && bytes.get(i + 3).is_some_and(|b| b.is_ascii_digit())
+    })
+}
+
 impl SessionResponse {
     /// Build a response from a session instance plus the user's current
     /// Claude Code fullscreen-renderer preference.
@@ -432,6 +493,8 @@ impl SessionResponse {
                 .and_then(|w| w.base_branch.clone()),
             base_branch_override: inst.base_branch_override.clone(),
             goal: inst.goal.clone(),
+            goal_missing: inst.goal.is_none() && goal_flags_apply(inst),
+            goal_stale: goal_stale_at(inst, chrono::Utc::now()),
             is_sandboxed: inst.is_sandboxed(),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
@@ -2832,6 +2895,9 @@ pub async fn set_session_goal(
         .map(str::to_string);
 
     // Persist first; only mutate memory once disk is durable. See #1589.
+    // The `goal_updated_at` stamp rides along so goal-staleness (WO #529)
+    // is measured from the durable write, not from memory.
+    let stamped_at = chrono::Utc::now();
     let persist_id = id.clone();
     let persist_goal = new_goal.clone();
     if persist_session_update(
@@ -2841,6 +2907,7 @@ pub async fn set_session_goal(
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 inst.goal = persist_goal;
+                inst.goal_updated_at = Some(stamped_at);
             }
         },
     )
@@ -2860,6 +2927,7 @@ pub async fn set_session_goal(
         return persist_failed_response();
     };
     inst.goal = new_goal;
+    inst.goal_updated_at = Some(stamped_at);
 
     (
         StatusCode::OK,
@@ -9270,6 +9338,80 @@ mod tests {
     }
 
     #[test]
+    fn goal_missing_flags_active_goalless_session() {
+        // per-dev WO #529: an active session with no goal must surface
+        // goal_missing on the wire so fleet tooling can page the manager.
+        let inst = make_test_instance();
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert!(resp.goal_missing, "active goalless session must flag");
+        assert!(!resp.goal_stale, "no goal means nothing can be stale");
+    }
+
+    #[test]
+    fn goal_missing_clears_when_goal_set_or_session_inactive() {
+        let mut with_goal = make_test_instance();
+        with_goal.goal = Some("ship the goal enforcement".to_string());
+        assert!(!SessionResponse::from_instance(&with_goal, false).goal_missing);
+
+        let mut archived = make_test_instance();
+        archived.archived_at = Some(chrono::Utc::now());
+        assert!(!SessionResponse::from_instance(&archived, false).goal_missing);
+
+        let mut stopped = make_test_instance();
+        stopped.status = Status::Stopped;
+        assert!(!SessionResponse::from_instance(&stopped, false).goal_missing);
+    }
+
+    #[test]
+    fn goal_stale_matrix() {
+        use chrono::Duration;
+        let now = chrono::Utc::now();
+        let mut inst = make_test_instance();
+        inst.goal = Some("old objective".to_string());
+
+        // A work-order dispatch newer than the goal, outside the grace
+        // window: the goal predates the latest assignment, so it is stale.
+        inst.goal_updated_at = Some(now - Duration::seconds(3600));
+        inst.last_wo_dispatch_at = Some(now - Duration::seconds(GOAL_STALE_GRACE_SECS + 60));
+        assert!(goal_stale_at(&inst, now), "dispatch after goal must flag");
+
+        // Goal refreshed after the dispatch: current again.
+        inst.goal_updated_at = Some(now - Duration::seconds(30));
+        assert!(!goal_stale_at(&inst, now), "refreshed goal must clear");
+
+        // Dispatch still inside the grace window: the worker gets time to
+        // set its goal before the flag raises.
+        inst.goal_updated_at = Some(now - Duration::seconds(3600));
+        inst.last_wo_dispatch_at = Some(now - Duration::seconds(GOAL_STALE_GRACE_SECS - 60));
+        assert!(!goal_stale_at(&inst, now), "grace window must suppress");
+
+        // No dispatch ever observed: nothing to compare against.
+        inst.last_wo_dispatch_at = None;
+        assert!(!goal_stale_at(&inst, now), "no dispatch means not stale");
+
+        // Legacy record: goal present but never stamped. A sufficiently old
+        // dispatch still flags it (missing stamp reads as the epoch).
+        inst.goal_updated_at = None;
+        inst.last_wo_dispatch_at = Some(now - Duration::seconds(GOAL_STALE_GRACE_SECS + 60));
+        assert!(goal_stale_at(&inst, now), "unstamped legacy goal must flag");
+
+        // Archived sessions never flag.
+        inst.archived_at = Some(now);
+        assert!(!goal_stale_at(&inst, now), "archived session must not flag");
+    }
+
+    #[test]
+    fn wo_shaped_message_detection() {
+        assert!(is_wo_shaped("WO#529: enforce goals everywhere"));
+        assert!(is_wo_shaped("continuing wo#12 from earlier"));
+        assert!(is_wo_shaped("New WORK ORDER for your lane"));
+        assert!(is_wo_shaped("work order: fix the daemon"));
+        assert!(!is_wo_shaped("hello world"));
+        assert!(!is_wo_shaped("wow #5 nice result"));
+        assert!(!is_wo_shaped("WO# with no number after it"));
+    }
+
+    #[test]
     fn public_create_session_error_forwards_whitelisted_git_errors() {
         let dup: anyhow::Error =
             GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo"))
@@ -11492,6 +11634,10 @@ pub async fn send_message(
     let sync_base = instance.clone();
     let tool = instance.tool.clone();
     let message_for_log = req.message.clone();
+    // Work-order shaped sends stamp `last_wo_dispatch_at` on the success
+    // path so goal-staleness (WO #529) can compare dispatch time against
+    // the last goal write.
+    let wo_dispatch_at = is_wo_shaped(&req.message).then(chrono::Utc::now);
     let message = req.message;
     let revive = req.revive;
     let send_result = tokio::task::spawn_blocking(move || -> SendKeysResult {
@@ -11611,6 +11757,9 @@ pub async fn send_message(
                     apply_post_restart_sync(i, &sync_base, &started);
                 }
                 i.touch_last_accessed();
+                if let Some(at) = wo_dispatch_at {
+                    i.last_wo_dispatch_at = Some(at);
+                }
                 i.source_profile.clone()
             } else {
                 // Session was deleted between the send and the stamp; nothing
@@ -11634,6 +11783,9 @@ pub async fn send_message(
                                 );
                             }
                             disk_inst.touch_last_accessed();
+                            if let Some(at) = wo_dispatch_at {
+                                disk_inst.last_wo_dispatch_at = Some(at);
+                            }
                         }
                         Ok(())
                     }) {
@@ -12058,6 +12210,8 @@ mod workspace_ordering_tests {
             base_branch: None,
             base_branch_override: None,
             goal: None,
+            goal_missing: false,
+            goal_stale: false,
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,

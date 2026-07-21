@@ -62,6 +62,16 @@ export interface SessionResponse {
    *  Optional so older payloads and test fixtures without the field read as
    *  not-urgent. See #1640. */
   urgent?: boolean;
+  /** True when the session is active (Running / Waiting / Idle, not
+   *  archived or trashed) but has no goal set. Server-derived; the
+   *  sidebar renders a "no goal" chip so goal-less workers are visible
+   *  at a glance. Optional so older payloads read as not-flagged. */
+  goal_missing?: boolean;
+  /** True when the session has a goal but a work-order-shaped dispatch
+   *  arrived after the goal was last written (with a grace window), so
+   *  the goal likely predates the work the session is actually doing.
+   *  Server-derived; optional for older payloads. */
+  goal_stale?: boolean;
   /** RFC3339 timestamp at which the session was web-pinned, or null /
    *  undefined when not pinned. Distinct from `favorited`: favorite is
    *  the TUI within-tier attention-sort signal; pin is the hard
