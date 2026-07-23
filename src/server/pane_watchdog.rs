@@ -101,12 +101,14 @@ pub(crate) fn fable_scan_hit(extra_args: &str, content: &str) -> Option<(String,
 
 /// The hard account draw order for cap relocation. Sessions on profiles
 /// outside this pool are never auto-moved (escalate only).
-pub(crate) const DRAW_ORDER: [&str; 5] = [
+pub(crate) const DRAW_ORDER: [&str; 7] = [
     "forit-main",
     "forit-backup",
     "gna-main",
     "xce-main",
     "RAS-Main",
+    "RAS-Work",
+    "bp-main",
 ];
 
 /// Pick the relocation target for a capped session: the first profile in
@@ -163,7 +165,8 @@ pub(crate) fn parked_wake(
         (
             "capped-all-accounts",
             format!(
-                "capped [{kind}] session '{title}' ({id}) on '{profile}' PARKED: ALL 5 pool accounts hold fresh probed NEGATIVE headroom claims. A credits escalation is warranted"
+                "capped [{kind}] session '{title}' ({id}) on '{profile}' PARKED: ALL {} pool accounts hold fresh probed NEGATIVE headroom claims. A credits escalation is warranted",
+                DRAW_ORDER.len()
             ),
         )
     } else {
@@ -3006,7 +3009,7 @@ and enter the code H7Q2K9F4P to authenticate.
         // relay to Ben (the WO#449 phantom top-up pages).
         let (kind, reason) = parked_wake(true, "credit", "for-tasks", "381b98ed", "xce-main");
         assert_eq!(kind, "capped-all-accounts");
-        assert!(reason.contains("ALL 5 pool accounts"), "{reason}");
+        assert!(reason.contains("ALL 7 pool accounts"), "{reason}");
         assert!(reason.to_lowercase().contains("probed"), "{reason}");
 
         let (kind, reason) = parked_wake(false, "credit", "for-tasks", "381b98ed", "xce-main");
