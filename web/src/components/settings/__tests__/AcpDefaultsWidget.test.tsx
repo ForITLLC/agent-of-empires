@@ -56,6 +56,23 @@ function catalog(agents: Record<string, unknown>) {
   return { version: 1, agents };
 }
 
+const CODEX_ENTRY = {
+  updated_at: "2026-07-20T00:00:00Z",
+  options: [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      current_value: "",
+      options: [
+        { value: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+        { value: "gpt-5.5", name: "GPT-5.5" },
+        { value: "o3", name: "o3" },
+      ],
+    },
+  ],
+};
+
 const OPENCODE_ENTRY = {
   updated_at: "2026-07-03T00:00:00Z",
   options: [
@@ -95,6 +112,30 @@ it("renders a model dropdown from the catalog and saves the selection", async ()
   expect(Array.from(select.options).map((o) => o.value)).toEqual(["", "openai/gpt-5.5", "anthropic/opus"]);
   fireEvent.change(select, { target: { value: "anthropic/opus" } });
   expect(save).toHaveBeenCalledWith({ opencode: { model: "anthropic/opus" } });
+});
+
+it("locks Default model to the profile's extra_args pin instead of a selectable dropdown", async () => {
+  // A profile that pins the codex model via `agent_extra_args` (`-m gpt-5.6-sol`)
+  // must NOT expose a selectable model dropdown, even though the recall catalog
+  // advertises several models. The control collapses to the single pinned value,
+  // disabled, so the one-profile-one-model contract is honored in the UI.
+  vi.mocked(api.fetchAgents).mockResolvedValue([agent("codex")] as never);
+  vi.mocked(api.fetchAcpOptionCatalog).mockResolvedValue({
+    version: 1,
+    agents: { codex: CODEX_ENTRY },
+    pinned_models: { codex: "gpt-5.6-sol" },
+  } as never);
+  const save = vi.fn();
+  render(<AcpDefaultsWidget descriptor={DESCRIPTOR} value={{}} save={save} profile="codex" />);
+  const select = await controlByLabel<HTMLSelectElement>("Default model", "select");
+  expect(select.disabled).toBe(true);
+  expect(Array.from(select.options).map((o) => o.value)).toEqual(["gpt-5.6-sol"]);
+  expect(select.value).toBe("gpt-5.6-sol");
+});
+
+it("passes the selected profile to the option-catalog fetch", async () => {
+  render(<AcpDefaultsWidget descriptor={DESCRIPTOR} value={{}} save={vi.fn()} profile="codex" />);
+  await waitFor(() => expect(api.fetchAcpOptionCatalog).toHaveBeenCalledWith("codex"));
 });
 
 it("falls back to a free-text input when the catalog has no options for the agent", async () => {

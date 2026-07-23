@@ -666,6 +666,7 @@ export function SettingsView({
                 focusRequest={focusRequest}
                 values={session}
                 onSaveField={saveSubField}
+                selectedProfile={selectedProfile}
                 onAfterSave={(descriptor) => {
                   if (descriptor.field === "row_tag" || descriptor.field === "show_session_colors") {
                     return onSettingsRefresh();

@@ -46,6 +46,10 @@ interface Props {
    *  fields (denylist). Both apply on top of the local_only skip. See #7. */
   onlyFields?: string[];
   hideFields?: string[];
+  /** The profile currently selected in the settings view (empty for global
+   *  scope). Forwarded to custom widgets whose options are profile-scoped
+   *  (e.g. the acp defaults widget locks a profile's pinned model). */
+  selectedProfile?: string;
 }
 
 /** Client-side list-entry validator derived from the server's validation rule,
@@ -89,6 +93,7 @@ function renderField(
   d: SettingsFieldDescriptor,
   values: Record<string, unknown>,
   save: (value: unknown) => Promise<boolean>,
+  selectedProfile?: string,
 ) {
   const raw = values[d.field];
   const description = describe(d);
@@ -220,7 +225,9 @@ function renderField(
       if (!Widget) {
         return <UnsupportedCustomWidget key={d.field} d={d} id={widget.id} />;
       }
-      return <Widget key={d.field} descriptor={{ ...d, description }} value={raw} save={save} />;
+      return (
+        <Widget key={d.field} descriptor={{ ...d, description }} value={raw} save={save} profile={selectedProfile} />
+      );
     }
   }
 }
@@ -244,6 +251,7 @@ export function SchemaSection({
   fieldAnchor,
   onlyFields,
   hideFields,
+  selectedProfile,
 }: Props) {
   const fields = schema.filter(
     (d) =>
@@ -312,10 +320,10 @@ export function SchemaSection({
 
   return (
     <div className="space-y-4">
-      {primary.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
+      {primary.map((d) => wrap(d, renderField(d, values, makeSave(d), selectedProfile)))}
       {advanced.length > 0 && (
         <CollapsibleSection title="Advanced" subtitle={advancedSubtitle} defaultOpen={targetAdvanced}>
-          {advanced.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
+          {advanced.map((d) => wrap(d, renderField(d, values, makeSave(d), selectedProfile)))}
         </CollapsibleSection>
       )}
     </div>

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -890,16 +890,50 @@ fn acp_agent_entries(
     entries
 }
 
-/// `GET /api/acp/option-catalog`: the recall cache of `config_options` each
-/// agent last advertised (model / mode / thinking choices), keyed by agent
-/// name. The per-agent defaults settings page reads this so its dropdowns can
-/// be populated without a live session. Empty until an agent has run at least
-/// once. See #2631.
-pub async fn get_option_catalog() -> impl IntoResponse {
+/// Optional `?profile=<name>` selector for the option-catalog endpoint. Absent
+/// falls back to the daemon's active profile, so the settings page can request
+/// the pins for whichever profile it is editing (a codex profile pins its
+/// model, the default profile does not).
+#[derive(Deserialize)]
+pub struct OptionCatalogQuery {
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+/// The option-catalog response: the recall cache flattened at the top level
+/// (`version` + `agents`) plus `pinned_models`, the per-agent `--model` pins
+/// resolved from the selected profile's `session.agent_extra_args`. The web
+/// picker greys out any dropdown whose agent appears in `pinned_models`.
+/// `pinned_models` is omitted when empty so non-pinning profiles carry no key.
+#[derive(Serialize)]
+struct OptionCatalogResponse {
+    #[serde(flatten)]
+    catalog: crate::acp::option_catalog::OptionCatalog,
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pinned_models: std::collections::HashMap<String, String>,
+}
+
+/// `GET /api/acp/option-catalog[?profile=<name>]`: the recall cache of
+/// `config_options` each agent last advertised (model / mode / thinking
+/// choices), keyed by agent name, plus the selected profile's per-agent
+/// `--model` pins. The per-agent defaults settings page reads this so its
+/// dropdowns can be populated (and model-locked) without a live session. The
+/// cache is empty until an agent has run at least once; the pins come straight
+/// from config so they are present immediately. See #2631.
+pub async fn get_option_catalog(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OptionCatalogQuery>,
+) -> impl IntoResponse {
     let catalog = tokio::task::spawn_blocking(crate::acp::option_catalog::load)
         .await
         .unwrap_or_default();
-    Json(catalog).into_response()
+    let profile = query.profile.unwrap_or_else(|| state.profile.clone());
+    let pinned_models = crate::server::api::plugin_settings::extra_args_model_pins(&profile).await;
+    Json(OptionCatalogResponse {
+        catalog,
+        pinned_models,
+    })
+    .into_response()
 }
 
 /// Atomically move a structured view session from one ACP backend to another.

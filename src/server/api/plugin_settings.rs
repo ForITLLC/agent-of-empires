@@ -298,6 +298,36 @@ async fn pinned_model_for_agent(profile: &str, agent: &str) -> Option<String> {
     .flatten()
 }
 
+/// Build the model-pin map that locks a settings model dropdown: for each
+/// `(agent, extra_args)` pair, an agent whose extra-args carry a `--model` /
+/// `-m` flag maps to that model; agents without a flag are absent. This reads
+/// `session.agent_extra_args` ONLY, never `acp_defaults.model` — the latter is
+/// the value the picker itself edits, so it can never be the lock signal. The
+/// pin is per-session-immutable; the dropdown collapses to it because a pinned
+/// agent always spawns on that model (escalate post-create via `set-model`).
+fn model_pins_from_extra_args<'a>(
+    extra_args: impl Iterator<Item = (&'a String, &'a String)>,
+) -> std::collections::HashMap<String, String> {
+    extra_args
+        .filter_map(|(agent, args)| parse_model_flag(args).map(|m| (agent.clone(), m)))
+        .collect()
+}
+
+/// The per-agent extra-args model pins for `profile`, resolved off the async
+/// runtime (global -> profile, no repo). Feeds the settings option-catalog so
+/// the web picker can lock a dropdown whose agent is pinned by `--model`.
+pub(crate) async fn extra_args_model_pins(
+    profile: &str,
+) -> std::collections::HashMap<String, String> {
+    let profile = profile.to_string();
+    tokio::task::spawn_blocking(move || {
+        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        model_pins_from_extra_args(config.session.agent_extra_args.iter())
+    })
+    .await
+    .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +431,22 @@ mod tests {
         // dangling flag with no value -> no pin (never returns an empty model)
         assert_eq!(parse_model_flag("--model"), None);
         assert_eq!(parse_model_flag("foo --model="), None);
+    }
+
+    #[test]
+    fn model_pins_from_extra_args_pins_only_flagged_agents() {
+        // Only agents whose extra-args carry a `--model` / `-m` flag get a pin;
+        // an agent with no model flag is absent. This is the signal the settings
+        // option-catalog uses to lock a model dropdown, and it deliberately
+        // ignores `acp_defaults.model` (which the widget itself edits).
+        let mut extra: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        extra.insert("codex".to_string(), "-m gpt-5.6-sol".to_string());
+        extra.insert("claude".to_string(), "--model claude-opus-4-8".to_string());
+        extra.insert("opencode".to_string(), "--port 8080".to_string());
+        let pins = model_pins_from_extra_args(extra.iter());
+        assert_eq!(pins.get("codex"), Some(&"gpt-5.6-sol".to_string()));
+        assert_eq!(pins.get("claude"), Some(&"claude-opus-4-8".to_string()));
+        assert_eq!(pins.get("opencode"), None);
+        assert_eq!(pins.len(), 2);
     }
 }

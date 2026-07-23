@@ -1436,10 +1436,20 @@ export interface AgentOptionEntry {
 export interface AcpOptionCatalog {
   version: number;
   agents: Record<string, AgentOptionEntry>;
+  /** Per-agent model pins resolved from the target profile's
+   *  `session.agent_extra_args` (`-m` / `--model`). Present when the catalog is
+   *  fetched for a specific profile; a pinned agent's model is fixed and the
+   *  settings UI must render it locked rather than as a selectable dropdown. */
+  pinned_models?: Record<string, string>;
 }
 
-export async function fetchAcpOptionCatalog(): Promise<AcpOptionCatalog> {
-  return (await fetchJson<AcpOptionCatalog>("/api/acp/option-catalog")) ?? { version: 1, agents: {} };
+/** Fetch the recall option catalog. When `profile` is given the response also
+ *  carries `pinned_models` resolved from that profile's `agent_extra_args`, so
+ *  the caller can lock any pinned model in the UI. Omitting `profile` resolves
+ *  against the daemon's own profile. */
+export async function fetchAcpOptionCatalog(profile?: string): Promise<AcpOptionCatalog> {
+  const qs = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+  return (await fetchJson<AcpOptionCatalog>(`/api/acp/option-catalog${qs}`)) ?? { version: 1, agents: {} };
 }
 
 // --- Acp switch agent ---

@@ -12,7 +12,7 @@
 import { useEffect, useState } from "react";
 
 import { fetchAcpOptionCatalog, fetchAgents } from "../../lib/api";
-import type { AgentOptionEntry } from "../../lib/api";
+import type { AcpOptionCatalog, AgentOptionEntry } from "../../lib/api";
 import type { ConfigOptionCategory, ConfigOptionDescriptor } from "../../lib/acpTypes";
 import type { AgentInfo } from "../../lib/types";
 import type { CustomWidgetProps } from "./customWidgets";
@@ -81,6 +81,7 @@ function OptionField({
   onChange,
   defaultLabel,
   placeholder,
+  lockedValue,
 }: {
   label: string;
   descriptor: ConfigOptionDescriptor | undefined;
@@ -88,7 +89,23 @@ function OptionField({
   onChange: (v: string) => void;
   defaultLabel: string;
   placeholder: string;
+  /** When set, the field is pinned to this value (e.g. a profile's
+   *  `agent_extra_args` model pin) and renders as a single-option, disabled
+   *  dropdown rather than a selectable list. */
+  lockedValue?: string;
 }) {
+  if (lockedValue) {
+    return (
+      <SelectField
+        label={label}
+        description="Pinned by this profile (agent_extra_args -m); not selectable here."
+        value={lockedValue}
+        onChange={() => {}}
+        options={[{ value: lockedValue, label: lockedValue }]}
+        disabled
+      />
+    );
+  }
   if (descriptor && descriptor.options.length > 0) {
     return (
       <SelectField
@@ -107,11 +124,15 @@ function AgentDefaultsCard({
   entry,
   defaults,
   onChange,
+  pinnedModel,
 }: {
   agent: AgentInfo;
   entry: AgentOptionEntry | undefined;
   defaults: AcpAgentDefaults;
   onChange: (next: AcpAgentDefaults) => void;
+  /** Model pinned for this agent by the target profile's `agent_extra_args`
+   *  (`-m`); when present the "Default model" control is locked to it. */
+  pinnedModel?: string;
 }) {
   const modelDesc = optionByCategory(entry?.options, "model");
   const modeDesc = optionByCategory(entry?.options, "mode");
@@ -156,6 +177,7 @@ function AgentDefaultsCard({
         onChange={(v) => set({ model: v || undefined })}
         defaultLabel="Adapter default"
         placeholder="e.g. openai/gpt-5.5"
+        lockedValue={pinnedModel}
       />
       <OptionField
         label="Default mode"
@@ -239,9 +261,10 @@ function AgentDefaultsCard({
   );
 }
 
-export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function AcpDefaultsWidget({ descriptor, value, save, profile }: CustomWidgetProps) {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [catalog, setCatalog] = useState<Record<string, AgentOptionEntry>>({});
+  const [pinnedModels, setPinnedModels] = useState<Record<string, string>>({});
   const [rawOpen, setRawOpen] = useState(false);
   const [rawText, setRawText] = useState("");
   const [rawError, setRawError] = useState<string | null>(null);
@@ -251,16 +274,17 @@ export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps
     void (async () => {
       const [a, c] = await Promise.all([
         fetchAgents().catch(() => [] as AgentInfo[]),
-        fetchAcpOptionCatalog().catch(() => ({ version: 1, agents: {} })),
+        fetchAcpOptionCatalog(profile).catch((): AcpOptionCatalog => ({ version: 1, agents: {} })),
       ]);
       if (!alive) return;
       setAgents(a);
       setCatalog(c.agents ?? {});
+      setPinnedModels(c.pinned_models ?? {});
     })();
     return () => {
       alive = false;
     };
-  }, []);
+  }, [profile]);
 
   const map = asMap(value);
   // ACP-capable agents drive the cards; a saved default for an agent no longer
@@ -294,6 +318,7 @@ export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps
             entry={catalog[agent.name]}
             defaults={map[agent.name] ?? {}}
             onChange={(next) => saveAgent(agent.name, next)}
+            pinnedModel={pinnedModels[agent.name]}
           />
         ))
       )}

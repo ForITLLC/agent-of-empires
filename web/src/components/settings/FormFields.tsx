@@ -154,6 +154,7 @@ export function SelectField({
   onChange,
   options,
   labelClassName,
+  disabled,
 }: {
   label: string;
   description?: string;
@@ -164,6 +165,10 @@ export function SelectField({
    *  (used by the Logging panel to render heavier section labels).
    *  Pass `""` to suppress the label element entirely. */
   labelClassName?: string;
+  /** Render the control read-only (a locked, non-interactive dropdown). Used
+   *  when a value is pinned upstream (e.g. a profile's `agent_extra_args`
+   *  model pin) and must not be user-editable. */
+  disabled?: boolean;
 }) {
   return (
     <div>
@@ -172,7 +177,8 @@ export function SelectField({
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
+        disabled={disabled}
+        className="w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary focus:border-brand-600 focus:outline-none disabled:opacity-60 disabled:cursor-not-allowed"
       >
         {options.map((opt) => (
           <option key={opt.value} value={opt.value}>

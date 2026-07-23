@@ -16,6 +16,11 @@ export interface CustomWidgetProps {
    *  Returns the save result (a Promise<boolean> in practice) so a widget can
    *  gate a side-effect on success. */
   save: (value: unknown) => Promise<boolean> | unknown;
+  /** The profile currently selected in the settings view (empty/undefined for
+   *  the global scope). Widgets whose options depend on profile-scoped config
+   *  (e.g. the acp defaults widget, which locks profile-pinned models) thread
+   *  it into their catalog fetch. */
+  profile?: string;
 }
 
 export type CustomSettingsWidget = (props: CustomWidgetProps) => React.ReactElement;
