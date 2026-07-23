@@ -3723,6 +3723,18 @@ impl Instance {
         override_if_distinct(self.agent_session_id.as_deref(), live)
     }
 
+    /// The `--model` / `-m` flag to append at terminal launch so this session
+    /// inherits its profile's pinned model when it carries no explicit
+    /// per-session model. `None` when `extra_args` already pins a model (a
+    /// `set-model` escalation, a user-typed `--model`) or the profile pins none.
+    /// See `config::launch_model_flag_injection`.
+    fn profile_model_flag_injection(&self) -> Option<String> {
+        let profile = self.effective_profile();
+        let cfg = super::profile_config::resolve_config_or_warn(&profile);
+        let pin = cfg.session.agent_extra_args.get(&self.tool);
+        super::config::launch_model_flag_injection(&self.extra_args, pin.map(String::as_str))
+    }
+
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let child = self.agent_session_id.clone();
@@ -4992,6 +5004,15 @@ impl Instance {
                             cmd,
                             super::config::quote_model_value_in_args(&self.extra_args)
                         );
+                    }
+                    // Make the per-profile model pin authoritative at spawn: when
+                    // the session carries no explicit `--model` (empty extra_args,
+                    // or a restart-dialog reseed that dropped it), inherit the
+                    // profile's pinned model instead of the account default. An
+                    // explicit per-session model (set-model escalation) still
+                    // wins. Mirrors `resolve_spawn_model_effort` on the ACP path.
+                    if let Some(model_flag) = self.profile_model_flag_injection() {
+                        cmd = format!("{} {}", cmd, model_flag);
                     }
                     if self.is_yolo_mode() {
                         if let Some(ref yolo) = a.yolo {
@@ -12647,6 +12668,74 @@ mod tests {
         let cmd_str = cmd.unwrap();
         assert!(cmd_str.contains("ses_abc123def456"));
         assert!(cmd_str.contains("--session-id") || cmd_str.contains("--resume"));
+    }
+
+    /// The live restart-dialog bug: a terminal-launched session whose
+    /// `extra_args` carry no `--model` must inherit the profile's pinned model
+    /// at spawn, so cycling the restart dialog can never drop a session onto the
+    /// account default model. Drives the real `build_host_command` against an
+    /// isolated app dir with a written profile pin.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_host_command_injects_profile_model_pin() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let profile_dir = crate::session::get_app_dir()
+            .unwrap()
+            .join("profiles")
+            .join("pinprof");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "[session.agent_extra_args]\nclaude = \"--model claude-opus-4-8\"\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "claude".to_string();
+        inst.source_profile = "pinprof".to_string();
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("claude"), &None)
+            .unwrap();
+        assert!(
+            cmd.as_ref().unwrap().contains("--model claude-opus-4-8"),
+            "profile pin must be injected when the session has no explicit model: {cmd:?}"
+        );
+    }
+
+    /// A per-session model (a set-model escalation to fable, or back to opus)
+    /// lives in `extra_args` and must always beat the profile pin, in either
+    /// direction, so escalations stick across a terminal relaunch.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_host_command_explicit_session_model_beats_pin() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let profile_dir = crate::session::get_app_dir()
+            .unwrap()
+            .join("profiles")
+            .join("pinprof");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "[session.agent_extra_args]\nclaude = \"--model claude-opus-4-8\"\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "claude".to_string();
+        inst.source_profile = "pinprof".to_string();
+        inst.extra_args = "--model fable".to_string();
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("claude"), &None)
+            .unwrap();
+        let cmd_str = cmd.unwrap();
+        assert!(
+            cmd_str.contains("--model fable"),
+            "explicit per-session model must survive: {cmd_str}"
+        );
+        assert!(
+            !cmd_str.contains("claude-opus-4-8"),
+            "profile pin must not clobber an explicit per-session model: {cmd_str}"
+        );
     }
 
     #[test]

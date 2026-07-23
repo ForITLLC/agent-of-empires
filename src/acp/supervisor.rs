@@ -1604,8 +1604,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         // ponytail: resolve here instead of threading model/effort/mode through
         // every SpawnRequest site; revisit if explicit per-request values land.
         let acp_defaults = resolved_cfg.acp.acp_defaults_for(&agent);
-        let (model, effort) =
-            crate::session::config::resolve_spawn_model_effort(acp_defaults, model, effort);
+        let (model, effort) = crate::session::config::resolve_spawn_model_effort(
+            acp_defaults,
+            model,
+            effort,
+            resolved_cfg
+                .session
+                .agent_extra_args
+                .get(&agent)
+                .map(String::as_str),
+        );
         let default_mode = acp_defaults.and_then(|defaults| defaults.mode());
 
         // `Config.environment` is trusted global/profile configuration; repo

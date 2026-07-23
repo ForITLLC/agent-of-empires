@@ -1494,27 +1494,95 @@ impl AcpConfig {
     }
 }
 
-/// Resolve the model + effort a structured-view spawn should use: an explicit
-/// per-request value (trimmed, non-empty) always wins, otherwise the per-agent
-/// structured-view default. Effort is keyed on the resolved model so a
-/// per-model override in `effort_by_model` applies to a defaulted model too.
+/// Resolve the model + effort a structured-view spawn should use. Precedence
+/// for the model: an explicit per-request value (trimmed, non-empty) always
+/// wins; otherwise the per-agent `acp_defaults.model`; otherwise the profile's
+/// `session.agent_extra_args.<agent>` `--model` / `-m` pin (`extra_args_pin`),
+/// so a profile that pins its model only via extra_args (the fleet's pinning
+/// mechanism) is honored at spawn instead of falling through to the account
+/// default. Effort is keyed on the resolved model so a per-model override in
+/// `effort_by_model` applies to a defaulted model too.
 ///
 /// Single source for every spawn path (CLI create, reconciler respawn, web
-/// create); see `AcpConfig::acp_defaults_for`.
+/// create); see `AcpConfig::acp_defaults_for`. The terminal-launch counterpart
+/// is `launch_model_flag_injection`.
 pub fn resolve_spawn_model_effort(
     defaults: Option<&AcpAgentDefaults>,
     req_model: Option<String>,
     req_effort: Option<String>,
+    extra_args_pin: Option<&str>,
 ) -> (Option<String>, Option<String>) {
     let model = req_model
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .or_else(|| defaults.and_then(|d| d.model()));
+        .or_else(|| defaults.and_then(|d| d.model()))
+        .or_else(|| extra_args_pin.and_then(model_value_from_args));
     let effort = req_effort
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .or_else(|| defaults.and_then(|d| d.effort_for_model(model.as_deref())));
     (model, effort)
+}
+
+/// Scan a whitespace-split extra-args string for a `--model` / `-m` flag,
+/// returning `(flag_form, value)`: `flag_form` is the exact substring
+/// (`--model X`, `-m X`, or the joined `--model=X`) so it can be re-appended to
+/// a launch command verbatim; `value` is the bare model id. Handles both spaced
+/// and joined forms; a dangling flag with no following value yields `None`.
+fn scan_model_flag(args: &str) -> Option<(String, String)> {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    for (i, tok) in toks.iter().enumerate() {
+        if tok.starts_with("--model=") || tok.starts_with("-m=") {
+            let value = tok.split_once('=').map(|(_, v)| v).unwrap_or("");
+            if !value.is_empty() {
+                return Some(((*tok).to_string(), value.to_string()));
+            }
+        } else if *tok == "--model" || *tok == "-m" {
+            if let Some(value) = toks.get(i + 1).filter(|v| !v.is_empty()) {
+                return Some((format!("{tok} {value}"), (*value).to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Extract the `--model` / `-m` flag *with its value* from an extra-args string,
+/// preserving the exact flag form so it can be re-appended to a launch command
+/// verbatim (the terminal-launch path). `None` when absent or dangling.
+pub fn extract_model_flag(args: &str) -> Option<String> {
+    scan_model_flag(args).map(|(flag, _)| flag)
+}
+
+/// Extract the bare model *value* (`X`) from a `--model X` / `-m X` /
+/// `--model=X` extra-args string, for surfaces that want the model id rather
+/// than the flag form (the ACP spawn resolver). `None` when absent or dangling.
+pub fn model_value_from_args(args: &str) -> Option<String> {
+    scan_model_flag(args).map(|(_, value)| value)
+}
+
+/// Whether `args` already carries an explicit `--model` / `-m` flag.
+pub fn has_model_flag(args: &str) -> bool {
+    scan_model_flag(args).is_some()
+}
+
+/// The model flag a terminal-session launch must append so the session lands on
+/// the model its profile pins, instead of silently falling through to the
+/// account-default model.
+///
+/// An explicit model already in the session's own `extra_args` (a
+/// `aoe session set-model` escalation, or a user-typed `--model`) always wins,
+/// so this returns `None` and nothing is added. Otherwise, when the profile
+/// pins a model for the tool (`session.agent_extra_args.<tool>` carries a
+/// `--model` / `-m` flag), return that flag so the launch inherits the pin.
+///
+/// This is the terminal-launch counterpart to `resolve_spawn_model_effort`
+/// (the structured/ACP spawn path): both make the per-profile model pin
+/// authoritative at spawn while leaving per-session escalation intact.
+pub fn launch_model_flag_injection(extra_args: &str, profile_pin: Option<&str>) -> Option<String> {
+    if has_model_flag(extra_args) {
+        return None;
+    }
+    extract_model_flag(profile_pin?)
 }
 
 /// What a single mouse click on a session row does in the Agent view.
@@ -4506,6 +4574,7 @@ mod tests {
             Some(&defaults),
             Some("anthropic/claude".to_string()),
             Some("high".to_string()),
+            None,
         );
         assert_eq!(model.as_deref(), Some("anthropic/claude"));
         assert_eq!(effort.as_deref(), Some("high"));
@@ -4518,7 +4587,7 @@ mod tests {
             effort: Some("low".to_string()),
             ..Default::default()
         };
-        let (model, effort) = resolve_spawn_model_effort(Some(&defaults), None, None);
+        let (model, effort) = resolve_spawn_model_effort(Some(&defaults), None, None, None);
         assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
         assert_eq!(effort.as_deref(), Some("low"));
     }
@@ -4534,6 +4603,7 @@ mod tests {
             Some(&defaults),
             Some("   ".to_string()),
             Some(String::new()),
+            None,
         );
         assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
         assert_eq!(effort.as_deref(), Some("low"));
@@ -4550,12 +4620,12 @@ mod tests {
             .effort_by_model
             .insert("gpt-5".to_string(), "high".to_string());
         // Model resolves to the default gpt-5, so the per-model effort applies.
-        let (model, effort) = resolve_spawn_model_effort(Some(&defaults), None, None);
+        let (model, effort) = resolve_spawn_model_effort(Some(&defaults), None, None, None);
         assert_eq!(model.as_deref(), Some("gpt-5"));
         assert_eq!(effort.as_deref(), Some("high"));
         // An explicit model that has no per-model override falls back to flat.
         let (model, effort) =
-            resolve_spawn_model_effort(Some(&defaults), Some("other".to_string()), None);
+            resolve_spawn_model_effort(Some(&defaults), Some("other".to_string()), None, None);
         assert_eq!(model.as_deref(), Some("other"));
         assert_eq!(effort.as_deref(), Some("low"));
     }
@@ -4575,22 +4645,135 @@ mod tests {
             Some(&defaults),
             Some("  gpt-5  ".to_string()),
             Some("  high  ".to_string()),
+            None,
         );
         assert_eq!(model.as_deref(), Some("gpt-5"));
         assert_eq!(effort.as_deref(), Some("high"));
         // With no explicit effort, the trimmed model still keys the per-model
         // override.
         let (model, effort) =
-            resolve_spawn_model_effort(Some(&defaults), Some("  gpt-5  ".to_string()), None);
+            resolve_spawn_model_effort(Some(&defaults), Some("  gpt-5  ".to_string()), None, None);
         assert_eq!(model.as_deref(), Some("gpt-5"));
         assert_eq!(effort.as_deref(), Some("high"));
     }
 
     #[test]
     fn resolve_spawn_model_effort_no_defaults_no_request_is_none() {
-        let (model, effort) = resolve_spawn_model_effort(None, None, None);
+        let (model, effort) = resolve_spawn_model_effort(None, None, None, None);
         assert_eq!(model, None);
         assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_extra_args_pin_is_lowest_fallback() {
+        // The profile's agent_extra_args --model pin is the LAST resort: it
+        // supplies the model only when neither an explicit request nor the ACP
+        // defaults name one. This is what makes a terminal-launched session
+        // (no ACP defaults, no request model) still honor the profile pin.
+        let (model, effort) =
+            resolve_spawn_model_effort(None, None, None, Some("--model claude-opus-4-8"));
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(effort, None);
+
+        // Short form and joined form both resolve.
+        let (model, _) = resolve_spawn_model_effort(None, None, None, Some("-m gpt-5.6-sol"));
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        let (model, _) = resolve_spawn_model_effort(None, None, None, Some("--model=fable"));
+        assert_eq!(model.as_deref(), Some("fable"));
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_request_and_defaults_outrank_pin() {
+        let defaults = AcpAgentDefaults {
+            model: Some("openai/gpt-5.5".to_string()),
+            ..Default::default()
+        };
+        // An explicit request model beats both the ACP default and the pin.
+        let (model, _) = resolve_spawn_model_effort(
+            Some(&defaults),
+            Some("anthropic/claude".to_string()),
+            None,
+            Some("--model claude-opus-4-8"),
+        );
+        assert_eq!(model.as_deref(), Some("anthropic/claude"));
+        // With no request, the ACP default still beats the pin.
+        let (model, _) = resolve_spawn_model_effort(
+            Some(&defaults),
+            None,
+            None,
+            Some("--model claude-opus-4-8"),
+        );
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
+    }
+
+    #[test]
+    fn extract_model_flag_handles_spaced_joined_and_short_forms() {
+        assert_eq!(
+            extract_model_flag("--model claude-opus-4-8").as_deref(),
+            Some("--model claude-opus-4-8")
+        );
+        assert_eq!(
+            extract_model_flag("-m gpt-5.6-sol").as_deref(),
+            Some("-m gpt-5.6-sol")
+        );
+        assert_eq!(
+            extract_model_flag("--model=fable").as_deref(),
+            Some("--model=fable")
+        );
+        // Model flag surrounded by other args is still found.
+        assert_eq!(
+            extract_model_flag("--foo --model opus --bar").as_deref(),
+            Some("--model opus")
+        );
+        // No model, empty, and a dangling flag with no value all yield None.
+        assert_eq!(extract_model_flag(""), None);
+        assert_eq!(extract_model_flag("--verbose"), None);
+        assert_eq!(extract_model_flag("--model"), None);
+    }
+
+    #[test]
+    fn launch_injection_empty_args_inherits_profile_pin() {
+        // The live fleet bug: a terminal session with empty extra_args must
+        // inherit the profile's --model pin, not launch on the account default.
+        assert_eq!(
+            launch_model_flag_injection("", Some("--model claude-opus-4-8")).as_deref(),
+            Some("--model claude-opus-4-8")
+        );
+        assert_eq!(
+            launch_model_flag_injection("", Some("-m gpt-5.6-sol")).as_deref(),
+            Some("-m gpt-5.6-sol")
+        );
+        // A profile pin that also carries unrelated args contributes only the model.
+        assert_eq!(
+            launch_model_flag_injection("--verbose", Some("--model claude-opus-4-8")).as_deref(),
+            Some("--model claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn launch_injection_explicit_session_model_wins() {
+        // A set-model escalation (fable, or back to opus) is stored in the
+        // session's extra_args and must survive: the profile pin never clobbers
+        // an explicit per-session model, in EITHER direction.
+        assert_eq!(
+            launch_model_flag_injection("--model fable", Some("--model claude-opus-4-8")),
+            None
+        );
+        assert_eq!(
+            launch_model_flag_injection("--model opus", Some("--model claude-opus-4-8")),
+            None
+        );
+        assert_eq!(
+            launch_model_flag_injection("--model=fable", Some("--model claude-opus-4-8")),
+            None
+        );
+    }
+
+    #[test]
+    fn launch_injection_no_pin_no_injection() {
+        // No profile pin and no session model: nothing to inject (account default).
+        assert_eq!(launch_model_flag_injection("", None), None);
+        assert_eq!(launch_model_flag_injection("--verbose", None), None);
     }
 
     #[test]

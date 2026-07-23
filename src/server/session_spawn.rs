@@ -314,6 +314,11 @@ pub(crate) async fn spawn_structured_session(
                     defaults,
                     explicit_model.clone(),
                     agent_effort,
+                    resolved_config
+                        .session
+                        .agent_extra_args
+                        .get(&agent_key)
+                        .map(String::as_str),
                 );
             instance.agent_model = resolved_model;
             instance.acp_effort = explicit_effort;

@@ -895,6 +895,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 defaults,
                 instance.agent_model.take(),
                 None,
+                config
+                    .session
+                    .agent_extra_args
+                    .get(&agent_name)
+                    .map(String::as_str),
             )
             .0;
         }

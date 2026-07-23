@@ -1134,6 +1134,11 @@ pub mod structured {
             defaults,
             instance.agent_model.take(),
             None,
+            config
+                .session
+                .agent_extra_args
+                .get(&instance.tool)
+                .map(String::as_str),
         )
         .0;
     }
