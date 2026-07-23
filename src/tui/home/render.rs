@@ -10,7 +10,7 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
-    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED,
+    ICON_DELETING, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED,
     ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
@@ -364,23 +364,16 @@ fn spinner_idle_fresh(
 /// so tests can pin the override behavior without going through the full
 /// render pipeline.
 pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
-    // A dormant (idle-reaped, resumable) structured worker gets its own glyph,
-    // taking precedence over the raw status but still yielding to the
-    // archived/snoozed/trashed sink override below. See #2250.
-    let icon = if inst.is_shown_dormant() {
-        ICON_DORMANT
-    } else {
-        match inst.status {
-            Status::Running => spinner_running(&inst.created_at),
-            Status::Waiting => spinner_waiting(&inst.created_at),
-            Status::Idle => ICON_IDLE,
-            Status::Unknown => ICON_UNKNOWN,
-            Status::Stopped => ICON_STOPPED,
-            Status::Error => ICON_ERROR,
-            Status::Starting => spinner_starting(&inst.created_at),
-            Status::Deleting => ICON_DELETING,
-            Status::Creating => spinner_starting(&inst.created_at),
-        }
+    let icon = match inst.status {
+        Status::Running => spinner_running(&inst.created_at),
+        Status::Waiting => spinner_waiting(&inst.created_at),
+        Status::Idle => ICON_IDLE,
+        Status::Unknown => ICON_UNKNOWN,
+        Status::Stopped => ICON_STOPPED,
+        Status::Error => ICON_ERROR,
+        Status::Starting => spinner_starting(&inst.created_at),
+        Status::Deleting => ICON_DELETING,
+        Status::Creating => spinner_starting(&inst.created_at),
     };
     // Error and Deleting are live operation states set by this TUI (a failed
     // or in-flight permanent delete), not stale persisted pane statuses, so
@@ -1508,24 +1501,19 @@ impl HomeView {
                             // wins over dormancy below (an unseen finished turn
                             // is the more actionable signal, matching the web
                             // sidebar's unread-dot precedence). See #2250.
-                            let is_shown_dormant = inst.is_shown_dormant();
-                            let mut icon = if is_shown_dormant {
-                                ICON_DORMANT
-                            } else {
-                                match inst.status {
-                                    Status::Running => spinner_running(&inst.created_at),
-                                    Status::Waiting => spinner_waiting(&inst.created_at),
-                                    Status::Idle if is_fresh_idle => {
-                                        spinner_idle_fresh(&inst.created_at, inst.idle_entered_at)
-                                    }
-                                    Status::Idle => ICON_IDLE,
-                                    Status::Unknown => ICON_UNKNOWN,
-                                    Status::Stopped => ICON_STOPPED,
-                                    Status::Error => ICON_ERROR,
-                                    Status::Starting => spinner_starting(&inst.created_at),
-                                    Status::Deleting => ICON_DELETING,
-                                    Status::Creating => spinner_starting(&inst.created_at),
+                            let mut icon = match inst.status {
+                                Status::Running => spinner_running(&inst.created_at),
+                                Status::Waiting => spinner_waiting(&inst.created_at),
+                                Status::Idle if is_fresh_idle => {
+                                    spinner_idle_fresh(&inst.created_at, inst.idle_entered_at)
                                 }
+                                Status::Idle => ICON_IDLE,
+                                Status::Unknown => ICON_UNKNOWN,
+                                Status::Stopped => ICON_STOPPED,
+                                Status::Error => ICON_ERROR,
+                                Status::Starting => spinner_starting(&inst.created_at),
+                                Status::Deleting => ICON_DELETING,
+                                Status::Creating => spinner_starting(&inst.created_at),
                             };
                             // Unread paints only on resting rows
                             // (Idle/Unknown): a live status (Running/Waiting/
@@ -1547,14 +1535,12 @@ impl HomeView {
                                 && !inst.is_archived()
                                 && !inst.is_snoozed()
                                 && matches!(inst.status, Status::Idle | Status::Unknown);
-                            // Dormant (auto-stopped, resumable) wins unless the
-                            // row is unread; unread then overrides the base hue;
+                            // Unread overrides the base hue on a resting row;
                             // otherwise the shared one-hue-one-meaning map in
                             // `Theme::status_color` decides, so this list and the
-                            // preview pane can't drift.
-                            let color = if is_shown_dormant && !unread_resting {
-                                theme.dormant()
-                            } else if unread_resting {
+                            // preview pane can't drift. (Fork UX: dormant gets no
+                            // separate hue — it collapses via `status_color`.)
+                            let color = if unread_resting {
                                 theme.unread
                             } else {
                                 theme.status_color(inst.status)
@@ -2528,10 +2514,6 @@ impl HomeView {
                         && !matches!(inst.status, Status::Error | Status::Deleting)
                     {
                         (ICON_STOPPED, theme.dimmed)
-                    } else if inst.is_shown_dormant() {
-                        // Dormant (idle-reaped, resumable) structured worker;
-                        // distinct glyph + dim amber. See #2250.
-                        (ICON_DORMANT, theme.dormant())
                     } else {
                         // Icon/spinner stays per-status (the animation language
                         // is fine); only the COLOR collapses through the shared

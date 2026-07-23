@@ -291,6 +291,13 @@ impl Theme {
             | Status::Deleting => self.dimmed,
         }
     }
+
+    /// Dormant tint — a mid blend of `fresh_idle` and `dimmed`. The TUI status
+    /// cells collapse to `status_color` (fork's 3-hue UX), so this is used only
+    /// by the web dashboard's `--color-status-dormant` CSS var (`resolved.rs`).
+    pub fn dormant(&self) -> Color {
+        blend(self.fresh_idle, self.dimmed, 0.5)
+    }
 }
 
 /// Linear RGB blend of `a` and `b` at `t` (0.0 = all `a`, 1.0 = all `b`).
