@@ -207,6 +207,15 @@ const CAP_TTL: Duration = Duration::from_secs(60 * 60);
 /// pane that stays blocked does not generate an action every tick.
 const ACTION_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
+/// Floor between repeated Commander pages for a session that stays capped on
+/// the SAME non-pool profile. A non-pool cap is deliberately never auto-moved
+/// (see [`Watchdog::handle_capped`]), so the page is a *notification*, not an
+/// act-now prompt — re-notifying every [`ACTION_COOLDOWN`] (~30 min) floods the
+/// Commander over a standing, unchanged condition (the WO#605 re-page bug). One
+/// page fires; a session that moves to a different non-pool profile, or that
+/// stays put past this window, pages again.
+const NON_POOL_PAGE_COOLDOWN: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// Floor between charter-drift escalations for the same (session, observed)
 /// pair. Drift is advisory, not operator-blocking, so it re-fires slowly.
 const DRIFT_COOLDOWN: Duration = Duration::from_secs(2 * 60 * 60);
@@ -250,6 +259,60 @@ struct CapFp {
     fp: String,
     first_seen_secs: u64,
     seen: Instant,
+}
+
+/// Last Commander page emitted for a session capped on a NON-POOL profile: the
+/// profile it was capped on and the wall-clock second it was paged. Backs the
+/// WO#605 non-pool re-page dampener, persisted across restarts so a daemon
+/// bounce does not re-flood every parked non-pool cap.
+#[derive(Clone)]
+struct NonPoolPage {
+    profile: String,
+    paged_at_secs: u64,
+}
+
+/// Whether a live cap on a NON-POOL profile warrants a *fresh* Commander page.
+/// `last` is the `(profile, paged_at_secs)` of the previous page for this
+/// session, if any. Pages on: a first sighting (`None`); a move to a DIFFERENT
+/// non-pool profile (a genuine state change — e.g. a session shuffled off
+/// `codex`); or once [`NON_POOL_PAGE_COOLDOWN`] has elapsed since the last page.
+/// A standing, unchanged cap on the same profile within the window is
+/// suppressed — the fix for the WO#605 re-page flood, where the non-pool branch
+/// woke the Commander on every [`ACTION_COOLDOWN`] re-entry. Pure, so the
+/// decision is unit-tested without a Watchdog fixture.
+fn non_pool_should_page(last: Option<(&str, u64)>, current_profile: &str, now_secs: u64) -> bool {
+    match last {
+        None => true,
+        Some((prof, _)) if prof != current_profile => true,
+        Some((_, at)) => now_secs.saturating_sub(at) >= NON_POOL_PAGE_COOLDOWN.as_secs(),
+    }
+}
+
+/// Parse the persisted `{"pages": {id: {"profile": …, "paged_at": …}}}`
+/// document into the in-memory non-pool-page map. Pure, like [`parse_cap_fp`];
+/// malformed input or a non-string profile yields an empty / skipped entry.
+/// WO#605.
+fn parse_non_pool_page(raw: &str) -> HashMap<String, NonPoolPage> {
+    let mut map = HashMap::new();
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return map;
+    };
+    if let Some(pages) = val.get("pages").and_then(|p| p.as_object()) {
+        for (id, entry) in pages {
+            let Some(profile) = entry.get("profile").and_then(|p| p.as_str()) else {
+                continue;
+            };
+            let paged_at_secs = entry.get("paged_at").and_then(|a| a.as_u64()).unwrap_or(0);
+            map.insert(
+                id.clone(),
+                NonPoolPage {
+                    profile: profile.to_string(),
+                    paged_at_secs,
+                },
+            );
+        }
+    }
+    map
 }
 
 /// True when the pane's LIVE EDGE (the last few non-empty lines) shows the
@@ -340,8 +403,10 @@ pub(crate) enum CapAction {
     /// Still capped but inside the per-session action cooldown: no new
     /// action, the state is logged so the hold is auditable.
     Cooldown,
-    /// Capped on a non-pool profile: never auto-moved, paged instead.
-    NonPool,
+    /// Capped on a non-pool profile: never auto-moved. `paged` is true when
+    /// this tick actually woke the Commander, false when the WO#605 re-page
+    /// dampener suppressed a standing, unchanged cap within its cooldown.
+    NonPool { paged: bool },
 }
 
 /// Per-session per-tick classification: what state the pane is in, what the
@@ -406,7 +471,14 @@ impl Disposition {
                 "none"
             }
             Disposition::LiveCap { action, .. } => match action {
-                CapAction::Moved { .. } | CapAction::NonPool => "page-commander",
+                CapAction::Moved { .. } => "page-commander",
+                CapAction::NonPool { paged } => {
+                    if *paged {
+                        "page-commander"
+                    } else {
+                        "none"
+                    }
+                }
                 CapAction::Cooldown => "none",
             },
             Disposition::FableDrift { paged, .. }
@@ -441,8 +513,12 @@ impl Disposition {
                     format!("live cap, auto-move to '{target}' FAILED, needs manual move")
                 }
                 CapAction::Cooldown => "still capped, holding within action cooldown".into(),
-                CapAction::NonPool => {
+                CapAction::NonPool { paged: true } => {
                     "capped on a non-pool profile, never auto-moved, paged".into()
+                }
+                CapAction::NonPool { paged: false } => {
+                    "capped on a non-pool profile, standing page suppressed within re-page cooldown"
+                        .into()
                 }
             },
             Disposition::ReplayedBanner { why } => {
@@ -835,6 +911,12 @@ struct Watchdog {
     /// gate: a banner whose unchanged content predates the profile's verified
     /// headroom grant is stale scrollback and must not revoke the grant.
     last_cap_fp: HashMap<String, CapFp>,
+    /// Last Commander page emitted per session for a NON-POOL cap (profile +
+    /// wall-clock secs), persisted across restarts. Backs the WO#605 re-page
+    /// dampener: a standing cap on the same non-pool profile is paged at most
+    /// once per [`NON_POOL_PAGE_COOLDOWN`], so a daemon bounce does not re-flood
+    /// every parked non-pool cap.
+    last_non_pool_page: HashMap<String, NonPoolPage>,
 }
 
 impl Watchdog {
@@ -848,6 +930,7 @@ impl Watchdog {
             last_action_fp: load_action_fp(),
             last_fable_fp: load_fable_fp(),
             last_cap_fp: load_cap_fp(),
+            last_non_pool_page: load_non_pool_page(),
         }
     }
 
@@ -1285,18 +1368,46 @@ impl Watchdog {
         let cap_kind = scan.cap_kind.unwrap_or(capacity::CapKind::Unknown);
         if !DRAW_ORDER.contains(&scan.profile.as_str()) {
             self.last_session_action.insert(scan.id.clone(), now);
-            wake(
-                "capped-non-pool",
-                &scan.id,
-                format!(
-                    "session '{}' ({}) is capped on non-pool profile '{}'; not auto-moving",
-                    scan.title, scan.id, scan.profile
-                ),
-            )
-            .await;
+            // WO#605: a non-pool cap is never auto-moved, so the wake is a
+            // notification. Page only on a genuine state change — first
+            // sighting, a move to a different non-pool profile, or once the
+            // re-page cooldown elapses — else the standing cap re-floods the
+            // Commander every ACTION_COOLDOWN re-entry.
+            let now_secs = unix_secs();
+            let last = self
+                .last_non_pool_page
+                .get(&scan.id)
+                .map(|p| (p.profile.as_str(), p.paged_at_secs));
+            let paged = non_pool_should_page(last, &scan.profile, now_secs);
+            if paged {
+                self.last_non_pool_page.insert(
+                    scan.id.clone(),
+                    NonPoolPage {
+                        profile: scan.profile.clone(),
+                        paged_at_secs: now_secs,
+                    },
+                );
+                self.persist_non_pool_page();
+                wake(
+                    "capped-non-pool",
+                    &scan.id,
+                    format!(
+                        "session '{}' ({}) is capped on non-pool profile '{}'; not auto-moving",
+                        scan.title, scan.id, scan.profile
+                    ),
+                )
+                .await;
+            } else {
+                tracing::debug!(
+                    target: "server.pane_watchdog",
+                    session = %scan.id,
+                    profile = %scan.profile,
+                    "capped-non-pool page suppressed within re-page cooldown (WO#605)"
+                );
+            }
             return Disposition::LiveCap {
                 kind: cap_kind.as_str(),
-                action: CapAction::NonPool,
+                action: CapAction::NonPool { paged },
             };
         }
         // The relocation gate reads the SHARED capacity state, not the
@@ -1474,6 +1585,30 @@ impl Watchdog {
         let json = serde_json::json!({ "updated": now_secs, "caps": caps });
         if let Err(e) = std::fs::write(&path, json.to_string()) {
             tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "cap-fp state write failed");
+        }
+    }
+
+    /// Persist the non-pool re-page map (`{"pages": {id: {profile, paged_at}}}`)
+    /// so a daemon bounce keeps knowing which parked non-pool caps were already
+    /// paged — without it, every restart would re-page every standing non-pool
+    /// cap immediately. WO#605.
+    fn persist_non_pool_page(&self) {
+        let Some(path) = non_pool_page_path() else {
+            return;
+        };
+        let pages: HashMap<&str, serde_json::Value> = self
+            .last_non_pool_page
+            .iter()
+            .map(|(id, p)| {
+                (
+                    id.as_str(),
+                    serde_json::json!({ "profile": p.profile, "paged_at": p.paged_at_secs }),
+                )
+            })
+            .collect();
+        let json = serde_json::json!({ "updated": unix_secs(), "pages": pages });
+        if let Err(e) = std::fs::write(&path, json.to_string()) {
+            tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "non-pool-page state write failed");
         }
     }
 
@@ -1676,6 +1811,36 @@ fn load_cap_fp() -> HashMap<String, CapFp> {
         return HashMap::new();
     };
     parse_cap_fp(&raw, Instant::now())
+}
+
+/// Resolve the non-pool re-page dampener state file: `AOE_NON_POOL_PAGE_FILE`
+/// override, else `<app_dir>/non-pool-page-state.json`. Separate file so it
+/// never collides with the other dampeners. `None` -> in-memory-only (fail-open:
+/// worst case is one extra page after a bounce, never a crash). WO#605.
+fn non_pool_page_path() -> Option<PathBuf> {
+    match std::env::var("AOE_NON_POOL_PAGE_FILE") {
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => match crate::session::get_app_dir() {
+            Ok(dir) => Some(dir.join("non-pool-page-state.json")),
+            Err(e) => {
+                tracing::warn!(target: "server.pane_watchdog", error = %e, "no app dir; non-pool-page state not persisted");
+                None
+            }
+        },
+    }
+}
+
+/// Load the persisted non-pool re-page map on daemon start via the pure
+/// [`parse_non_pool_page`]. Missing / malformed yields an empty map (fail-open).
+/// WO#605.
+fn load_non_pool_page() -> HashMap<String, NonPoolPage> {
+    let Some(path) = non_pool_page_path() else {
+        return HashMap::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    parse_non_pool_page(&raw)
 }
 
 /// Parse the persisted `{"gates": {id: fp}}` document into the in-memory map,
@@ -2697,6 +2862,58 @@ and enter the code H7Q2K9F4P to authenticate.
         assert!(
             parse_cap_fp(r#"{"caps":{"sess-a":{"fp":7}}}"#, Instant::now()).is_empty(),
             "entry with non-string fp must be skipped"
+        );
+    }
+
+    // ── WO#605: non-pool cap re-page dampener ───────────────────────────
+
+    #[test]
+    fn non_pool_should_page_dampens_standing_cap() {
+        let cd = NON_POOL_PAGE_COOLDOWN.as_secs();
+        let t0 = 1_000_000u64;
+        // A first sighting always pages.
+        assert!(
+            non_pool_should_page(None, "aoe-wmw", t0),
+            "first non-pool cap must page"
+        );
+        // The SAME non-pool profile within the cooldown is suppressed — this is
+        // the WO#605 fix; the buggy always-page behaviour fails these two.
+        assert!(
+            !non_pool_should_page(Some(("aoe-wmw", t0)), "aoe-wmw", t0 + 60),
+            "standing cap on the same profile just after a page must be suppressed"
+        );
+        assert!(
+            !non_pool_should_page(Some(("aoe-wmw", t0)), "aoe-wmw", t0 + cd - 1),
+            "still inside the cooldown window must be suppressed"
+        );
+        // Once the cooldown elapses on the same profile, it re-pages.
+        assert!(
+            non_pool_should_page(Some(("aoe-wmw", t0)), "aoe-wmw", t0 + cd),
+            "cooldown elapsed on the same profile must re-page"
+        );
+        // Moving to a DIFFERENT non-pool profile is a state change -> pages now.
+        assert!(
+            non_pool_should_page(Some(("aoe-wmw", t0)), "aoe-fiw", t0 + 60),
+            "a move to a different non-pool profile must page immediately"
+        );
+    }
+
+    #[test]
+    fn parse_non_pool_page_roundtrip() {
+        let raw = r#"{"updated":1800000000,"pages":{"sess-a":{"profile":"aoe-wmw","paged_at":1799990000}}}"#;
+        let map = parse_non_pool_page(raw);
+        let a = map.get("sess-a").expect("entry parsed");
+        assert_eq!(a.profile, "aoe-wmw");
+        assert_eq!(a.paged_at_secs, 1_799_990_000);
+    }
+
+    #[test]
+    fn parse_non_pool_page_malformed_yields_empty() {
+        assert!(parse_non_pool_page("not json").is_empty());
+        assert!(parse_non_pool_page(r#"{"pages": 42}"#).is_empty());
+        assert!(
+            parse_non_pool_page(r#"{"pages":{"sess-a":{"profile":7}}}"#).is_empty(),
+            "entry with non-string profile must be skipped"
         );
     }
 
