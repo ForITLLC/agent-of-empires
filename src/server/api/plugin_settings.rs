@@ -257,6 +257,33 @@ async fn group_options(state: &Arc<AppState>) -> Vec<SelectOption> {
     paths.iter().map(|p| SelectOption::new(p, p)).collect()
 }
 
+/// Extract the value of a `--model` / `-m` flag from a whitespace-split
+/// extra-args string (`session.agent_extra_args.<agent>`). Handles the spaced
+/// form (`--model X`, `-m X`) and the joined form (`--model=X`, `-m=X`). A
+/// dangling flag — no following value, or the next token is another option
+/// (`--model --verbose`) — yields `None` rather than a bogus model.
+fn parse_model_flag(args: &str) -> Option<String> {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    for (i, tok) in toks.iter().enumerate() {
+        if let Some(v) = tok
+            .strip_prefix("--model=")
+            .or_else(|| tok.strip_prefix("-m="))
+        {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        } else if *tok == "--model" || *tok == "-m" {
+            if let Some(v) = toks
+                .get(i + 1)
+                .filter(|v| !v.is_empty() && !v.starts_with('-'))
+            {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// The model pinned under the profile for the agent `agent` spawns as, if
 /// any; see `pinned_model_for_tool`. A plain `model` without `pin_model` is a
 /// default an explicit request still beats at creation, so it yields `None`
@@ -265,11 +292,11 @@ async fn pinned_model_for_agent(profile: &str, agent: &str) -> Option<String> {
     let profile = profile.to_string();
     let agent = agent.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::acp::pinned_model_for_tool(
-            &crate::session::config::profile_config::resolve_config_or_warn(&profile),
-            &agent,
-            None,
-        )
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+        crate::acp::pinned_model_for_tool(&config, &agent, None).or_else(|| {
+            // Retain the fleet's legacy CLI model pins alongside explicit ACP pins.
+            config.session.agent_extra_args.get(&agent).and_then(|args| parse_model_flag(args))
+        })
     })
     .await
     .ok()
@@ -381,5 +408,41 @@ mod tests {
             Some("claude-pinned")
         );
         assert_eq!(pinned_model_for_agent("default", "gemini").await, None);
+    }
+    #[test]
+    fn parse_model_flag_extracts_the_pinned_model() {
+        // spaced form, both flag spellings
+        assert_eq!(
+            parse_model_flag("--model claude-opus-4-8"),
+            Some("claude-opus-4-8".to_string())
+        );
+        assert_eq!(
+            parse_model_flag("-m gpt-5.6-sol"),
+            Some("gpt-5.6-sol".to_string())
+        );
+        // joined form
+        assert_eq!(
+            parse_model_flag("--model=claude-fable-5"),
+            Some("claude-fable-5".to_string())
+        );
+        assert_eq!(
+            parse_model_flag("-m=claude-opus-4-8"),
+            Some("claude-opus-4-8".to_string())
+        );
+        // the flag surrounded by other args (real profile shape)
+        assert_eq!(
+            parse_model_flag("--port 8080 --model claude-opus-4-8 --verbose"),
+            Some("claude-opus-4-8".to_string())
+        );
+        // no model flag present -> no pin
+        assert_eq!(parse_model_flag("--port 8080"), None);
+        assert_eq!(parse_model_flag(""), None);
+        // a flag followed by another option is dangling, not a pin on "--verbose"
+        assert_eq!(parse_model_flag("--model --verbose"), None);
+        assert_eq!(parse_model_flag("-m -v --port 8080"), None);
+        assert_eq!(parse_model_flag("--port 8080 --model"), None);
+        // dangling flag with no value -> no pin (never returns an empty model)
+        assert_eq!(parse_model_flag("--model"), None);
+        assert_eq!(parse_model_flag("foo --model="), None);
     }
 }
