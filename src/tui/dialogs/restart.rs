@@ -64,6 +64,24 @@ pub struct RestartDialog {
     /// Which selector row the mouse is over, for the hover highlight.
     /// Visual only; never moves keyboard `focused_field`.
     hover: HoverState,
+    /// The engines the Tool cycler may select for the currently selected
+    /// profile, cached so the config lookup (disk-backed) runs at most once per
+    /// profile selection rather than every keystroke/frame. `None` until first
+    /// primed; cleared whenever the profile changes. See `cyclable_tools`.
+    cyclable_cache: Option<Vec<String>>,
+}
+
+/// The engines the Tool cycler may land on for a profile. When the profile
+/// pins `session.default_tool` to an engine that is actually available, the
+/// cycler is locked to exactly that engine (one-engine-per-profile), so a
+/// restart cannot launch a different model than the profile is configured for.
+/// No pin, or a pin naming an unavailable engine, leaves every detected engine
+/// selectable (unchanged upstream behavior).
+fn cyclable_tools(available: &[String], pinned: Option<&str>) -> Vec<String> {
+    match pinned {
+        Some(p) if available.iter().any(|t| t == p) => vec![p.to_string()],
+        _ => available.to_vec(),
+    }
 }
 
 impl RestartDialog {
@@ -104,6 +122,7 @@ impl RestartDialog {
             profile_selector_area: Rect::default(),
             tool_selector_area: Rect::default(),
             hover: HoverState::default(),
+            cyclable_cache: None,
         }
     }
 
@@ -135,10 +154,8 @@ impl RestartDialog {
         }
         if self.tool_selector_area.contains(pos) {
             self.focused_field = 1;
-            if !self.available_tools.is_empty() {
-                self.tool_index = (self.tool_index + 1) % self.available_tools.len();
-                self.reload_tool_config();
-            }
+            // Cycle within the profile's locked engine set (no-op when pinned).
+            self.cycle_tool(true);
             return Some(DialogResult::Continue);
         }
         None
@@ -166,6 +183,8 @@ impl RestartDialog {
     /// and snap `tool_index` accordingly, matching the keyboard's
     /// "cycle profile -> auto-pick its default_tool" behavior.
     fn sync_tool_from_profile(&mut self) {
+        // The engine lock is per-profile, so a profile change invalidates it.
+        self.cyclable_cache = None;
         let Some(profile) = self.selected_profile().map(String::from) else {
             return;
         };
@@ -200,6 +219,8 @@ impl RestartDialog {
     /// "picking a profile pre-populates the AI engine" matches across the
     /// New / Rename / Restart modals.
     fn reload_tool_from_profile(&mut self) {
+        // The engine lock is per-profile, so a profile change invalidates it.
+        self.cyclable_cache = None;
         let Some(profile) = self.selected_profile().map(str::to_string) else {
             return;
         };
@@ -247,6 +268,62 @@ impl RestartDialog {
                 .unwrap_or_default(),
         );
         self.command_override = Input::new(config.session.resolve_tool_command(&tool));
+    }
+
+    /// Prime `cyclable_cache` for the selected profile if it isn't already.
+    /// Reads `session.default_tool` once (the config lookup is disk-backed);
+    /// the cache is invalidated whenever the profile changes, so the read runs
+    /// at most once per profile selection rather than every keystroke/frame.
+    fn ensure_cyclable(&mut self) {
+        if self.cyclable_cache.is_some() {
+            return;
+        }
+        let pinned = self
+            .selected_profile()
+            .and_then(|p| resolve_config_or_warn(p).session.default_tool.clone());
+        self.cyclable_cache = Some(cyclable_tools(&self.available_tools, pinned.as_deref()));
+    }
+
+    /// Positions in `available_tools` the Tool cycler may land on, honoring the
+    /// per-profile engine lock. Falls back to every tool when the cache hasn't
+    /// been primed (unconstrained). Preserves `available_tools` order.
+    fn cyclable_indices(&self) -> Vec<usize> {
+        let cyclable = self
+            .cyclable_cache
+            .as_deref()
+            .unwrap_or(&self.available_tools);
+        self.available_tools
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| cyclable.iter().any(|c| c == *t))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Advance the Tool selection within the profile's cyclable set. When the
+    /// profile pins a single engine the set has one entry, so this is a no-op;
+    /// otherwise it steps forward/backward through the allowed engines,
+    /// wrapping, and re-seeds the tool-config inputs.
+    fn cycle_tool(&mut self, forward: bool) {
+        if self.available_tools.is_empty() {
+            return;
+        }
+        self.ensure_cyclable();
+        let allowed = self.cyclable_indices();
+        if allowed.is_empty() {
+            return;
+        }
+        let pos = allowed
+            .iter()
+            .position(|&i| i == self.tool_index)
+            .unwrap_or(0);
+        let next = if forward {
+            (pos + 1) % allowed.len()
+        } else {
+            (pos + allowed.len() - 1) % allowed.len()
+        };
+        self.tool_index = allowed[next];
+        self.reload_tool_config();
     }
 
     fn next_field(&mut self) {
@@ -360,23 +437,11 @@ impl RestartDialog {
                 DialogResult::Continue
             }
             KeyCode::Left if self.is_tool_field() => {
-                if self.available_tools.is_empty() {
-                    return DialogResult::Continue;
-                }
-                self.tool_index = if self.tool_index == 0 {
-                    self.available_tools.len() - 1
-                } else {
-                    self.tool_index - 1
-                };
-                self.reload_tool_config();
+                self.cycle_tool(false);
                 DialogResult::Continue
             }
             KeyCode::Right | KeyCode::Char(' ') if self.is_tool_field() => {
-                if self.available_tools.is_empty() {
-                    return DialogResult::Continue;
-                }
-                self.tool_index = (self.tool_index + 1) % self.available_tools.len();
-                self.reload_tool_config();
+                self.cycle_tool(true);
                 DialogResult::Continue
             }
             _ => DialogResult::Continue,
@@ -450,6 +515,9 @@ impl RestartDialog {
 
         self.render_profile_selector(frame, chunks[4], theme);
         self.profile_selector_area = chunks[4];
+        // Prime the per-profile engine lock so the Tool row reflects it: a pinned
+        // profile shows a single engine (no cycler affordances), not all of them.
+        self.ensure_cyclable();
         self.render_tool_selector(frame, chunks[5], theme);
         self.tool_selector_area = chunks[5];
         self.render_hints(frame, chunks[7], theme);
@@ -508,11 +576,20 @@ impl RestartDialog {
             .get(self.tool_index)
             .map(String::as_str)
             .unwrap_or("(none)");
+        // Drive the cycler off the profile-allowed engine set, not the full tool
+        // list: a profile pinned to one engine reports total==1, so
+        // `tool_cycler_spans` drops the arrows/badge and the row shows a single
+        // engine instead of every installed one.
+        let allowed = self.cyclable_indices();
+        let pos = allowed
+            .iter()
+            .position(|&i| i == self.tool_index)
+            .unwrap_or(0);
         let mut spans = tool_cycler_spans(
             "Tool:",
             value,
-            self.tool_index,
-            self.available_tools.len(),
+            pos,
+            allowed.len(),
             self.is_tool_field(),
             theme,
         );
@@ -948,6 +1025,93 @@ mod tests {
             }
             _ => panic!("Expected Submit"),
         }
+    }
+
+    #[test]
+    fn cyclable_locks_to_pinned_when_pin_is_available() {
+        // A profile that pins an available engine constrains the Tool cycler to
+        // exactly that engine (one-engine-per-profile): a restart can't launch a
+        // model the profile isn't configured for.
+        let avail = tools(); // claude, codex, settl
+        assert_eq!(
+            cyclable_tools(&avail, Some("codex")),
+            vec!["codex".to_string()]
+        );
+        assert_eq!(
+            cyclable_tools(&avail, Some("claude")),
+            vec!["claude".to_string()]
+        );
+    }
+
+    #[test]
+    fn cyclable_is_unconstrained_when_no_pin() {
+        // No default_tool pin -> every detected engine stays selectable
+        // (unchanged upstream behavior).
+        let avail = tools();
+        assert_eq!(cyclable_tools(&avail, None), avail);
+    }
+
+    #[test]
+    fn cyclable_is_unconstrained_when_pin_unavailable() {
+        // A pin naming an engine that isn't installed can't lock the cycler to a
+        // tool the user can't actually run; fall back to the full list.
+        let avail = tools();
+        assert_eq!(cyclable_tools(&avail, Some("gemini")), avail);
+    }
+
+    #[test]
+    fn test_tool_cycle_locked_to_pinned_engine_is_noop() {
+        // With the profile's engine lock primed to a single tool, cycling the
+        // Tool field must not move off the pinned engine. This is the core of
+        // "one engine per profile": the restart dialog was letting a user cycle
+        // to a model the profile isn't configured for (Ben: "still sees two per
+        // profile ... triggered the wrong AI model").
+        let mut d = dialog("default", "claude");
+        d.focused_field = 1; // tool field
+        d.cyclable_cache = Some(vec!["claude".to_string()]);
+        let before = d.tool_index;
+        d.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            d.tool_index, before,
+            "Right must not cycle past the locked engine"
+        );
+        d.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            d.tool_index, before,
+            "Left must not cycle past the locked engine"
+        );
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            d.tool_index, before,
+            "Space must not cycle past the locked engine"
+        );
+    }
+
+    #[test]
+    fn test_tool_click_locked_to_pinned_engine_is_noop() {
+        // Clicking the Tool selector row must also respect the engine lock.
+        let mut d = dialog("default", "claude");
+        d.tool_selector_area = Rect::new(2, 5, 50, 1);
+        d.cyclable_cache = Some(vec!["claude".to_string()]);
+        let before = d.tool_index;
+        d.handle_click(5, 5);
+        assert_eq!(
+            d.tool_index, before,
+            "click must not cycle past the locked engine"
+        );
+    }
+
+    #[test]
+    fn test_tool_cycle_unconstrained_still_cycles() {
+        // No lock (cache holds every detected tool) -> cycling behaves exactly
+        // as upstream: every engine stays reachable.
+        let mut d = dialog("default", "claude");
+        d.focused_field = 1;
+        d.cyclable_cache = Some(tools()); // claude, codex, settl
+        d.handle_key(key(KeyCode::Right));
+        assert_eq!(d.tool_index, 1); // claude -> codex
+        d.handle_key(key(KeyCode::Left));
+        assert_eq!(d.tool_index, 0); // codex -> claude
     }
 
     #[test]
