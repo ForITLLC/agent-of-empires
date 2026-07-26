@@ -613,13 +613,58 @@ fn find_session_across_profiles(identifier: &str) -> Result<(String, crate::sess
                 .map(|(p, i)| format!("{} (profile '{}')", i.id, p))
                 .collect::<Vec<_>>()
                 .join(", ");
-            bail!(
+            Err(AmbiguousAcrossProfiles(format!(
                 "Ambiguous: {:?} matches sessions in multiple profiles: {}. \
                  Re-run with the exact session id.",
-                identifier,
-                where_
-            )
+                identifier, where_
+            ))
+            .into())
         }
+    }
+}
+
+/// An identifier that names a different session in more than one profile.
+///
+/// A distinct type, not a bare `bail!`, because the two callers must treat it
+/// differently from "no such session": not-found falls back to the caller's
+/// default profile (so each verb's own, more specific error surfaces), while
+/// ambiguity has to propagate verbatim. Flattening the two is the bug this
+/// exists to prevent, and only a typed error survives the `Err(_)` match that
+/// the hand-copied lookups used.
+#[derive(Debug)]
+struct AmbiguousAcrossProfiles(String);
+
+impl std::fmt::Display for AmbiguousAcrossProfiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AmbiguousAcrossProfiles {}
+
+/// Resolve the profile whose `sessions.json` actually owns `identifier`.
+///
+/// Every identifier-taking `session` verb opens storage for exactly one
+/// profile. Using the caller's default there means an id owned by another
+/// account reads as "Session not found" even though `aoe list --all` shows it.
+/// `unarchive` and `restart` each grew a private copy of this lookup, which is
+/// why exactly those two verbs worked cross-profile; this is that block, once.
+///
+/// Order matters: an explicit `-p` wins outright and never runs the lookup, so
+/// naming a profile stays authoritative (and cannot fail on an ambiguity in
+/// some unrelated account). An absent identifier means the verb will auto-
+/// detect the current pane, which is inherently local, so it stays put.
+fn owning_profile_for(profile: &str, identifier: Option<&str>) -> Result<String> {
+    if !profile.is_empty() {
+        return Ok(profile.to_string());
+    }
+    let Some(identifier) = identifier else {
+        return Ok(profile.to_string());
+    };
+    match find_session_across_profiles(identifier) {
+        Ok((owner, _)) => Ok(owner),
+        Err(e) if e.downcast_ref::<AmbiguousAcrossProfiles>().is_some() => Err(e),
+        Err(_) => Ok(crate::session::config::effective_profile(profile)),
     }
 }
 
@@ -783,7 +828,8 @@ async fn move_session(args: MoveArgs) -> Result<()> {
 }
 
 async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.favorite();
@@ -795,7 +841,8 @@ async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn unfavorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unfavorite();
@@ -815,7 +862,8 @@ async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
         other => Some(other.to_string()),
     };
 
-    let storage = Storage::new_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::new_unwatched(&owning_profile)?;
     let (title, color) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.set_color(new_color.clone())
@@ -832,7 +880,8 @@ async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
 }
 
 async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
 
     // Phase 1 (unlocked): resolve identifier.
     let (instances, _groups) = storage.load_with_groups()?;
@@ -891,17 +940,7 @@ async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // `aoe-wmw`) failed with "Session not found" even though the daemon listed
     // it as archived. Mirrors restart_session's #99 cross-profile resolution;
     // an explicit `-p <profile>` still overrides.
-    let owning_profile = if profile.is_empty() {
-        match find_session_across_profiles(&args.identifier) {
-            Ok((p, _)) => p,
-            // Not found in any profile: fall back to the resolved default so
-            // the normal "session missing" error surfaces from resolve_session
-            // below rather than a confusing lookup error.
-            Err(_) => crate::session::config::effective_profile(profile),
-        }
-    } else {
-        profile.to_string()
-    };
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
     let storage = Storage::open_unwatched(&owning_profile)?;
     let inst = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
@@ -922,7 +961,8 @@ async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
 
     // Resolve within the trashed subset only. The CLI advertises the argument
     // as an id OR title, and a live or archived session can share a title/path
@@ -1167,7 +1207,10 @@ async fn empty_trash(profile: &str) -> Result<()> {
 }
 
 async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
-    let config = crate::session::profile_config::resolve_config(profile)?;
+    // Config comes from the OWNING profile, not the caller's: the snooze
+    // default is a property of the account the session lives in.
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let config = crate::session::profile_config::resolve_config(&owning_profile)?;
 
     // `--minutes` overrides the profile default; otherwise use the
     // configured `snooze_duration_minutes`. Validate either way so the
@@ -1179,7 +1222,7 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
     crate::session::validate_snooze_duration(raw_minutes).map_err(|e| anyhow::anyhow!("{}", e))?;
     let minutes = raw_minutes as u32;
 
-    let storage = Storage::open_unwatched(profile)?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.snooze(minutes);
@@ -1191,7 +1234,8 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
 }
 
 async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unsnooze();
@@ -1203,7 +1247,8 @@ async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
 
     // Phase 1 (unlocked): snapshot the target by identifier, rehydrate
     // `source_profile` so config resolution honors the right profile.
@@ -1213,7 +1258,9 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "start")?;
     let mut working = inst.clone();
-    working.source_profile = profile.to_string();
+    // The OWNING profile, not the caller's: stamping the caller's here is how a
+    // cross-profile `start` silently re-homes a session into the wrong account.
+    working.source_profile = owning_profile.clone();
 
     // Snapshot the sid for the same reason `restart_session` does: a persisted
     // `ResumeIntent::Cleared` (from `aoe session set-session-id <id> ""`) makes
@@ -1567,7 +1614,8 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
 /// confirmed. The `warn!` for the Unknown case is emitted inside
 /// [`crate::session::Instance::stop`], so this call site does not re-warn.
 async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
 
     // Resolve the identifier before the lifecycle-locked shutdown.
     let (instances, _groups) = storage.load_with_groups()?;
@@ -1825,17 +1873,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // onto the default account and clustered the whole fleet on one wallet.
     // An explicit `-p <profile>` still overrides (intentional migration — the
     // path `aoe session move` relies on).
-    let owning_profile = if profile.is_empty() {
-        match find_session_across_profiles(&args.identifier) {
-            Ok((p, _)) => p,
-            // Not found in any profile's sessions.json: fall back to the
-            // resolved default so the normal "session missing" error surfaces
-            // from resolve_session below rather than a confusing lookup error.
-            Err(_) => crate::session::config::effective_profile(profile),
-        }
-    } else {
-        profile.to_string()
-    };
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
     let storage = Storage::open_unwatched(&owning_profile)?;
 
     // Phase 1 (unlocked): snapshot the target by identifier and
@@ -1961,7 +1999,8 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
@@ -1980,7 +2019,8 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, args.identifier.as_deref())?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let mut inst = if let Some(id) = &args.identifier {
@@ -2047,7 +2087,8 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
 }
 
 async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, args.identifier.as_deref())?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = if let Some(id) = &args.identifier {
@@ -2144,7 +2185,8 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         bail!("At least one of --title or --group must be specified");
     }
 
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, args.identifier.as_deref())?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
 
     // Phase 1 (unlocked): resolve the target id (auto-detect from tmux if
     // no identifier given) and the old/new title pair so we can do the
@@ -2214,7 +2256,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // Tied mode (#1927): renaming an aoe-managed worktree session also moves
     // its directory leaf to match the title (and optionally the branch), so
     // the two cannot drift. Decided per-session from the resolved setting.
-    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let config = crate::session::profile_config::resolve_config_or_warn(&owning_profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
     let tied_edit = tied && (args.title.is_some() || args.rename_branch);
     let duplicate_path = if tied_edit {
@@ -2552,7 +2594,8 @@ mod rename_tests {
 }
 
 async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, args.identifier.as_deref())?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = if let Some(id) = &args.identifier {
         super::resolve_session(id, &instances)?
@@ -2589,7 +2632,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     // When tied (#1927) the directory follows the title, so reject the
     // standalone edit and point at the unified rename instead.
     if inst.tie_workdir_applies(
-        crate::session::profile_config::resolve_config_or_warn(profile)
+        crate::session::profile_config::resolve_config_or_warn(&owning_profile)
             .session
             .tie_workdir_to_name,
     ) {
@@ -2747,7 +2790,8 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
         crate::session::ResumeIntent::Use(trimmed)
     };
 
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let target_id = {
         let instances = storage.load()?;
         super::resolve_session(&args.identifier, &instances)?
@@ -2914,7 +2958,8 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     if !args.clear && args.branch.is_none() {
         bail!("Provide a branch ref or pass --clear to remove the override.");
     }
-    let storage = Storage::open_unwatched(profile)?;
+    let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
+    let storage = Storage::open_unwatched(&owning_profile)?;
     let instances = storage.load()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
@@ -3518,6 +3563,138 @@ mod unarchive_cross_profile_tests {
         .expect("explicit -p unarchive must succeed");
 
         assert!(!is_archived_in("unarch-explicit", "dddd4444"));
+    }
+}
+
+#[cfg(test)]
+mod cross_profile_wiring_tests {
+    // WO#773 S2. `unarchive` (#194-1) and `restart` (#99) each grew their OWN
+    // copy of the cross-profile owner lookup, so exactly those two verbs work
+    // on an id owned by a non-default profile. Every other identifier-taking
+    // verb still opened the caller's default profile and bailed "Session not
+    // found" for an id the daemon happily lists. These tests pin the shared
+    // helper and the read-only verb (`show`) that proved it live.
+    use super::{owning_profile_for, show_session, ShowArgs};
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    /// Point HOME (and XDG on unix) at a throwaway dir so profiles created
+    /// here never touch the real registry.
+    fn isolate() -> tempfile::TempDir {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        temp
+    }
+
+    fn seed(profile: &str, id: &str, title: &str) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new(id, "/tmp/seed");
+        inst.id = id.to_string();
+        inst.title = title.to_string();
+        inst.source_profile = profile.to_string();
+        let on_disk = inst.clone();
+        storage
+            .update(|i, _g| {
+                i.push(on_disk.clone());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The live-RED case, as a test. `aoe session show <foreign-id>` with no
+    /// `-p`: the decoy profile sorts first and therefore BECOMES the resolved
+    /// default (resolve_default_profile -> list_profiles().next()), so the id
+    /// is genuinely owned by a non-default profile — the same shape as the
+    /// real registry split that made `show` fail on a RAS-Work id while the
+    /// ambient default was gna-main.
+    #[tokio::test]
+    #[serial]
+    async fn show_resolves_an_id_owned_by_a_non_default_profile() {
+        let _temp = isolate();
+        seed("aaa-decoy-default", "0000aaaa", "decoy");
+        seed("zzz-owner", "851c3a91aaf64876", "for-Foreign");
+
+        show_session(
+            "",
+            ShowArgs {
+                identifier: Some("851c3a91aaf64876".to_string()),
+                json: true,
+            },
+        )
+        .await
+        .expect("show must resolve an id owned by another profile");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_dash_p_wins_and_never_runs_the_lookup() {
+        let _temp = isolate();
+        // `dup-title` is AMBIGUOUS across profiles, so if an explicit `-p`
+        // ever fell through to the cross-profile lookup this would error.
+        // Asserting Ok therefore proves the short-circuit, not just the value.
+        seed("prof-a", "aaaa1111", "dup-title");
+        seed("prof-b", "bbbb2222", "dup-title");
+
+        let picked = owning_profile_for("prof-b", Some("dup-title"))
+            .expect("explicit -p must short-circuit before the lookup");
+        assert_eq!("prof-b", picked);
+    }
+
+    /// The fallback trap. The copied block matched `Err(_)` and fell back to
+    /// the default profile, so an AMBIGUOUS identifier was flattened into the
+    /// same generic "Session not found" an unwired verb emitted — the caller
+    /// could not tell "no such session" from "that name means two different
+    /// sessions in two accounts". Ambiguity must propagate verbatim.
+    #[tokio::test]
+    #[serial]
+    async fn ambiguity_propagates_and_is_never_flattened_into_not_found() {
+        let _temp = isolate();
+        seed("prof-a", "aaaa1111", "dup-title");
+        seed("prof-b", "bbbb2222", "dup-title");
+
+        let err = owning_profile_for("", Some("dup-title"))
+            .expect_err("an id matching two profiles must not silently resolve");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Ambiguous"),
+            "ambiguity was flattened into a generic error: {msg}"
+        );
+        assert!(
+            msg.contains("prof-a") && msg.contains("prof-b"),
+            "ambiguity error must name both owning profiles: {msg}"
+        );
+    }
+
+    /// A genuinely unresolvable id keeps the OLD behavior: fall back to the
+    /// resolved default so the verb's own, more specific error surfaces
+    /// (`restore` searches only the trash, `show` only the live set). The
+    /// helper must not turn "not found" into a cross-profile lookup error.
+    #[tokio::test]
+    #[serial]
+    async fn unresolvable_identifier_falls_back_to_the_default_profile() {
+        let _temp = isolate();
+        seed("aaa-decoy-default", "0000aaaa", "decoy");
+
+        let picked = owning_profile_for("", Some("no-such-session-anywhere"))
+            .expect("an unresolvable id must fall back, not hard-error");
+        assert_eq!("aaa-decoy-default", picked);
+    }
+
+    /// `show`/`capture`/`rename`/`set-worktree-name` take an OPTIONAL
+    /// identifier and auto-detect the current pane when it is absent. That
+    /// path is inherently local, so it must stay on the caller's profile and
+    /// must not be sent through a cross-profile lookup with nothing to look up.
+    #[tokio::test]
+    #[serial]
+    async fn absent_identifier_stays_on_the_callers_profile() {
+        let _temp = isolate();
+        seed("aaa-decoy-default", "0000aaaa", "decoy");
+
+        assert_eq!("", owning_profile_for("", None).unwrap());
+        assert_eq!("prof-x", owning_profile_for("prof-x", None).unwrap());
     }
 }
 
