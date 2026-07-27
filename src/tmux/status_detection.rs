@@ -919,40 +919,108 @@ pub(crate) fn claude_pane_input_ready(raw_content: &str) -> bool {
         })
 }
 
-/// The non-empty text a human has parked at the Claude composer's `❯`
-/// prompt, if any. `claude_pane_input_ready` counts a composer holding a
-/// half-typed draft as "ready", but injecting into it fuses the operator's
-/// text with the injected message and submits the blob under their name —
-/// the WO#453 collision. Callers use this to defer injection until the
-/// draft clears (or to mark the boundary when they can't wait). Numbered
-/// menu cursors (`❯ 1. ...`) are dialogs, not drafts, and return `None`,
-/// as does an empty or whitespace-only composer. `pub(crate)` for the
-/// daemon send path.
+/// Rows below the `❯` prompt scanned for the composer box's closing rule.
+/// Sized above any composer a human keeps open. Exhausting it means the
+/// capture is not a composer shape we recognize, so the scan falls back to
+/// the prompt row rather than reporting unrelated output as a draft.
+const CLAUDE_COMPOSER_MAX_REGION: usize = 12;
+
+/// The box-drawing rule that closes the Claude composer. A short run of the
+/// drawing glyphs is enough, since a human does not readily type them and a
+/// row made only of them is chrome; an ASCII run has to be long, because a
+/// draft may legitimately hold a markdown `---`.
+fn claude_line_is_horizontal_rule(trimmed: &str) -> bool {
+    let len = trimmed.chars().count();
+    let drawn = trimmed
+        .chars()
+        .all(|c| matches!(c, '─' | '━' | '┄' | '┅' | '┈' | '┉' | '╌' | '╍' | '═'));
+    (drawn && len >= 3) || (trimmed.chars().all(|c| c == '-') && len >= 10)
+}
+
+/// The non-empty text a human has parked in the Claude composer, if any.
+/// `claude_pane_input_ready` counts a composer holding a half-typed draft as
+/// "ready", but injecting into it fuses the operator's text with the injected
+/// message and submits the blob under their name — the WO#453 collision.
+/// Callers use this to defer injection until the draft clears (or to mark the
+/// boundary when they can't wait). Numbered menu cursors (`❯ 1. ...`) are
+/// dialogs, not drafts, and return `None`, as does an empty composer.
+/// `pub(crate)` for the daemon send path.
+///
+/// Reads the composer's whole region — the `❯` row plus every continuation row
+/// down to the box's closing rule — not just the prompt row. A draft whose
+/// first line is empty (any paste beginning with a newline) renders with its
+/// text on a continuation row and an empty `❯` row, so a prompt-row-only read
+/// reports "no draft" and the caller injects straight into it. That is the
+/// WO#904 bypass, observed in the wild on a live session. Blank rows inside
+/// the box are interior, not content, and must not be filtered out before the
+/// rows are located: dropping them is what made the prompt row and its
+/// continuation rows indistinguishable.
 pub(crate) fn claude_composer_draft(raw_content: &str) -> Option<String> {
     let clean = strip_ansi(raw_content);
-    clean
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect::<Vec<&str>>()
-        .iter()
-        .rev()
-        .take(CLAUDE_COMPOSER_TAIL)
-        .find_map(|line| {
-            let trimmed = line.trim();
-            if claude_line_is_numbered_choice(trimmed) {
-                return None;
+    let lines: Vec<&str> = clean.lines().collect();
+
+    // Locate the `❯` row, scanning up from the bottom over the same trailing
+    // window the readiness check uses. Blank rows are box interior, so they
+    // do not consume the budget.
+    let mut examined = 0usize;
+    let mut prompt = None;
+    for (row, line) in lines.iter().enumerate().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        examined += 1;
+        if examined > CLAUDE_COMPOSER_TAIL {
+            break;
+        }
+        if claude_line_is_numbered_choice(trimmed) {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('❯') {
+            if rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace) {
+                prompt = Some((row, rest.trim()));
+                break;
             }
-            let draft = trimmed.strip_prefix('❯')?.trim();
-            if draft.is_empty() {
-                return None;
-            }
-            // With messages queued, Claude Code parks this dim hint on the
-            // `❯` line (captured live, WO#453) — UI chrome, not a draft.
-            if draft == "Press up to edit queued messages" {
-                return None;
-            }
-            Some(draft.to_string())
-        })
+        }
+    }
+    let (prompt_row, prompt_text) = prompt?;
+
+    let mut body = vec![prompt_text.to_string()];
+    let mut closed = false;
+    let mut row = prompt_row + 1;
+    while row < lines.len() && row - prompt_row <= CLAUDE_COMPOSER_MAX_REGION {
+        let trimmed = lines[row].trim();
+        if claude_line_is_horizontal_rule(trimmed) {
+            closed = true;
+            break;
+        }
+        body.push(trimmed.to_string());
+        row += 1;
+    }
+    if row >= lines.len() && body.len() == 1 {
+        // The `❯` row is the last row captured (short pane, composer on the
+        // bottom row): the end of the capture closes the box just as the rule
+        // would. A capture that runs past continuation rows and never finds a
+        // rule is a shape we cannot delimit, so it takes the fallback instead
+        // of swallowing whatever followed the prompt.
+        closed = true;
+    }
+
+    let joined = if closed {
+        body.join("\n")
+    } else {
+        body[0].clone()
+    };
+    let draft = joined.trim();
+    if draft.is_empty() {
+        return None;
+    }
+    // With messages queued, Claude Code parks this dim hint on the `❯` line
+    // (captured live, WO#453) — UI chrome, not a draft.
+    if draft == "Press up to edit queued messages" {
+        return None;
+    }
+    Some(draft.to_string())
 }
 
 /// `message` is sitting unsubmitted in the Claude composer: the paste landed
@@ -3461,6 +3529,101 @@ enter to select · esc to cancel";
         assert_eq!(
             claude_composer_draft(pane),
             Some("BEN DRAFT WO453 probe2 half-typed".to_string())
+        );
+    }
+
+    #[test]
+    fn test_claude_composer_draft_sees_text_on_continuation_row() {
+        // Captured live from `%1340 aoe_for-Directory` during the WO#904
+        // fleet census. The composer's `❯` row is EMPTY and the operator's
+        // parked text sits on a continuation row two rows below it, which is
+        // what Claude Code renders for a draft that begins with a newline (a
+        // paste starting with one is enough). Reading only the `❯` row
+        // reports "no draft", so the send proceeds and fuses the injected
+        // message with text the operator never sent.
+        let pane = concat!(
+            "────────────────────────────────────────\n",
+            "❯ \n",
+            "\n",
+            "\n",
+            "  [Pasted text #5 +83 lines]\n",
+            "────────────────────────────────────────\n",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        );
+        assert_eq!(
+            claude_composer_draft(pane),
+            Some("[Pasted text #5 +83 lines]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_claude_composer_draft_joins_multi_row_draft() {
+        // A plain two-line draft: both rows belong to the operator, so both
+        // are reported. The refusal payload's char and line counts derive from
+        // this string, so dropping the continuation would undercount a draft
+        // as well as miss one.
+        let pane = concat!(
+            "────────────────────────────────────────\n",
+            "❯ alpha one\n",
+            "  beta two\n",
+            "────────────────────────────────────────\n",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        );
+        assert_eq!(
+            claude_composer_draft(pane),
+            Some("alpha one\nbeta two".to_string())
+        );
+    }
+
+    #[test]
+    fn test_claude_composer_draft_none_on_empty_multi_row_composer() {
+        // Captured live from `%1518 aoe_per-Macbook`: a genuinely EMPTY
+        // composer that still renders two blank continuation rows, with the
+        // caret parked on the last one (`cursor_y` two rows below the `❯` row,
+        // `cursor_x` at the prompt's own indent). Scanning the whole region
+        // must not invent a draft here. This shape is also why the caret's row
+        // cannot be read as evidence of content: "the cursor sits below the
+        // `❯` row" is true of this empty composer.
+        let pane = concat!(
+            "────────────────────────────────────────\n",
+            "❯ \n",
+            "\n",
+            "\n",
+            "────────────────────────────────────────\n",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        );
+        assert_eq!(claude_composer_draft(pane), None);
+    }
+
+    #[test]
+    fn test_claude_composer_draft_stops_at_the_closing_rule() {
+        // The chrome under the composer is not the operator's text. A region
+        // scan that ran past the closing rule would report the permissions
+        // footer as a parked draft and refuse every send to every pane.
+        let pane = concat!(
+            "────────────────────────────────────────\n",
+            "❯ \n",
+            "────────────────────────────────────────\n",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n",
+            "  ⏸ 2 background tasks"
+        );
+        assert_eq!(claude_composer_draft(pane), None);
+    }
+
+    #[test]
+    fn test_claude_composer_draft_reads_bottom_row_composer() {
+        // Captured live from `%1455 aoe_for-avops`: on a short pane the
+        // composer is the bottom row of the screen, so the capture ends
+        // without a closing rule. The `❯` row still carries the draft.
+        let pane = concat!(
+            "   … +55 completed\n",
+            "                    new task? /clear to save 151.2k tokens\n",
+            "─────────────────────────── planet 9 draft av ops ──\n",
+            "❯ go with B on marketing"
+        );
+        assert_eq!(
+            claude_composer_draft(pane),
+            Some("go with B on marketing".to_string())
         );
     }
 

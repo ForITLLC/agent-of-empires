@@ -11859,12 +11859,96 @@ fn default_revive() -> bool {
     true
 }
 
+#[derive(Debug)]
 enum SendKeysError {
     NotRunning,
     ResumeFailed(String),
     Transient(Status),
     StructuredView,
+    /// The composer holds a human's unsent draft, so the send was refused
+    /// before anything was typed. Distinct from [`Self::Tmux`] because the
+    /// two answer the caller's real question -- "can I retry?" -- in opposite
+    /// ways: this one delivered nothing and knows it.
+    ParkedDraft(crate::tmux::ParkedDraftRefusal),
     Tmux(anyhow::Error),
+}
+
+/// The HTTP shape of a failed send.
+///
+/// Pure, and separate from [`send_message`]'s state-sync side effects, so the
+/// contract a caller depends on can be asserted without a daemon, a tmux
+/// server or a live pane.
+fn send_error_parts(err: &SendKeysError) -> (StatusCode, serde_json::Value) {
+    match err {
+        SendKeysError::NotRunning => (
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": "session_not_running"}),
+        ),
+        SendKeysError::ResumeFailed(sid) => (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "resume_failed",
+                "message": format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                "resume_session_id": sid,
+            }),
+        ),
+        SendKeysError::Transient(status) => (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "session_transient",
+                "status": format!("{status:?}"),
+            }),
+        ),
+        SendKeysError::StructuredView => (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "acp_mode_unsupported"}),
+        ),
+        // 423 LOCKED, used by no other arm, so a caller can branch on the
+        // status line before parsing a body. It is also the accurate reading:
+        // the composer is held by a human, and the hold is not the daemon's
+        // to break. Deliberately NOT 5xx -- refusing is the daemon working,
+        // not failing.
+        SendKeysError::ParkedDraft(refusal) => (
+            StatusCode::LOCKED,
+            serde_json::json!({
+                "error": "parked_draft",
+                "reason": "operator_draft_in_composer",
+                // The field that decides retry safety. Nothing was typed into
+                // the pane, so a retry cannot double-deliver.
+                "sent": false,
+                "retry_safe": true,
+                // ...but it stays futile until a human acts, and a caller told
+                // only "retryable" will spin against an unchanged composer.
+                "retry_when": "composer_clear",
+                // Size only. The draft is a human's unsent words and this body
+                // reaches every agent that calls the send API.
+                "draft_chars": refusal.chars,
+                "draft_lines": refusal.lines,
+                "detail": refusal.to_string(),
+            }),
+        ),
+        // No `sent` field: a transport failure genuinely does not know whether
+        // the message landed, and asserting either way would be a guess the
+        // caller cannot audit.
+        SendKeysError::Tmux(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error": "tmux_error"}),
+        ),
+    }
+}
+
+/// The durable audit row's outcome string, read by `GET /api/messages` and by
+/// later sessions reconstructing what happened. A refusal recorded as
+/// `error: tmux_error` is a false record of a fault that never occurred.
+fn send_error_audit_outcome(err: &SendKeysError) -> String {
+    match err {
+        SendKeysError::NotRunning => "error: session_not_running".to_string(),
+        SendKeysError::ResumeFailed(_) => "error: resume_failed".to_string(),
+        SendKeysError::Transient(_) => "error: session_transient".to_string(),
+        SendKeysError::StructuredView => "error: acp_mode_unsupported".to_string(),
+        SendKeysError::ParkedDraft(_) => "refused: parked_draft".to_string(),
+        SendKeysError::Tmux(_) => "error: tmux_error".to_string(),
+    }
 }
 
 type SendKeysResult =
@@ -11989,7 +12073,15 @@ pub async fn send_message(
         // the composer accepts its Enter; the verified variant gates on
         // composer readiness and resubmits a swallowed Enter (never re-pastes).
         if let Err(e) = tmux_session.send_keys_verified(&message, delay, &tool) {
-            return Err(Box::new((inst_owned, outcome, SendKeysError::Tmux(e))));
+            // A parked-draft refusal arrives on the same Result as a real tmux
+            // failure, so it has to be recovered by type here or the caller
+            // cannot tell "nothing was sent, deliberately" from "the transport
+            // broke, delivery unknown".
+            let err = match e.downcast::<crate::tmux::ParkedDraftRefusal>() {
+                Ok(refusal) => SendKeysError::ParkedDraft(refusal),
+                Err(e) => SendKeysError::Tmux(e),
+            };
+            return Err(Box::new((inst_owned, outcome, err)));
         }
         Ok((outcome, inst_owned))
     })
@@ -12001,13 +12093,7 @@ pub async fn send_message(
     {
         let outcome = match &send_result {
             Ok(Ok(_)) => "sent".to_string(),
-            Ok(Err(boxed)) => match &boxed.2 {
-                SendKeysError::NotRunning => "error: session_not_running".to_string(),
-                SendKeysError::ResumeFailed(_) => "error: resume_failed".to_string(),
-                SendKeysError::Transient(_) => "error: session_transient".to_string(),
-                SendKeysError::StructuredView => "error: acp_mode_unsupported".to_string(),
-                SendKeysError::Tmux(_) => "error: tmux_error".to_string(),
-            },
+            Ok(Err(boxed)) => send_error_audit_outcome(&boxed.2),
             Err(_) => "error: internal".to_string(),
         };
         let rec = crate::messages::MessageRecord {
@@ -12086,7 +12172,10 @@ pub async fn send_message(
             // touch fields the live entry needs to reflect (fresh sid from
             // acquire, last_start_time, etc.). Sync only when work happened.
             let did_work = !matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
-            match send_err {
+            // State reconciliation only. The response itself is built once,
+            // below, by `send_error_parts`, so the wire contract cannot drift
+            // per-variant as these sync rules change.
+            match &send_err {
                 SendKeysError::NotRunning => {
                     // External kill or remain-on-exit-off crash can race
                     // ensure_pane_ready's Alive decision against the
@@ -12101,40 +12190,32 @@ pub async fn send_message(
                             apply_cascade_state_sync(i, &sync_base, &started);
                         }
                     }
-                    (
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({"error": "session_not_running"})),
-                    )
-                        .into_response()
                 }
-                SendKeysError::ResumeFailed(sid) => {
+                SendKeysError::ResumeFailed(_) => {
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                         apply_post_restart_sync(i, &sync_base, &started);
                     }
-                    (
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({
-                            "error": "resume_failed",
-                            "message": format!("Resume failed for sid {sid}; preserved for explicit retry"),
-                            "resume_session_id": sid,
-                        })),
-                    )
-                        .into_response()
                 }
-                SendKeysError::Transient(status) => (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "session_transient",
-                        "status": format!("{status:?}"),
-                    })),
-                )
-                    .into_response(),
-                SendKeysError::StructuredView => (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "acp_mode_unsupported"})),
-                )
-                    .into_response(),
+                SendKeysError::Transient(_) | SendKeysError::StructuredView => {}
+                SendKeysError::ParkedDraft(refusal) => {
+                    // Deliberately NO status/last_error write. The session is
+                    // healthy and is doing the right thing; painting it Error
+                    // would make a human's parked keystrokes look like a fault
+                    // and invite an operator to "fix" the pane, which is the
+                    // one outcome that could destroy their text.
+                    tracing::info!(
+                        target: "http.api.sessions",
+                        "send_message: refused for {id}: operator draft in composer ({} chars)",
+                        refusal.chars,
+                    );
+                    if did_work {
+                        let mut instances = state.instances.write().await;
+                        if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
+                            apply_cascade_state_sync(i, &sync_base, &started);
+                        }
+                    }
+                }
                 SendKeysError::Tmux(e) => {
                     tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
                     let msg = e.to_string();
@@ -12154,13 +12235,10 @@ pub async fn send_message(
                             i.last_error = Some(msg);
                         }
                     }
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "tmux_error"})),
-                    )
-                        .into_response()
                 }
             }
+            let (status, body) = send_error_parts(&send_err);
+            (status, Json(body)).into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "send_message: blocking task panicked for {id}: {e}");
@@ -12460,6 +12538,135 @@ pub async fn read_output(
             )
                 .into_response()
         }
+    }
+}
+
+/// The send-failure contract, as seen by a caller.
+///
+/// These pin the one distinction a caller cannot recover on its own: whether a
+/// failed send LEFT NOTHING BEHIND (safe to retry, and futile until a human
+/// acts) or FAILED IN TRANSPORT (delivery genuinely unknown). Both used to
+/// arrive as `500 {"error":"tmux_error"}`, so every caller had to guess.
+#[cfg(test)]
+mod send_error_contract_tests {
+    use super::*;
+    use crate::tmux::ParkedDraftRefusal;
+
+    fn refusal() -> SendKeysError {
+        SendKeysError::ParkedDraft(ParkedDraftRefusal::from_draft(
+            "yes, authorize the Pax8 bump",
+        ))
+    }
+
+    fn transport_failure() -> SendKeysError {
+        SendKeysError::Tmux(anyhow::anyhow!("tmux: no server running"))
+    }
+
+    /// The defect WO#904 names. A refusal and a transport failure decide
+    /// opposite things about retry safety, so they may not look alike.
+    #[test]
+    fn test_a_refusal_is_not_reported_as_a_transport_failure() {
+        let (refused_status, refused_body) = send_error_parts(&refusal());
+        let (failed_status, failed_body) = send_error_parts(&transport_failure());
+        assert_ne!(
+            refused_status, failed_status,
+            "a refusal shares its status with a transport failure; callers cannot branch on it"
+        );
+        assert_ne!(refused_body["error"], failed_body["error"]);
+        assert!(
+            !refused_status.is_server_error(),
+            "a refusal is a deliberate, correct outcome -- 5xx tells the caller the daemon broke"
+        );
+    }
+
+    /// "Its own status": a caller must be able to branch on the status line
+    /// alone, before parsing any body.
+    #[test]
+    fn test_the_refusal_status_is_used_by_no_other_send_error() {
+        let (refused_status, _) = send_error_parts(&refusal());
+        for other in [
+            SendKeysError::NotRunning,
+            SendKeysError::ResumeFailed("sid".into()),
+            SendKeysError::Transient(crate::session::Status::Starting),
+            SendKeysError::StructuredView,
+            transport_failure(),
+        ] {
+            let (status, _) = send_error_parts(&other);
+            assert_ne!(refused_status, status, "status collides with {other:?}");
+        }
+    }
+
+    /// The field that actually decides whether a retry can double-deliver.
+    /// The refusal KNOWS nothing was sent; the transport failure does not, and
+    /// must not pretend otherwise.
+    #[test]
+    fn test_only_the_refusal_claims_certainty_that_nothing_was_sent() {
+        let (_, refused_body) = send_error_parts(&refusal());
+        assert_eq!(
+            Some(false),
+            refused_body["sent"].as_bool(),
+            "the refusal must state definitively that nothing was delivered"
+        );
+        let (_, failed_body) = send_error_parts(&transport_failure());
+        assert!(
+            failed_body["sent"].is_null(),
+            "a transport failure cannot know whether the message landed; claiming it did not is a lie"
+        );
+    }
+
+    /// A machine-readable reason, not prose. Callers branch on this; prose
+    /// gets reworded and silently unparses every reader.
+    #[test]
+    fn test_the_refusal_carries_a_stable_machine_readable_reason() {
+        let (_, body) = send_error_parts(&refusal());
+        assert_eq!("parked_draft", body["error"].as_str().unwrap());
+        assert_eq!(
+            "operator_draft_in_composer",
+            body["reason"].as_str().unwrap()
+        );
+        assert_eq!(28, body["draft_chars"].as_u64().unwrap());
+        assert_eq!(1, body["draft_lines"].as_u64().unwrap());
+    }
+
+    /// Retrying cannot duplicate (nothing was sent), but it stays futile until
+    /// a human clears the composer. A caller told only "retryable" will spin.
+    #[test]
+    fn test_the_refusal_names_the_condition_that_ends_it() {
+        let (_, body) = send_error_parts(&refusal());
+        assert_eq!(Some(true), body["retry_safe"].as_bool());
+        assert_eq!("composer_clear", body["retry_when"].as_str().unwrap());
+    }
+
+    /// The response reaches every agent that calls the send API. The draft is
+    /// a human's unsent words; the size is enough to recognise it, the text
+    /// would republish it to exactly the audience it was never sent to.
+    #[test]
+    fn test_the_refusal_body_never_carries_the_drafts_text() {
+        let (_, body) = send_error_parts(&refusal());
+        let blob = body.to_string();
+        assert!(
+            !blob.contains("Pax8"),
+            "refusal body leaked the draft: {blob}"
+        );
+        assert!(
+            !blob.contains("authorize"),
+            "refusal body leaked the draft: {blob}"
+        );
+    }
+
+    /// The durable audit row is how a later session reconstructs what
+    /// happened. A refusal logged as `error: tmux_error` is a false record of
+    /// a fault that never occurred.
+    #[test]
+    fn test_the_audit_row_records_a_refusal_as_a_refusal() {
+        assert_eq!(
+            "refused: parked_draft",
+            send_error_audit_outcome(&refusal())
+        );
+        assert_eq!(
+            "error: tmux_error",
+            send_error_audit_outcome(&transport_failure())
+        );
     }
 }
 

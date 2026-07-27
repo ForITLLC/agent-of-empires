@@ -1481,12 +1481,15 @@ impl Session {
                 let deadline = *draft_deadline
                     .get_or_insert_with(|| std::time::Instant::now() + DRAFT_TIMEOUT);
                 if std::time::Instant::now() >= deadline {
-                    let refusal = parked_draft_refusal(&draft);
+                    let refusal = ParkedDraftRefusal::from_draft(&draft);
                     tracing::warn!(target: "tmux.command",
                         "send_keys_verified: operator draft still in composer after \
                          {DRAFT_TIMEOUT:?}; {refusal}"
                     );
-                    bail!("{refusal}");
+                    // Typed, not `bail!`: the API layer has to tell this
+                    // refusal apart from a transport failure, and only a
+                    // downcastable value survives the anyhow boundary.
+                    return Err(refusal.into());
                 }
                 std::thread::sleep(READY_POLL);
                 continue;
@@ -1518,11 +1521,11 @@ impl Session {
                 // rode exactly this branch). If the final capture shows one,
                 // refuse here too rather than fuse.
                 if let Some(draft) = super::status_detection::claude_composer_draft(&content) {
-                    let refusal = parked_draft_refusal(&draft);
+                    let refusal = ParkedDraftRefusal::from_draft(&draft);
                     tracing::warn!(target: "tmux.command",
                         "send_keys_verified: draft visible on an unready composer; {refusal}"
                     );
-                    bail!("{refusal}");
+                    return Err(refusal.into());
                 }
                 break;
             }
@@ -2226,20 +2229,52 @@ pub(crate) const INJECT_DRAFT_DELIMITER: &str =
 
 /// Explains a refused injection WITHOUT reproducing the operator's draft.
 ///
-/// The refusal reaches the caller and the daemon log, both of which other
-/// agents read. The draft is text a human typed and never sent; echoing it
-/// here would republish it to exactly the audience the composer split was
-/// closed against. Size is reported instead -- enough for an operator to
-/// recognise their own half-written message, useless to anyone else.
-pub(crate) fn parked_draft_refusal(draft: &str) -> String {
-    let chars = draft.chars().count();
-    let lines = draft.lines().count().max(1);
-    format!(
-        "operator draft parked in the composer ({chars} chars, {lines} line(s), \
-         content withheld); message NOT SENT. Injecting would submit the human's \
-         unsent draft under their name. Retry once the composer is clear."
-    )
+/// This is a TYPE and not a message because of where it has to travel. The
+/// refusal leaves `send_keys_verified` as an `anyhow::Error`, the same channel
+/// carrying genuine tmux transport failures, and the API layer at the far end
+/// has to tell them apart: a refusal delivered nothing and says so with
+/// certainty, whereas a transport failure leaves delivery unknown. Prose
+/// cannot survive that boundary -- it can only be logged -- so the API used to
+/// report both as `500 {"error":"tmux_error"}` and every caller had to guess
+/// whether retrying would double-deliver.
+///
+/// It carries the draft's SIZE and never its text: enough for the operator to
+/// recognise their own half-written message, useless to anyone else. See
+/// [`Self::fmt`] for why the rendered wording is fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedDraftRefusal {
+    /// Characters in the parked draft. Never the draft itself.
+    pub chars: usize,
+    /// Lines in the parked draft, floored at 1 -- a draft with no newline is
+    /// still one line, and `0 lines` would name nothing recognisable.
+    pub lines: usize,
 }
+
+impl ParkedDraftRefusal {
+    pub(crate) fn from_draft(draft: &str) -> Self {
+        Self {
+            chars: draft.chars().count(),
+            lines: draft.lines().count().max(1),
+        }
+    }
+}
+
+impl std::fmt::Display for ParkedDraftRefusal {
+    /// The wording is a WIRE FORMAT. It is already in daemon logs that other
+    /// sessions grep, and the tests pin it; rewording it silently unparses
+    /// every existing reader.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (chars, lines) = (self.chars, self.lines);
+        write!(
+            f,
+            "operator draft parked in the composer ({chars} chars, {lines} line(s), \
+             content withheld); message NOT SENT. Injecting would submit the human's \
+             unsent draft under their name. Retry once the composer is clear."
+        )
+    }
+}
+
+impl std::error::Error for ParkedDraftRefusal {}
 
 /// Refuses to send any message carrying the injection boundary marker.
 ///
@@ -2278,6 +2313,13 @@ mod tests {
         );
     }
 
+    /// The refusal as a caller reads it: the rendered wording, which is what
+    /// the assertions below are about. Production code carries the typed
+    /// [`ParkedDraftRefusal`] instead, because the API layer needs the fields.
+    fn parked_draft_refusal(draft: &str) -> String {
+        ParkedDraftRefusal::from_draft(draft).to_string()
+    }
+
     /// A refusal is reported to the caller and lands in the daemon log. The
     /// draft is the human's unsent text; echoing it there republishes it to
     /// every agent that reads the error, which is the same leak the composer
@@ -2310,6 +2352,53 @@ mod tests {
         let draft = "line one\nline two";
         let msg = parked_draft_refusal(draft);
         assert!(msg.contains(&draft.chars().count().to_string()), "{msg:?}");
+    }
+
+    /// THE regression this type exists to prevent.
+    ///
+    /// The refusal travels to the API layer as an `anyhow::Error`, shared with
+    /// genuine tmux transport failures. While the reason was only prose, the
+    /// API could not tell the two apart and reported both as
+    /// `500 {"error":"tmux_error"}` -- so a caller could not know whether the
+    /// message had been delivered, and therefore could not know whether
+    /// retrying was safe. Carrying the reason as a downcastable type is what
+    /// makes the distinction survive that boundary.
+    #[test]
+    fn test_refusal_survives_the_anyhow_boundary_as_a_type() {
+        let err: anyhow::Error = ParkedDraftRefusal::from_draft("line one\nline two").into();
+        let recovered = err
+            .downcast_ref::<ParkedDraftRefusal>()
+            .expect("refusal must remain identifiable after crossing anyhow");
+        assert_eq!(17, recovered.chars);
+        assert_eq!(2, recovered.lines);
+    }
+
+    /// A transport failure must NOT be mistakable for a refusal. If an
+    /// arbitrary error downcast to a refusal, the API would tell callers
+    /// "nothing was sent" about a send whose fate is genuinely unknown --
+    /// inverting the very guarantee the type is here to make.
+    #[test]
+    fn test_a_generic_tmux_failure_does_not_downcast_to_a_refusal() {
+        let err = anyhow::anyhow!("tmux: no server running on /tmp/tmux-501/default");
+        assert!(err.downcast_ref::<ParkedDraftRefusal>().is_none());
+    }
+
+    /// The refusal prose is a WIRE FORMAT: it is already in daemon logs, and
+    /// the tests above pin its wording. Typing the reason must not reword it.
+    #[test]
+    fn test_typed_refusal_renders_the_same_prose_as_before() {
+        let draft = "half a sentence";
+        assert_eq!(
+            parked_draft_refusal(draft),
+            ParkedDraftRefusal::from_draft(draft).to_string()
+        );
+    }
+
+    /// An empty draft is not a draft. Reporting `0 chars` would refuse a send
+    /// while naming nothing the operator could recognise.
+    #[test]
+    fn test_refusal_counts_a_single_line_draft_as_one_line() {
+        assert_eq!(1, ParkedDraftRefusal::from_draft("no newline here").lines);
     }
 
     /// Forgery guard. The delimiter's whole meaning is "a human typed the text
