@@ -391,19 +391,19 @@ fn goal_flags_apply(inst: &Instance) -> bool {
 
 /// True when the session has a goal but a work-order dispatch newer than the
 /// last goal write has outlived the grace window: the worker is running under
-/// a pre-assignment objective. A missing `goal_updated_at` (legacy record)
-/// reads as the epoch, so any aged dispatch flags it; records that never saw
-/// a dispatch never flag. See per-dev WO #529.
+/// a pre-assignment objective. Two classes never flag (per-dev #211): a goal
+/// recorded as perpetual, which is meant to outlive every work order, and a
+/// legacy record with no `goal_updated_at`, whose freshness is unknown rather
+/// than stale. Records that never saw a dispatch never flag. See per-dev
+/// WO #529.
 fn goal_stale_at(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
-    if inst.goal.is_none() || !goal_flags_apply(inst) {
+    if inst.goal.is_none() || inst.goal_perpetual || !goal_flags_apply(inst) {
         return false;
     }
-    let Some(dispatched) = inst.last_wo_dispatch_at else {
+    let (Some(dispatched), Some(goal_set)) = (inst.last_wo_dispatch_at, inst.goal_updated_at)
+    else {
         return false;
     };
-    let goal_set = inst
-        .goal_updated_at
-        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
     dispatched > goal_set && (now - dispatched).num_seconds() >= GOAL_STALE_GRACE_SECS
 }
 
@@ -2855,6 +2855,12 @@ pub struct UpdateGoalBody {
     /// so a malformed PATCH silently erased the record. See per-dev WO #937 A6.
     #[serde(default, deserialize_with = "deserialize_present")]
     pub goal: Option<Option<String>>,
+    /// Marks the goal a standing objective — a monitoring loop, a charter —
+    /// that is meant to outlive the work orders dispatched under it. Absent
+    /// leaves whatever the record already says, so an ordinary goal edit
+    /// cannot silently demote one. See per-dev #211.
+    #[serde(default)]
+    pub perpetual: Option<bool>,
 }
 
 fn deserialize_present<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
@@ -2875,7 +2881,11 @@ pub const GOAL_MAX_CHARS: usize = 16_384;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum GoalUpdate {
-    Set(String),
+    Set {
+        goal: String,
+        /// `None` leaves the stored perpetual flag alone. See per-dev #211.
+        perpetual: Option<bool>,
+    },
     Clear,
 }
 
@@ -2907,7 +2917,10 @@ fn goal_update_from_body(body: &UpdateGoalBody) -> Result<GoalUpdate, GoalUpdate
             max: GOAL_MAX_CHARS,
         });
     }
-    Ok(GoalUpdate::Set(goal.to_string()))
+    Ok(GoalUpdate::Set {
+        goal: goal.to_string(),
+        perpetual: body.perpetual,
+    })
 }
 
 pub async fn get_session_goal(
@@ -2933,6 +2946,7 @@ pub async fn get_session_goal(
             "goal": inst.goal,
             "goal_len": inst.goal.as_deref().map(str::chars).map(Iterator::count).unwrap_or(0),
             "goal_max": GOAL_MAX_CHARS,
+            "perpetual": inst.goal_perpetual,
         })),
     )
         .into_response()
@@ -2973,9 +2987,11 @@ pub async fn set_session_goal(
         inst.source_profile.clone()
     };
 
-    let new_goal = match goal_update_from_body(&body) {
-        Ok(GoalUpdate::Set(goal)) => Some(goal),
-        Ok(GoalUpdate::Clear) => None,
+    // `new_perpetual` of `None` leaves the stored flag untouched; a clear resets
+    // it, because the standing objective it described is gone. See per-dev #211.
+    let (new_goal, new_perpetual) = match goal_update_from_body(&body) {
+        Ok(GoalUpdate::Set { goal, perpetual }) => (Some(goal), perpetual),
+        Ok(GoalUpdate::Clear) => (None, Some(false)),
         Err(GoalUpdateError::Omitted) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -3014,6 +3030,9 @@ pub async fn set_session_goal(
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 inst.goal = persist_goal;
                 inst.goal_updated_at = Some(stamped_at);
+                if let Some(perpetual) = new_perpetual {
+                    inst.goal_perpetual = perpetual;
+                }
             }
         },
     )
@@ -3034,10 +3053,17 @@ pub async fn set_session_goal(
     };
     inst.goal = new_goal;
     inst.goal_updated_at = Some(stamped_at);
+    if let Some(perpetual) = new_perpetual {
+        inst.goal_perpetual = perpetual;
+    }
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "id": inst.id, "goal": inst.goal })),
+        Json(serde_json::json!({
+            "id": inst.id,
+            "goal": inst.goal,
+            "perpetual": inst.goal_perpetual,
+        })),
     )
         .into_response()
 }
@@ -9473,7 +9499,10 @@ mod tests {
     fn a_goal_is_stored_trimmed() {
         assert_eq!(
             goal_update_from_body(&parse_goal_body("{\"goal\":\"  ship it  \"}")),
-            Ok(GoalUpdate::Set("ship it".to_string()))
+            Ok(GoalUpdate::Set {
+                goal: "ship it".to_string(),
+                perpetual: None
+            })
         );
     }
 
@@ -9500,7 +9529,10 @@ mod tests {
             goal_update_from_body(&parse_goal_body(
                 &serde_json::json!({ "goal": at_cap }).to_string()
             )),
-            Ok(GoalUpdate::Set("g".repeat(GOAL_MAX_CHARS)))
+            Ok(GoalUpdate::Set {
+                goal: "g".repeat(GOAL_MAX_CHARS),
+                perpetual: None
+            })
         );
     }
 
@@ -9568,15 +9600,69 @@ mod tests {
         inst.last_wo_dispatch_at = None;
         assert!(!goal_stale_at(&inst, now), "no dispatch means not stale");
 
-        // Legacy record: goal present but never stamped. A sufficiently old
-        // dispatch still flags it (missing stamp reads as the epoch).
+        // Legacy record: goal present but never stamped. The freshness of that
+        // goal is unknown, not stale; treating the missing stamp as the epoch
+        // flagged every pre-WO#529 record forever. See per-dev #211.
         inst.goal_updated_at = None;
         inst.last_wo_dispatch_at = Some(now - Duration::seconds(GOAL_STALE_GRACE_SECS + 60));
-        assert!(goal_stale_at(&inst, now), "unstamped legacy goal must flag");
+        assert!(
+            !goal_stale_at(&inst, now),
+            "unstamped legacy goal is unknown, not stale"
+        );
 
         // Archived sessions never flag.
+        inst.goal_updated_at = Some(now - Duration::seconds(3600));
         inst.archived_at = Some(now);
         assert!(!goal_stale_at(&inst, now), "archived session must not flag");
+    }
+
+    #[test]
+    fn perpetual_goal_never_goes_stale() {
+        // per-dev #211: a standing objective (a monitoring loop, a charter) is
+        // meant to outlive many work orders. The timestamp heuristic reads
+        // every later dispatch as evidence the goal is out of date, so such a
+        // session flagged permanently and the flag stopped meaning anything.
+        // Perpetuity is recorded on the goal, not inferred from its prose.
+        use chrono::Duration;
+        let now = chrono::Utc::now();
+        let mut inst = make_test_instance();
+        inst.goal = Some("watch the agile chat and react — never self-close".to_string());
+        inst.goal_updated_at = Some(now - Duration::seconds(3600));
+        inst.last_wo_dispatch_at = Some(now - Duration::seconds(GOAL_STALE_GRACE_SECS + 60));
+        assert!(
+            goal_stale_at(&inst, now),
+            "control: a one-shot goal behind a dispatch still flags"
+        );
+
+        inst.goal_perpetual = true;
+        assert!(
+            !goal_stale_at(&inst, now),
+            "a perpetual goal must never flag stale"
+        );
+    }
+
+    #[test]
+    fn perpetual_rides_on_the_goal_write() {
+        // The flag is set through the same PATCH that writes the goal, so a
+        // caller cannot mark a session perpetual without saying what for.
+        assert_eq!(
+            goal_update_from_body(&parse_goal_body(
+                "{\"goal\":\"monitor the queue\",\"perpetual\":true}"
+            )),
+            Ok(GoalUpdate::Set {
+                goal: "monitor the queue".to_string(),
+                perpetual: Some(true)
+            })
+        );
+        // Absent means "leave whatever the record already says" — a routine
+        // goal edit must not silently demote a standing objective.
+        assert_eq!(
+            goal_update_from_body(&parse_goal_body("{\"goal\":\"monitor the queue\"}")),
+            Ok(GoalUpdate::Set {
+                goal: "monitor the queue".to_string(),
+                perpetual: None
+            })
+        );
     }
 
     #[test]

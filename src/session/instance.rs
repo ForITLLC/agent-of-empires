@@ -1107,6 +1107,15 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_updated_at: Option<DateTime<Utc>>,
 
+    /// Whether `goal` is a standing objective — a monitoring loop, a charter —
+    /// meant to outlive the work orders dispatched under it. Such a goal is
+    /// never stale by construction, so the `goal_stale` timestamp comparison
+    /// is skipped for it entirely. Recorded on the goal write rather than
+    /// inferred from its prose: the flag has to hold whether or not the text
+    /// happens to say "perpetual". See per-dev #211.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub goal_perpetual: bool,
+
     /// When a work-order shaped message (`WO#<n>` or "work order" in the
     /// body) last flowed to this session through the daemon's send API.
     /// Stamped by `send_message`; a dispatch newer than `goal_updated_at`
@@ -1794,6 +1803,7 @@ impl Instance {
             color: None,
             goal: None,
             goal_updated_at: None,
+            goal_perpetual: false,
             last_wo_dispatch_at: None,
             view: View::Terminal,
             agent_name: None,
@@ -2356,6 +2366,9 @@ impl Instance {
         }
         if pre.goal_updated_at != post.goal_updated_at {
             self.goal_updated_at = post.goal_updated_at;
+        }
+        if pre.goal_perpetual != post.goal_perpetual {
+            self.goal_perpetual = post.goal_perpetual;
         }
         if pre.last_wo_dispatch_at != post.last_wo_dispatch_at {
             self.last_wo_dispatch_at = post.last_wo_dispatch_at;
