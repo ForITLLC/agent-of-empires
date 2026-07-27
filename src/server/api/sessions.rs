@@ -2848,9 +2848,66 @@ pub async fn update_session_diff_base(
 
 #[derive(Deserialize)]
 pub struct UpdateGoalBody {
-    /// New goal. `Some(non-empty)` sets it; `Some("")` or `None` clears it.
-    #[serde(default)]
-    pub goal: Option<String>,
+    /// Whether the caller wrote the field at all is load bearing, so this is a
+    /// nested option: the outer `None` means `goal` was absent from the body,
+    /// `Some(None)` is an explicit `null`, `Some(Some(s))` is a string. An
+    /// absent field used to deserialize to the same value as an explicit clear,
+    /// so a malformed PATCH silently erased the record. See per-dev WO #937 A6.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub goal: Option<Option<String>>,
+}
+
+fn deserialize_present<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<String> as serde::Deserialize>::deserialize(de).map(Some)
+}
+
+/// Largest goal the API accepts on a write, in characters. Reads are not
+/// capped: a record written before this bound existed still serves in full, so
+/// raising or lowering the cap never destroys stored text. A caller over the
+/// bound gets a 400 naming both lengths and rolls its own text over by
+/// trimming; the API never truncates on the caller's behalf, because a
+/// silently shortened objective is the same class of defect as a silently
+/// cleared one. See per-dev WO #937 A5.
+pub const GOAL_MAX_CHARS: usize = 16_384;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GoalUpdate {
+    Set(String),
+    Clear,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GoalUpdateError {
+    /// The body carried no `goal` field. Refused rather than treated as a clear.
+    Omitted,
+    TooLong {
+        len: usize,
+        max: usize,
+    },
+}
+
+fn goal_update_from_body(body: &UpdateGoalBody) -> Result<GoalUpdate, GoalUpdateError> {
+    // The outer `None` is an absent field, the inner one an explicit null. Only
+    // the second asks for a clear; the first is a malformed request that used to
+    // erase the record with a 200. See per-dev WO #937 A6.
+    let Some(value) = body.goal.as_ref() else {
+        return Err(GoalUpdateError::Omitted);
+    };
+    let Some(goal) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(GoalUpdate::Clear);
+    };
+    // Characters, not bytes; a non-ASCII goal is not shorter than it reads.
+    let len = goal.chars().count();
+    if len > GOAL_MAX_CHARS {
+        return Err(GoalUpdateError::TooLong {
+            len,
+            max: GOAL_MAX_CHARS,
+        });
+    }
+    Ok(GoalUpdate::Set(goal.to_string()))
 }
 
 pub async fn get_session_goal(
@@ -2865,9 +2922,18 @@ pub async fn get_session_goal(
         )
             .into_response();
     };
+    // `goal_len` lets a caller size the record before reading it. A goal is
+    // free text with no bound before WO #937 A5, and a large one overflows the
+    // consumer's own result limits, so the length has to be readable on its
+    // own. See per-dev WO #937 A5.
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "id": inst.id, "goal": inst.goal })),
+        Json(serde_json::json!({
+            "id": inst.id,
+            "goal": inst.goal,
+            "goal_len": inst.goal.as_deref().map(str::chars).map(Iterator::count).unwrap_or(0),
+            "goal_max": GOAL_MAX_CHARS,
+        })),
     )
         .into_response()
 }
@@ -2907,12 +2973,32 @@ pub async fn set_session_goal(
         inst.source_profile.clone()
     };
 
-    let new_goal = body
-        .goal
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string);
+    let new_goal = match goal_update_from_body(&body) {
+        Ok(GoalUpdate::Set(goal)) => Some(goal),
+        Ok(GoalUpdate::Clear) => None,
+        Err(GoalUpdateError::Omitted) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "goal_omitted",
+                    "message": "body must carry a `goal` field; send null or \"\" to clear it"
+                })),
+            )
+                .into_response();
+        }
+        Err(GoalUpdateError::TooLong { len, max }) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "goal_too_long",
+                    "message": format!("goal is {len} characters, the maximum is {max}"),
+                    "len": len,
+                    "max": max
+                })),
+            )
+                .into_response();
+        }
+    };
 
     // Persist first; only mutate memory once disk is durable. See #1589.
     // The `goal_updated_at` stamp rides along so goal-staleness (WO #529)
@@ -9355,6 +9441,79 @@ mod tests {
             !plain_resp.urgent,
             "session with no hook file must not be urgent"
         );
+    }
+
+    fn parse_goal_body(json: &str) -> UpdateGoalBody {
+        serde_json::from_str(json).expect("body parses")
+    }
+
+    #[test]
+    fn omitted_goal_field_is_refused_not_treated_as_a_clear() {
+        // per-dev WO #937 A6: a PATCH whose body never mentions `goal` used to
+        // deserialize identically to an explicit clear, so a malformed request
+        // erased the record with a 200. Absence must be its own answer.
+        assert_eq!(
+            goal_update_from_body(&parse_goal_body("{}")),
+            Err(GoalUpdateError::Omitted)
+        );
+    }
+
+    #[test]
+    fn explicit_null_and_blank_still_clear_the_goal() {
+        for body in ["{\"goal\":null}", "{\"goal\":\"\"}", "{\"goal\":\"   \"}"] {
+            assert_eq!(
+                goal_update_from_body(&parse_goal_body(body)),
+                Ok(GoalUpdate::Clear),
+                "{body} must clear"
+            );
+        }
+    }
+
+    #[test]
+    fn a_goal_is_stored_trimmed() {
+        assert_eq!(
+            goal_update_from_body(&parse_goal_body("{\"goal\":\"  ship it  \"}")),
+            Ok(GoalUpdate::Set("ship it".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_goal_over_the_cap_is_refused_with_both_lengths() {
+        // per-dev WO #937 A5: goals were unbounded, and a 90k-character record
+        // overflowed its own readers. The write is refused, never truncated.
+        let long = "g".repeat(GOAL_MAX_CHARS + 1);
+        assert_eq!(
+            goal_update_from_body(&parse_goal_body(
+                &serde_json::json!({ "goal": long }).to_string()
+            )),
+            Err(GoalUpdateError::TooLong {
+                len: GOAL_MAX_CHARS + 1,
+                max: GOAL_MAX_CHARS,
+            })
+        );
+    }
+
+    #[test]
+    fn a_goal_exactly_at_the_cap_is_accepted() {
+        let at_cap = "g".repeat(GOAL_MAX_CHARS);
+        assert_eq!(
+            goal_update_from_body(&parse_goal_body(
+                &serde_json::json!({ "goal": at_cap }).to_string()
+            )),
+            Ok(GoalUpdate::Set("g".repeat(GOAL_MAX_CHARS)))
+        );
+    }
+
+    #[test]
+    fn the_cap_counts_characters_not_bytes() {
+        // A multi-byte goal at the character cap is still under it; counting
+        // bytes would reject a legitimate record for being non-ASCII.
+        let at_cap = "é".repeat(GOAL_MAX_CHARS);
+        assert!(at_cap.len() > GOAL_MAX_CHARS, "fixture must be multi-byte");
+        assert!(goal_update_from_body(&parse_goal_body(
+            &serde_json::json!({ "goal": at_cap }).to_string()
+        ))
+        .is_ok());
     }
 
     #[test]
