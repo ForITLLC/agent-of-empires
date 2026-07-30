@@ -16049,7 +16049,7 @@ mod live_send_mode {
         use crate::tui::home::live_send::LiveSendWorker;
         let mut env = create_test_env_with_sessions(1);
         install_live_for_first_session(&mut env);
-        env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+        env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None, false));
 
         // Flag not set: the poll is a no-op and live mode stays.
         assert!(!env.view.poll_live_send_takeover());
