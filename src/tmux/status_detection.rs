@@ -937,6 +937,67 @@ fn claude_line_is_horizontal_rule(trimmed: &str) -> bool {
     (drawn && len >= 3) || (trimmed.chars().all(|c| c == '-') && len >= 10)
 }
 
+/// Erases the renderer's dim (`SGR 2`) spans from a raw `-e` capture,
+/// leaving everything else for `strip_ansi`. Claude Code paints its
+/// autocomplete ghost text dim while the operator's own text never is, so a
+/// dim span is chrome, not a draft — reading it as one is the WO#904 phantom
+/// refusal (19 of the 22 census refusals were empty composers wearing a
+/// ghost). Dim state persists across newlines, since tmux re-emits SGR only
+/// on change, and ends on SGR 0 or 22. A literal `2` inside an
+/// extended-color argument list (`38;5;2`) is a color index, not dim.
+fn strip_dim_spans(raw: &str) -> String {
+    fn sgr_dim_state(params: &str, dim: &mut bool) {
+        let parts: Vec<Option<u16>> = params
+            .split(';')
+            .map(|p| {
+                if p.is_empty() {
+                    Some(0)
+                } else {
+                    p.parse().ok()
+                }
+            })
+            .collect();
+        let mut i = 0;
+        while i < parts.len() {
+            match parts[i] {
+                Some(0) | Some(22) => *dim = false,
+                Some(2) => *dim = true,
+                Some(38) | Some(48) | Some(58) => match parts.get(i + 1) {
+                    Some(Some(5)) => i += 2,
+                    Some(Some(2)) => i += 4,
+                    _ => {}
+                },
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    let mut out = String::with_capacity(raw.len());
+    let mut dim = false;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut params = String::new();
+            for p in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&p) {
+                    if p == 'm' {
+                        sgr_dim_state(&params, &mut dim);
+                    }
+                    break;
+                }
+                params.push(p);
+            }
+            continue;
+        }
+        if !dim || c == '\n' {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// The non-empty text a human has parked in the Claude composer, if any.
 /// `claude_pane_input_ready` counts a composer holding a half-typed draft as
 /// "ready", but injecting into it fuses the operator's text with the injected
@@ -956,7 +1017,7 @@ fn claude_line_is_horizontal_rule(trimmed: &str) -> bool {
 /// rows are located: dropping them is what made the prompt row and its
 /// continuation rows indistinguishable.
 pub(crate) fn claude_composer_draft(raw_content: &str) -> Option<String> {
-    let clean = strip_ansi(raw_content);
+    let clean = strip_ansi(&strip_dim_spans(raw_content));
     let lines: Vec<&str> = clean.lines().collect();
 
     // Locate the `❯` row, scanning up from the bottom over the same trailing
@@ -3510,6 +3571,78 @@ enter to select · esc to cancel";
             claude_composer_draft(pane),
             Some("send h-1c2bc36f".to_string())
         );
+    }
+
+    #[test]
+    fn test_claude_composer_draft_none_on_dim_ghost_suggestion() {
+        // Captured live from `%1577` / `%1634` during the WO#904 census: an
+        // EMPTY composer over which Claude Code paints a dim autocomplete
+        // ghost (`\x1b[2m...`). The operator typed none of it; refusing the
+        // send for it is the phantom-draft false positive (19 of 22 census
+        // refusals). Dim spans are the renderer's, never the operator's, and
+        // must strip before the draft is read.
+        let pane = concat!(
+            "\x1b[38;5;244m────────────────────────────────────────\x1b[39m\n",
+            "\x1b[38;5;246m❯ \x1b[39m\x1b[2mdid the CRM preview job come back\x1b[0m\n",
+            "\x1b[38;5;244m────────────────────────────────────────\x1b[39m\n",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        );
+        assert_eq!(claude_composer_draft(pane), None);
+    }
+
+    #[test]
+    fn test_claude_composer_draft_keeps_typed_text_before_dim_ghost() {
+        // Half-typed word plus the dim completion Claude Code offers for it.
+        // The typed prefix is the operator's and must survive; the ghost tail
+        // must not.
+        let pane = concat!(
+            "❯ wake \x1b[2mfor-mm and hand it off\x1b[0m\n",
+            "\x1b[38;5;244m────────────────────────────────────────\x1b[39m"
+        );
+        assert_eq!(claude_composer_draft(pane), Some("wake".to_string()));
+    }
+
+    #[test]
+    fn test_claude_composer_draft_dim_ghost_wraps_across_rows() {
+        // tmux emits SGR state only on change, so a wrapped ghost carries its
+        // `\x1b[2m` from the prompt row across the continuation row with no
+        // re-emit. Dim state must persist across newlines or the second row
+        // reads as a real continuation draft.
+        let pane = concat!(
+            "❯ \x1b[2mdid the CRM preview job finish and did\n",
+            "anything need attention afterwards\x1b[0m\n",
+            "\x1b[38;5;244m────────────────────────────────────────\x1b[39m"
+        );
+        assert_eq!(claude_composer_draft(pane), None);
+    }
+
+    #[test]
+    fn test_claude_composer_draft_sgr22_ends_dim_span() {
+        // SGR 22 (normal intensity) closes a dim span just as SGR 0 does;
+        // text after it is visible and kept.
+        let pane = "❯ \x1b[2mghost \x1b[22mtyped tail\n────────────";
+        assert_eq!(claude_composer_draft(pane), Some("typed tail".to_string()));
+    }
+
+    #[test]
+    fn test_claude_composer_draft_color_sgr_is_not_dim() {
+        // A colored draft is still a draft. `\x1b[32m` must not read as dim,
+        // and neither may `\x1b[38;5;2m`, where the literal `2` is an
+        // extended-color index argument, not SGR 2.
+        let green = "❯ \x1b[32msend it\x1b[0m\n────────────";
+        assert_eq!(claude_composer_draft(green), Some("send it".to_string()));
+        let indexed = "❯ \x1b[38;5;2mrun the green build\x1b[39m\n────────────";
+        assert_eq!(
+            claude_composer_draft(indexed),
+            Some("run the green build".to_string())
+        );
+    }
+
+    #[test]
+    fn test_claude_composer_draft_compound_sgr_sets_dim() {
+        // Dim arriving in a compound parameter list still marks the span.
+        let pane = "❯ \x1b[2;3mitalic dim ghost\x1b[0m\n────────────";
+        assert_eq!(claude_composer_draft(pane), None);
     }
 
     #[test]
