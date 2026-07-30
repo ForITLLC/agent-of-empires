@@ -2,8 +2,9 @@
 //!
 //! Two endpoints under `/api/capacity`:
 //!   - GET → the whole [`CapacityState`] map, as persisted
-//!   - PATCH → merge `{profiles: {name: {headroom, cap_kind?, note?}}}`
-//!     into the persisted state, stamping each named entry with now
+//!   - PATCH → merge `{profiles: {name: {headroom, cap_kind?, note?,
+//!     reset_at?}}}` into the persisted state, stamping each named entry
+//!     with now
 //!
 //! This is the ONLY path that can grant positive headroom: the pane
 //! watchdog reads this state to pick relocation targets and only ever
@@ -32,7 +33,8 @@ pub struct PatchRequest {
 
 /// One profile's claim in a PATCH body. `headroom` is mandatory so a
 /// caller can never touch an entry without taking a position on whether
-/// the account is serving; `cap_kind`/`note` are kept when omitted.
+/// the account is serving; `cap_kind`/`note`/`reset_at` are kept when
+/// omitted.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfilePatch {
@@ -41,6 +43,8 @@ pub struct ProfilePatch {
     pub cap_kind: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+    #[serde(default)]
+    pub reset_at: Option<u64>,
 }
 
 fn now_secs() -> u64 {
@@ -70,6 +74,9 @@ fn apply_patch(state: &mut CapacityState, profiles: HashMap<String, ProfilePatch
         }
         if patch.note.is_some() {
             entry.note = patch.note;
+        }
+        if patch.reset_at.is_some() {
+            entry.reset_at = patch.reset_at;
         }
         entry.updated = now_secs;
     }
@@ -177,6 +184,7 @@ mod tests {
             headroom,
             cap_kind: cap_kind.map(str::to_string),
             note: note.map(str::to_string),
+            reset_at: None,
         }
     }
 
@@ -225,6 +233,7 @@ mod tests {
                 headroom: false,
                 cap_kind: Some("monthly-spend".to_string()),
                 note: None,
+                reset_at: None,
                 updated: NOW - 100,
             },
         );
@@ -247,6 +256,7 @@ mod tests {
                 headroom: false,
                 cap_kind: Some("fable-credit".to_string()),
                 note: Some("watchdog observed".to_string()),
+                reset_at: None,
                 updated: NOW - 100,
             },
         );
@@ -260,6 +270,34 @@ mod tests {
         assert_eq!(entry.cap_kind.as_deref(), Some("fable-credit"));
         assert_eq!(entry.note.as_deref(), Some("watchdog observed"));
         assert_eq!(entry.updated, NOW);
+    }
+
+    #[test]
+    fn patch_sets_reset_at_and_keeps_when_omitted() {
+        // WO#942 item A: a cap observation can carry the reset clock the
+        // banner named; a later patch that omits it must not erase it.
+        let mut state = CapacityState::default();
+        let with_reset = ProfilePatch {
+            headroom: false,
+            cap_kind: Some("weekly".to_string()),
+            note: None,
+            reset_at: Some(NOW + 7200),
+        };
+        apply_patch(
+            &mut state,
+            HashMap::from([("forit-main".to_string(), with_reset)]),
+            NOW,
+        );
+        assert_eq!(state.profiles["forit-main"].reset_at, Some(NOW + 7200));
+
+        apply_patch(
+            &mut state,
+            HashMap::from([("forit-main".to_string(), patch(true, None, None))]),
+            NOW + 10,
+        );
+        let entry = &state.profiles["forit-main"];
+        assert!(entry.headroom);
+        assert_eq!(entry.reset_at, Some(NOW + 7200));
     }
 
     // ── WO#445: per-profile PATCH (Commander grant path) ─────────────
@@ -289,6 +327,7 @@ mod tests {
                 headroom: false,
                 cap_kind: Some("fable-credit".to_string()),
                 note: Some("watchdog observed".to_string()),
+                reset_at: None,
                 updated: NOW - 100,
             },
         );

@@ -89,6 +89,11 @@ pub struct ProfileCapacity {
     /// Free-text provenance for the claim, e.g. which probe produced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Unix seconds when the recorded cap is expected to reset, when the
+    /// banner or operator report named one. Lets relocation tooling answer
+    /// "when does this account come back" without re-probing (WO#942).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<u64>,
     /// Unix seconds of the last update to this entry; the freshness gate.
     #[serde(default)]
     pub updated: u64,
@@ -179,6 +184,7 @@ mod tests {
                     headroom: *headroom,
                     cap_kind: None,
                     note: None,
+                    reset_at: None,
                     updated: *updated,
                 },
             );
@@ -232,6 +238,31 @@ mod tests {
             state.profiles["xce-main"].cap_kind.as_deref(),
             Some("fable-credit")
         );
+    }
+
+    #[test]
+    fn reset_at_defaults_none_and_roundtrips() {
+        // Legacy rows without the field must still parse (WO#942 item A).
+        let legacy: ProfileCapacity =
+            serde_json::from_str(r#"{"headroom": false, "updated": 5}"#).expect("legacy row");
+        assert_eq!(legacy.reset_at, None);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capacity.json");
+        let mut state = CapacityState::default();
+        state.profiles.insert(
+            "xce-main".to_string(),
+            ProfileCapacity {
+                headroom: false,
+                cap_kind: Some("weekly".to_string()),
+                note: None,
+                reset_at: Some(NOW + 3600),
+                updated: NOW,
+            },
+        );
+        state.save(&path);
+        let loaded = CapacityState::load(&path);
+        assert_eq!(loaded.profiles["xce-main"].reset_at, Some(NOW + 3600));
     }
 
     #[test]

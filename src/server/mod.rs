@@ -2101,8 +2101,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/sw.js", get(serve_public_file))
         .route("/icon-192.png", get(serve_public_file))
         .route("/icon-512.png", get(serve_public_file))
-        // SPA fallback: all other GET routes serve index.html
-        .fallback(get(serve_index))
+        // Fallback: unmatched /api/* paths fail closed with a JSON 404 so
+        // an automation probe never mistakes the SPA shell for an API
+        // answer; every other unmatched path keeps the SPA index fallback.
+        .fallback(spa_or_api_fallback)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             cityhall_gate,
@@ -2783,6 +2785,33 @@ async fn security_headers(
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
     headers.insert("content-security-policy", CSP.parse().unwrap());
     response
+}
+
+/// Router fallback. An unmatched `/api/*` path answers a JSON 404 (the API
+/// surface fails closed; serving the SPA shell there made a typoed probe
+/// read as 200 with HTML, WO#1000 D2a). Anything else keeps SPA semantics:
+/// GET/HEAD serve the index shell, other methods answer 405.
+async fn spa_or_api_fallback(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = uri.path();
+    if path == "/api" || path.starts_with("/api/") {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "unknown API route",
+                "path": path,
+            })),
+        )
+            .into_response();
+    }
+    if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+        return axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    serve_index(uri, headers).await.into_response()
 }
 
 async fn serve_index(
@@ -7608,6 +7637,151 @@ mod tests {
             );
             assert!(line.contains("request_id="), "no request id at all: {line}");
         }
+    }
+
+    #[tokio::test]
+    async fn unmatched_api_path_fails_closed_json_404() {
+        use tower::ServiceExt;
+        // WO#1000: an unmatched /api/* path must never fall through to the
+        // SPA shell; a consumer probing a route that does not exist has to
+        // see a JSON 404, not a 200 text/html index page.
+        for (method, path) in [
+            ("GET", "/api/tasks"),
+            ("GET", "/api/board"),
+            ("GET", "/api/todos"),
+            ("GET", "/api/sessions/deadbeef/tasks"),
+            ("GET", "/api/openapi.json"),
+            ("GET", "/api/routes"),
+            ("POST", "/api/definitely-not-a-route"),
+        ] {
+            let state = test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vecs(&["localhost"]),
+                Vec::new(),
+                None,
+            );
+            let app = test_support::build_router_for_test(state);
+            let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+            let mut req = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(remote));
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "{method} {path} must fail closed with 404"
+            );
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            assert!(
+                ct.starts_with("application/json"),
+                "{method} {path} must answer JSON, got '{ct}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_survives_for_non_api_paths() {
+        use tower::ServiceExt;
+        // Client-side routes outside /api keep serving the SPA shell.
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let mut req = axum::http::Request::builder()
+            .uri("/sessions/some-client-route")
+            .header("host", "localhost")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/html"),
+            "non-/api fallback must stay the SPA shell, got '{ct}'"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_list_carries_per_profile_capacity() {
+        use tower::ServiceExt;
+        // WO#942 item A: each /api/sessions row exposes its profile's shared
+        // capacity claim (headroom, cap_kind, reset_at) so consumers can see
+        // cap state per session without a second capacity lookup.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cap_path = dir.path().join("capacity.json");
+        std::env::set_var("AOE_CAPACITY_FILE", &cap_path);
+        let mut cap = capacity::CapacityState::default();
+        cap.profiles.insert(
+            "cap-join-profile".to_string(),
+            capacity::ProfileCapacity {
+                headroom: false,
+                cap_kind: Some("weekly".to_string()),
+                note: None,
+                reset_at: Some(1_900_000_000),
+                updated: 1_800_000_000,
+            },
+        );
+        cap.save(&cap_path);
+
+        let mut inst = Instance::new("cap-join-row", "/tmp/aoe-test-capjoin");
+        inst.source_profile = "cap-join-profile".to_string();
+        let sid = inst.id.clone();
+        let state = test_support::build_test_app_state_with_policy(
+            vec![inst],
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let mut req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(req).await.unwrap();
+        std::env::remove_var("AOE_CAPACITY_FILE");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let row = v["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .find(|s| s["id"] == sid.as_str())
+            .expect("seeded session row")
+            .clone();
+        assert_eq!(row["capacity"]["headroom"], serde_json::json!(false));
+        assert_eq!(row["capacity"]["cap_kind"], "weekly");
+        assert_eq!(
+            row["capacity"]["reset_at"],
+            serde_json::json!(1_900_000_000u64)
+        );
     }
 
     #[tokio::test]

@@ -2070,6 +2070,7 @@ mod tests {
                     headroom: *headroom,
                     cap_kind: None,
                     note: None,
+                    reset_at: None,
                     updated,
                 },
             );

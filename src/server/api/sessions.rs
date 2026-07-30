@@ -199,6 +199,14 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub profile: String,
+    /// The owning profile's shared capacity entry (headroom claim, cap
+    /// family, reset clock), joined in `list_sessions` from the same state
+    /// file the relocation watchdog reads. Present only when the profile
+    /// has an entry; single-session responses omit it (WO#942: consumers
+    /// see cap state and `reset_at` on the session row itself instead of
+    /// re-deriving it from pane text).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<crate::server::capacity::ProfileCapacity>,
     pub cleanup_defaults: CleanupDefaults,
     pub remote_owner: Option<String>,
     /// Host-scoped identity for `remote_owner` ("owner@host"), so the web
@@ -555,6 +563,9 @@ impl SessionResponse {
                 .clone()
                 .or_else(|| crate::pane_rules::model_pin(&inst.extra_args)),
             profile: inst.source_profile.clone(),
+            // Overlaid per-profile in list_sessions from the shared
+            // capacity state; single-session responses omit it.
+            capacity: None,
             cleanup_defaults: CleanupDefaults {
                 delete_worktree: true,
                 delete_branch: false,
@@ -911,6 +922,18 @@ pub async fn list_sessions(
             resp.status = projected.to_string();
         }
         resp.pane_alive = Some(alive);
+    }
+
+    // Overlay each row's per-profile capacity entry from the shared state
+    // file. One load per request; an unreadable or empty state leaves every
+    // row's `capacity` omitted, which consumers read as "no observation".
+    if let Some(cap_path) = crate::server::capacity::capacity_path() {
+        let cap = crate::server::capacity::CapacityState::load(&cap_path);
+        if !cap.profiles.is_empty() {
+            for resp in sessions.iter_mut() {
+                resp.capacity = cap.profiles.get(&resp.profile).cloned();
+            }
+        }
     }
 
     // Overlay custom-agent ACP capability (built-ins were resolved in the
@@ -12713,6 +12736,7 @@ mod workspace_ordering_tests {
             has_terminal: false,
             model: None,
             profile: "default".to_string(),
+            capacity: None,
             cleanup_defaults: CleanupDefaults {
                 delete_worktree: false,
                 delete_branch: false,
