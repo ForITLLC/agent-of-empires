@@ -1634,6 +1634,8 @@ mod tests {
                         n.to_string(),
                         PaneMetadata {
                             pane_dead: false,
+                            pane_dead_status: None,
+                            pane_dead_signal: None,
                             pane_current_command: None,
                             pane_start_command_is_protected: false,
                         },
