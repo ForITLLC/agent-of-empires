@@ -1142,6 +1142,29 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub goal_read_count: u64,
 
+    /// When a build that TRACKS goal reads first handled this record, and when
+    /// a caller first identified itself on one of its goal reads.
+    ///
+    /// A bare `goal_read_count: 0` is uninterpretable and has already caused
+    /// harm: it was read sixteen minutes after the counter shipped and taken
+    /// as proof a worker never reads its goal, which was false. A zero
+    /// conflates at least five states — never read, read but undeclared, read
+    /// then erased by an older binary's round trip, counter younger than the
+    /// read, and the declaring header not reaching that session yet.
+    ///
+    /// These two timestamps separate them. `goal_read_tracking_since` absent
+    /// means this record has never been handled by a counting build, so its
+    /// zero says nothing at all; recent means the counter is simply younger
+    /// than the behaviour it claims to measure. `goal_reader_declared_at`
+    /// absent means no caller has ever identified itself on this session's
+    /// goal reads, so reads cannot be attributed and a zero is not evidence of
+    /// not reading. See per-dev WO#1166 D2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_read_tracking_since: Option<DateTime<Utc>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_reader_declared_at: Option<DateTime<Utc>>,
+
     /// When a work-order shaped message (`WO#<n>` or "work order" in the
     /// body) last flowed to this session through the daemon's send API.
     /// Stamped by `send_message`; a dispatch newer than `goal_updated_at`
@@ -1297,6 +1320,28 @@ pub struct Instance {
     /// constructions remain functional without an explicit injection.
     #[serde(skip, default)]
     pub(crate) file_watch: Option<std::sync::Arc<crate::file_watch::FileWatchService>>,
+
+    /// Every key in the stored record this build does not declare, carried
+    /// through untouched so a write from ANY build is non-destructive.
+    ///
+    /// On 2026-08-04 a `cx` TUI built on JUL-31 rewrote `sessions.json` and
+    /// erased `goal_last_read_at` minutes after the daemon wrote it. Nothing
+    /// was corrupt and nothing errored: serde drops keys a struct does not
+    /// name, so any binary round-tripping this file silently deletes every
+    /// field added after it was compiled. `goal_perpetual`, `goal_updated_at`
+    /// and `last_wo_dispatch_at` — the inputs to `goal_stale` — were exposed
+    /// the same way for weeks.
+    ///
+    /// "Keep every aoe process on the same build" is a discipline, and the
+    /// discipline is what failed. Compatibility belongs in the format, where
+    /// it holds across processes, machines and restarts. BTreeMap so the
+    /// carried keys land in a stable order and do not churn the file.
+    ///
+    /// Never populated for a key this build declares: serde matches named
+    /// fields first, so a known key reaches its typed home and cannot also be
+    /// written from here.
+    #[serde(flatten)]
+    pub unknown_fields: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
@@ -1832,6 +1877,9 @@ impl Instance {
             goal_perpetual: false,
             goal_last_read_at: None,
             goal_read_count: 0,
+            goal_read_tracking_since: None,
+            goal_reader_declared_at: None,
+            unknown_fields: std::collections::BTreeMap::new(),
             last_wo_dispatch_at: None,
             view: View::Terminal,
             agent_name: None,
@@ -8095,6 +8143,132 @@ pub(crate) fn duplicate_session_error(title: &str) -> anyhow::Error {
          Tip: use a different title or remove the existing session first",
         title
     )
+}
+
+/// A stored session must survive a binary that has never heard of half of it.
+///
+/// THE INCIDENT. On 2026-08-04 a `cx` TUI built on JUL-31 rewrote
+/// `sessions.json` and erased `goal_last_read_at` minutes after the daemon
+/// wrote it. Nothing was corrupt and nothing errored: serde simply drops keys
+/// a struct does not declare, so an older binary round-tripping the file
+/// deletes every field added after it was compiled. `goal_perpetual`,
+/// `goal_updated_at` and `last_wo_dispatch_at` — the inputs to `goal_stale` —
+/// were exposed the same way for weeks, silently.
+///
+/// "Keep every aoe process on the same build" is a discipline, and the
+/// discipline is what failed. This is the structural fix: unknown keys are
+/// captured on the way in and written back out, so a write from any build,
+/// older or newer, is non-destructive.
+#[cfg(test)]
+mod unknown_field_preservation_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The shape of a build that predates a field — exactly the Jul-31 TUI's
+    /// view of a record the daemon had already stamped.
+    #[derive(Serialize, Deserialize)]
+    struct FieldBlind {
+        id: String,
+        #[serde(flatten)]
+        unknown: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+
+    /// The same shape WITHOUT the capture: this is what actually shipped on
+    /// Jul-31, kept as the witness of the defect.
+    #[derive(Serialize, Deserialize)]
+    struct FieldBlindUnprotected {
+        id: String,
+    }
+
+    fn stamped_record() -> serde_json::Value {
+        json!({
+            "id": "e2b9c4d38a474c35",
+            "goal_last_read_at": "2026-08-04T13:21:44.509032Z",
+            "goal_read_count": 3,
+        })
+    }
+
+    #[test]
+    fn the_regression_reproduced_a_blind_struct_without_capture_erases_the_stamp() {
+        let blind: FieldBlindUnprotected =
+            serde_json::from_value(stamped_record()).expect("parses");
+        let out = serde_json::to_value(&blind).expect("serializes");
+        assert!(
+            out.get("goal_last_read_at").is_none(),
+            "this is the Jul-31 behaviour being fixed: the stamp is gone"
+        );
+    }
+
+    #[test]
+    fn a_field_blind_struct_carries_the_stamp_back_out() {
+        // Write a stamp, round-trip it through a struct that has never heard
+        // of it, and the stamp survives.
+        let blind: FieldBlind = serde_json::from_value(stamped_record()).expect("parses");
+        let out = serde_json::to_value(&blind).expect("serializes");
+        assert_eq!(
+            out.get("goal_last_read_at").and_then(|v| v.as_str()),
+            Some("2026-08-04T13:21:44.509032Z"),
+            "a binary must not delete a field it has never heard of"
+        );
+        assert_eq!(out.get("goal_read_count").and_then(|v| v.as_u64()), Some(3));
+    }
+
+    /// The shipped struct, not a model of it: a real stored row carrying a key
+    /// from some future build must come back out intact.
+    #[test]
+    fn the_real_instance_preserves_a_field_from_a_newer_build() {
+        let mut row = serde_json::to_value(Instance::new("t", "/tmp")).expect("serializes");
+        row["field_from_a_newer_build"] = json!({"nested": ["still", "here"]});
+        row["goal_read_count"] = json!(7);
+
+        let inst: Instance = serde_json::from_value(row).expect("parses");
+        let out = serde_json::to_value(&inst).expect("serializes");
+
+        assert_eq!(
+            out.get("field_from_a_newer_build"),
+            Some(&json!({"nested": ["still", "here"]})),
+            "an unknown key must survive the round trip"
+        );
+        // The known field still deserializes into its typed home, and must not
+        // ALSO appear in the capture map — one key, one owner.
+        assert_eq!(inst.goal_read_count, 7);
+        assert_eq!(out.get("goal_read_count").and_then(|v| v.as_u64()), Some(7));
+    }
+
+    #[test]
+    fn a_known_field_is_never_captured_as_unknown() {
+        // If a declared field also landed in the capture map it would be
+        // written twice, and the second copy would shadow the typed one.
+        let mut row = serde_json::to_value(Instance::new("t", "/tmp")).expect("serializes");
+        row["goal_perpetual"] = json!(true);
+        row["goal_updated_at"] = json!("2026-08-01T00:00:00Z");
+
+        let inst: Instance = serde_json::from_value(row).expect("parses");
+        assert!(inst.goal_perpetual);
+        // Observed from outside, the way a reader of the file sees it: a key
+        // captured as unknown AND emitted from its typed home would appear
+        // twice, and the trailing copy wins on the next parse.
+        let text = serde_json::to_string(&inst).expect("serializes");
+        for key in ["\"goal_perpetual\"", "\"goal_updated_at\""] {
+            assert_eq!(text.matches(key).count(), 1, "{key} written twice");
+        }
+    }
+
+    #[test]
+    fn the_goal_stale_inputs_survive_a_blind_round_trip() {
+        // The three fields that were silently at risk for weeks.
+        let row = json!({
+            "id": "abc",
+            "goal_perpetual": true,
+            "goal_updated_at": "2026-08-01T00:00:00Z",
+            "last_wo_dispatch_at": "2026-08-02T00:00:00Z",
+        });
+        let blind: FieldBlind = serde_json::from_value(row.clone()).expect("parses");
+        let out = serde_json::to_value(&blind).expect("serializes");
+        for key in ["goal_perpetual", "goal_updated_at", "last_wo_dispatch_at"] {
+            assert_eq!(out.get(key), row.get(key), "{key} was dropped");
+        }
+    }
 }
 
 #[cfg(test)]

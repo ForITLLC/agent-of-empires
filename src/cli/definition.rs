@@ -290,6 +290,13 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "restore",
     "send",
     "status",
+    // The master kill switch (per-dev WO#1096 D1) shipped without its
+    // telemetry names, so `aoe on` / `aoe off` / `aoe power` were being
+    // dropped from cli_usage — the commands whose use you would most want a
+    // record of.
+    "on",
+    "off",
+    "power",
     "killall",
     "session",
     "group",

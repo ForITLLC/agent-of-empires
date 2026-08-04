@@ -104,6 +104,21 @@ pub struct SessionResponse {
     /// absence rather than probe for a missing field. See per-dev WO#1159 D3.
     pub goal_last_read_at: Option<chrono::DateTime<chrono::Utc>>,
     pub goal_read_count: u64,
+    /// What the count above licenses you to conclude, and the two facts that
+    /// decide it. A zero is not evidence of anything on its own — it was read
+    /// as proof a worker never reads its goal sixteen minutes after the
+    /// counter shipped, and that was false. `goal_read_state` is one of
+    /// `read` / `untracked` / `no_declaration_seen` / `never_read`;
+    /// `goal_read_note` says in words what to do with it. See per-dev
+    /// WO#1166 D2.
+    pub goal_read_state: &'static str,
+    pub goal_read_note: &'static str,
+    /// When a counting build first handled this record: a count is only as old
+    /// as this.
+    pub goal_read_tracking_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a caller first identified itself on one of this session's goal
+    /// reads. Absent means reads here cannot be attributed at all yet.
+    pub goal_reader_declared_at: Option<chrono::DateTime<chrono::Utc>>,
     pub is_sandboxed: bool,
     /// True when the session was created with `--scratch`; the
     /// `project_path` points at an auto-provisioned directory under
@@ -537,6 +552,10 @@ impl SessionResponse {
             goal_stale: goal_stale_at(inst, chrono::Utc::now()),
             goal_last_read_at: inst.goal_last_read_at,
             goal_read_count: inst.goal_read_count,
+            goal_read_state: goal_read_state(inst).0,
+            goal_read_note: goal_read_state(inst).1,
+            goal_read_tracking_since: inst.goal_read_tracking_since,
+            goal_reader_declared_at: inst.goal_reader_declared_at,
             is_sandboxed: inst.is_sandboxed(),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
@@ -2998,6 +3017,144 @@ fn declared_reader(headers: &axum::http::HeaderMap, q: &GoalReadQuery) -> Option
         })
 }
 
+/// What a `goal_read_count` actually licenses a reader to conclude.
+///
+/// The count alone is not evidence. It was read sixteen minutes after it
+/// shipped and taken as proof that a worker never reads its goal — a false
+/// accusation, from a field whose most natural reading is the opposite of the
+/// truth. The caveat existed, in a commit message, and no consumer of this API
+/// ever sees a commit message. So it ships in the payload.
+fn goal_read_state(inst: &Instance) -> (&'static str, &'static str) {
+    if inst.goal_read_count > 0 {
+        return (
+            "read",
+            "this session has read its own goal record; goal_last_read_at is when it last did.",
+        );
+    }
+    let Some(_) = inst.goal_read_tracking_since else {
+        return (
+            "untracked",
+            "NO CONCLUSION AVAILABLE: this record has never been handled by a build that counts \
+             goal reads, so the zero is an absence of measurement, not an absence of reading.",
+        );
+    };
+    if inst.goal_reader_declared_at.is_none() {
+        return (
+            "no_declaration_seen",
+            "NOT EVIDENCE OF NOT READING: no caller has ever identified itself on this session's \
+             goal reads, so a read could not have been attributed even if it happened. Compare \
+             goal_read_tracking_since with how long this session has been running before drawing \
+             anything from the zero.",
+        );
+    }
+    (
+        "never_read",
+        "this session has NOT read its own goal record since goal_read_tracking_since, and \
+         attributed reads are known to work here because a caller has identified itself before.",
+    )
+}
+
+/// A zero must never be readable as an accusation.
+///
+/// The count was read sixteen minutes after it shipped and taken as proof that
+/// a worker never reads its goal. It was not proof of anything: the counter
+/// was younger than the behaviour, and no caller had yet identified itself, so
+/// no read COULD have been attributed. The states below exist so that reading
+/// is done from the payload instead of from a commit message.
+#[cfg(test)]
+mod goal_read_state_tests {
+    use super::*;
+
+    fn inst() -> Instance {
+        Instance::new("t", "/tmp")
+    }
+
+    fn at(secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+        Some(chrono::Utc::now() - chrono::Duration::seconds(secs))
+    }
+
+    #[test]
+    fn an_untracked_record_licenses_no_conclusion() {
+        // The pre-WO#1159 state, and the state of anything this build has not
+        // handled yet. A zero here is an absence of measurement.
+        let i = inst();
+        let (state, note) = goal_read_state(&i);
+        assert_eq!(state, "untracked");
+        assert!(note.contains("NO CONCLUSION AVAILABLE"), "{note}");
+    }
+
+    #[test]
+    fn tracking_on_but_nobody_has_ever_identified_itself_is_not_evidence() {
+        // THE CASE THAT CAUSED THE FALSE ACCUSATION. Counting is on, the count
+        // is 0, and no read could have been attributed even if it happened —
+        // because the declaring header is not reaching this session yet.
+        let mut i = inst();
+        i.goal_read_tracking_since = at(3600);
+        let (state, note) = goal_read_state(&i);
+        assert_eq!(state, "no_declaration_seen");
+        assert!(note.contains("NOT EVIDENCE OF NOT READING"), "{note}");
+        assert!(
+            note.contains("goal_read_tracking_since"),
+            "the note must point at the field that bounds the claim: {note}"
+        );
+    }
+
+    #[test]
+    fn only_a_proven_declaration_path_turns_a_zero_into_never_read() {
+        let mut i = inst();
+        i.goal_read_tracking_since = at(86_400);
+        i.goal_reader_declared_at = at(3600);
+        let (state, note) = goal_read_state(&i);
+        assert_eq!(state, "never_read");
+        assert!(note.contains("NOT read its own goal"), "{note}");
+    }
+
+    #[test]
+    fn a_nonzero_count_reads_as_read_whatever_else_is_missing() {
+        // A recorded read is a fact; it does not need the other timestamps to
+        // be interpretable.
+        let mut i = inst();
+        i.goal_read_count = 1;
+        assert_eq!(goal_read_state(&i).0, "read");
+        i.goal_read_tracking_since = at(10);
+        i.goal_reader_declared_at = at(10);
+        assert_eq!(goal_read_state(&i).0, "read");
+    }
+
+    #[test]
+    fn a_fresh_counter_is_distinguishable_from_a_genuine_never_read() {
+        // The bar: a consumer must tell these apart without reading source.
+        let mut fresh = inst();
+        fresh.goal_read_tracking_since = at(60);
+        let mut settled = inst();
+        settled.goal_read_tracking_since = at(86_400);
+        settled.goal_reader_declared_at = at(86_400);
+
+        assert_ne!(goal_read_state(&fresh).0, goal_read_state(&settled).0);
+        assert_eq!(goal_read_state(&fresh).0, "no_declaration_seen");
+        assert_eq!(goal_read_state(&settled).0, "never_read");
+    }
+
+    #[test]
+    fn every_state_says_something_a_reader_can_act_on() {
+        // A note that is empty, or that merely restates the state name, would
+        // put the caveat back where nobody sees it.
+        let mut i = inst();
+        for _ in 0..4 {
+            let (state, note) = goal_read_state(&i);
+            assert!(note.len() > 40, "{state} has no usable note");
+            assert!(note.ends_with('.'), "{state} note is truncated: {note}");
+            match state {
+                "untracked" => i.goal_read_tracking_since = at(10),
+                "no_declaration_seen" => i.goal_reader_declared_at = at(5),
+                "never_read" => i.goal_read_count = 1,
+                _ => break,
+            }
+        }
+        assert_eq!(goal_read_state(&i).0, "read");
+    }
+}
+
 /// Who a goal read is attributed to.
 ///
 /// The whole value of the field rests here. `GET /goal` is called by more than
@@ -3084,6 +3241,30 @@ mod goal_read_attribution_tests {
     }
 }
 
+/// Apply whichever of the three goal-read facts this request established.
+///
+/// Kept in one place because the disk write and the in-memory update must not
+/// drift: a stamp that reaches only memory would claim, after the next
+/// restart, that a read never happened.
+fn apply_goal_read_stamps(
+    inst: &mut Instance,
+    at: chrono::DateTime<chrono::Utc>,
+    self_read: bool,
+    first_tracking: bool,
+    first_declaration: bool,
+) {
+    if first_tracking {
+        inst.goal_read_tracking_since = Some(at);
+    }
+    if first_declaration {
+        inst.goal_reader_declared_at = Some(at);
+    }
+    if self_read {
+        inst.goal_last_read_at = Some(at);
+        inst.goal_read_count = inst.goal_read_count.saturating_add(1);
+    }
+}
+
 pub async fn get_session_goal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3095,16 +3276,28 @@ pub async fn get_session_goal(
     // reflects it. Persist first, memory second, exactly as the goal WRITE
     // path does: a stamp that survives only until the next restart would claim
     // a worker had read something it may never have.
-    let self_read = {
+    let declared = declared_reader(&headers, &q);
+    let (self_read, first_tracking, first_declaration) = {
         let instances = state.instances.read().await;
-        let known = instances.iter().any(|i| i.id == id);
-        let is_self = declared_reader(&headers, &q)
-            .map(|r| same_session_id(&r, &id))
-            .unwrap_or(false);
-        // read_only serves a frozen view; recording a read would be a write.
-        known && is_self && !state.read_only
+        match instances.iter().find(|i| i.id == id) {
+            None => (false, false, false),
+            Some(inst) => (
+                declared
+                    .as_deref()
+                    .map(|r| same_session_id(r, &id))
+                    .unwrap_or(false),
+                // The first time a counting build handles this record is when
+                // its counter starts meaning anything.
+                inst.goal_read_tracking_since.is_none(),
+                declared.is_some() && inst.goal_reader_declared_at.is_none(),
+            ),
+        }
     };
-    if self_read {
+    // read_only serves a frozen view; recording anything would be a write.
+    let self_read = self_read && !state.read_only;
+    let first_tracking = first_tracking && !state.read_only;
+    let first_declaration = first_declaration && !state.read_only;
+    if self_read || first_tracking || first_declaration {
         let profile = {
             let instances = state.instances.read().await;
             instances
@@ -3124,16 +3317,26 @@ pub async fn get_session_goal(
                 state.file_watch.clone(),
                 move |instances| {
                     if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                        inst.goal_last_read_at = Some(stamped_at);
-                        inst.goal_read_count = inst.goal_read_count.saturating_add(1);
+                        apply_goal_read_stamps(
+                            inst,
+                            stamped_at,
+                            self_read,
+                            first_tracking,
+                            first_declaration,
+                        );
                     }
                 },
             )
             .await;
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                inst.goal_last_read_at = Some(stamped_at);
-                inst.goal_read_count = inst.goal_read_count.saturating_add(1);
+                apply_goal_read_stamps(
+                    inst,
+                    stamped_at,
+                    self_read,
+                    first_tracking,
+                    first_declaration,
+                );
             }
         }
     }
@@ -3160,6 +3363,10 @@ pub async fn get_session_goal(
             "perpetual": inst.goal_perpetual,
             "goal_last_read_at": inst.goal_last_read_at,
             "goal_read_count": inst.goal_read_count,
+            "goal_read_state": goal_read_state(inst).0,
+            "goal_read_note": goal_read_state(inst).1,
+            "goal_read_tracking_since": inst.goal_read_tracking_since,
+            "goal_reader_declared_at": inst.goal_reader_declared_at,
         })),
     )
         .into_response()
@@ -13337,6 +13544,10 @@ mod workspace_ordering_tests {
             goal_stale: false,
             goal_last_read_at: None,
             goal_read_count: 0,
+            goal_read_state: "untracked",
+            goal_read_note: "",
+            goal_read_tracking_since: None,
+            goal_reader_declared_at: None,
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,
