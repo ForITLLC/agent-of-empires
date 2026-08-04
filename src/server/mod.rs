@@ -18,6 +18,7 @@ pub mod live_ws;
 pub mod login;
 mod charter_drift;
 mod pane;
+pub mod pane_composer;
 pub(crate) mod pane_watchdog;
 pub mod power;
 pub mod push;

@@ -12936,16 +12936,27 @@ pub async fn read_output(
     .await;
 
     match capture_result {
-        Ok(Ok(content)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "id": id,
-                "lines": lines,
-                "format": q.format,
-                "content": content,
-            })),
-        )
-            .into_response(),
+        Ok(Ok(content)) => {
+            // Committed history and the LIVE input widget are separate regions
+            // (WO#1124). A capture renders typed-but-unsent text exactly like
+            // sent text, and a reader once took another session's unsubmitted
+            // "send it" as an order. The unsent text is still returned — as its
+            // own region, marked submitted:false — so it reads as data and
+            // never as an utterance. Nothing is blocked here; this only tells
+            // one region from another.
+            let (history, composer) = crate::server::pane_composer::split_pane_composer(&content);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": id,
+                    "lines": lines,
+                    "format": q.format,
+                    "content": history,
+                    "composer": composer,
+                })),
+            )
+                .into_response()
+        }
         Ok(Err(CaptureError::NotRunning)) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "session_not_running"})),
