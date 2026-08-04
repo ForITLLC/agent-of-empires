@@ -100,9 +100,12 @@ fn apply_profile_patch(
 
 pub async fn get_capacity(
     State(_state): State<Arc<AppState>>,
-) -> Result<Json<CapacityState>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let path = capacity_path().ok_or_else(no_app_dir)?;
-    Ok(Json(CapacityState::load(&path)))
+    Ok(Json(crate::server::capacity::annotate_staleness(
+        &CapacityState::load(&path),
+        now_secs(),
+    )))
 }
 
 pub async fn patch_capacity(
@@ -135,11 +138,13 @@ pub async fn patch_capacity(
 pub async fn get_capacity_profile(
     State(_state): State<Arc<AppState>>,
     axum::extract::Path(profile): axum::extract::Path<String>,
-) -> Result<Json<ProfileCapacity>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let path = capacity_path().ok_or_else(no_app_dir)?;
-    CapacityState::load(&path)
-        .profiles
-        .get(&profile)
+    let annotated =
+        crate::server::capacity::annotate_staleness(&CapacityState::load(&path), now_secs());
+    annotated
+        .get("profiles")
+        .and_then(|p| p.get(&profile))
         .cloned()
         .map(Json)
         .ok_or((

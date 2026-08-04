@@ -156,6 +156,52 @@ impl CapacityState {
     }
 }
 
+/// Wire-annotate a capacity state with its own age, per profile and for the
+/// whole map: `age_secs` + `stale` on every row, `stale`/`stale_profiles`/
+/// `age_secs` at the top, and a plain-words `staleness_note` when the map is
+/// past [`HEADROOM_TTL_SECS`].
+///
+/// The stored state never says how old it is, and the automated truth-writer
+/// (the fable capacity sentinel) was deliberately retired with the watchdog
+/// teardown, so rows can sit for a week while `GET /api/capacity` answers
+/// confidently. A capacity surface that a profile-move decision reads must
+/// declare its age rather than let stale claims pass as live.
+pub fn annotate_staleness(state: &CapacityState, now_secs: u64) -> serde_json::Value {
+    let mut v = serde_json::to_value(state).unwrap_or_else(|_| serde_json::json!({}));
+    let mut stale_profiles = 0u64;
+    if let Some(profiles) = v.get_mut("profiles").and_then(|p| p.as_object_mut()) {
+        for row in profiles.values_mut() {
+            let updated = row.get("updated").and_then(|u| u.as_u64()).unwrap_or(0);
+            let age = now_secs.saturating_sub(updated);
+            let stale = age > HEADROOM_TTL_SECS;
+            if stale {
+                stale_profiles += 1;
+            }
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("age_secs".into(), serde_json::json!(age));
+                obj.insert("stale".into(), serde_json::json!(stale));
+            }
+        }
+    }
+    let map_age = now_secs.saturating_sub(state.updated);
+    let map_stale = map_age > HEADROOM_TTL_SECS;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("age_secs".into(), serde_json::json!(map_age));
+        obj.insert("stale".into(), serde_json::json!(map_stale));
+        obj.insert("stale_profiles".into(), serde_json::json!(stale_profiles));
+        if map_stale {
+            obj.insert(
+                "staleness_note".into(),
+                serde_json::json!(format!(
+                    "capacity data is STALE: no writer has touched this map in {map_age}s \
+                     (TTL {HEADROOM_TTL_SECS}s). Treat stale rows as unknown, not as headroom."
+                )),
+            );
+        }
+    }
+    v
+}
+
 /// Where the shared capacity state lives: `AOE_CAPACITY_FILE` when set, else
 /// `capacity.json` in the app dir. `None` only when no app dir resolves.
 pub fn capacity_path() -> Option<PathBuf> {
@@ -173,6 +219,53 @@ pub fn capacity_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn staleness_annotation_ages_every_row_and_the_map() {
+        use super::*;
+        const T: u64 = 1_800_000_000;
+        let mut state = CapacityState {
+            updated: T - HEADROOM_TTL_SECS - 100,
+            ..Default::default()
+        };
+        state.profiles.insert(
+            "fresh".into(),
+            ProfileCapacity {
+                headroom: true,
+                updated: T - 60,
+                ..Default::default()
+            },
+        );
+        state.profiles.insert(
+            "old".into(),
+            ProfileCapacity {
+                headroom: true,
+                updated: T - HEADROOM_TTL_SECS - 1,
+                ..Default::default()
+            },
+        );
+        let v = annotate_staleness(&state, T);
+        assert_eq!(v["profiles"]["fresh"]["stale"], false);
+        assert_eq!(v["profiles"]["fresh"]["age_secs"], 60);
+        assert_eq!(v["profiles"]["old"]["stale"], true);
+        assert_eq!(v["profiles"]["old"]["age_secs"], HEADROOM_TTL_SECS + 1);
+        assert_eq!(v["stale_profiles"], 1);
+        assert_eq!(v["stale"], true, "map-level updated is past the TTL");
+        let note = v["staleness_note"].as_str().unwrap_or("");
+        assert!(
+            note.contains("STALE"),
+            "note must say the data is stale: {note}"
+        );
+        let fresh_map = annotate_staleness(
+            &CapacityState {
+                updated: T - 5,
+                ..Default::default()
+            },
+            T,
+        );
+        assert_eq!(fresh_map["stale"], false);
+        assert!(fresh_map.get("staleness_note").is_none());
+    }
+
     use super::*;
 
     fn state_with(entries: &[(&str, bool, u64)]) -> CapacityState {
