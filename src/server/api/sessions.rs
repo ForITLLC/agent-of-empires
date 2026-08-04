@@ -92,6 +92,18 @@ pub struct SessionResponse {
     /// pre-assignment objective. Always serialized, like `urgent`. See
     /// per-dev WO #529.
     pub goal_stale: bool,
+    /// When this session last read its OWN goal record, and how many times it
+    /// ever has. Absent / `0` means it never has.
+    ///
+    /// A goal that is set looks identical to a goal that is read, so a worker
+    /// running purely off dispatch text is invisible from outside — until a
+    /// deliverable it never saw goes missing. Only a self read counts: a
+    /// manager reading a worker's goal, an enforcement hook fetching it at
+    /// dispatch time, or a curl must not stamp it, because none of those say
+    /// the worker looked. Always serialized so fleet tooling can page on the
+    /// absence rather than probe for a missing field. See per-dev WO#1159 D3.
+    pub goal_last_read_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub goal_read_count: u64,
     pub is_sandboxed: bool,
     /// True when the session was created with `--scratch`; the
     /// `project_path` points at an auto-provisioned directory under
@@ -523,6 +535,8 @@ impl SessionResponse {
             goal: inst.goal.clone(),
             goal_missing: inst.goal.is_none() && goal_flags_apply(inst),
             goal_stale: goal_stale_at(inst, chrono::Utc::now()),
+            goal_last_read_at: inst.goal_last_read_at,
+            goal_read_count: inst.goal_read_count,
             is_sandboxed: inst.is_sandboxed(),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
@@ -2946,10 +2960,184 @@ fn goal_update_from_body(body: &UpdateGoalBody) -> Result<GoalUpdate, GoalUpdate
     })
 }
 
+/// Who is reading, as declared by the caller.
+///
+/// A read is attributed only when the reader names ITSELF and that name is the
+/// session being read. Everything else — a manager checking a worker, the
+/// dispatch-time enforcement hook, a curl, the dashboard — is a third party
+/// whose read says nothing about whether the worker ever looked at its own
+/// record. Undeclared is the safe default: the stamp is simply not written.
+#[derive(serde::Deserialize, Default)]
+pub struct GoalReadQuery {
+    #[serde(default)]
+    reader: Option<String>,
+}
+
+/// Session ids match, tolerating the 8-char short form callers use.
+fn same_session_id(claimed: &str, target: &str) -> bool {
+    let (claimed, target) = (claimed.trim().to_lowercase(), target.trim().to_lowercase());
+    let n = claimed.len().min(target.len());
+    n >= 8 && claimed[..n] == target[..n]
+}
+
+/// The reader identity on a goal GET: `?reader=` or the `X-Aoe-Session` header
+/// the MCP layer forwards from the calling pane.
+fn declared_reader(headers: &axum::http::HeaderMap, q: &GoalReadQuery) -> Option<String> {
+    q.reader
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            headers
+                .get("x-aoe-session")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// Who a goal read is attributed to.
+///
+/// The whole value of the field rests here. `GET /goal` is called by more than
+/// the session that owns it — the Commander checks a worker, and the
+/// dispatch-time goal hook fetches it on EVERY work order — so attributing
+/// those would stamp a session that has never once looked at its own record
+/// and turn the signal into the opposite of what it claims.
+#[cfg(test)]
+mod goal_read_attribution_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    const SELF_ID: &str = "e2b9c4d38a474c35";
+    const OTHER_ID: &str = "ba42461ba69b4801";
+
+    fn q(reader: Option<&str>) -> GoalReadQuery {
+        GoalReadQuery {
+            reader: reader.map(str::to_string),
+        }
+    }
+
+    fn headers(reader: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(r) = reader {
+            h.insert("x-aoe-session", HeaderValue::from_str(r).unwrap());
+        }
+        h
+    }
+
+    fn attributed(hdr: Option<&str>, query: Option<&str>) -> bool {
+        declared_reader(&headers(hdr), &q(query))
+            .map(|r| same_session_id(&r, SELF_ID))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn a_session_reading_its_own_record_is_attributed() {
+        assert!(attributed(None, Some(SELF_ID)));
+        assert!(attributed(Some(SELF_ID), None));
+    }
+
+    #[test]
+    fn the_short_form_of_the_same_id_still_counts() {
+        assert!(attributed(None, Some(&SELF_ID[..8])));
+    }
+
+    #[test]
+    fn an_undeclared_read_is_never_attributed() {
+        // curl, the dashboard, anything that does not name itself. `None` must
+        // read as "no self read proven", never as "nobody read it".
+        assert!(!attributed(None, None));
+        assert!(!attributed(Some(""), Some("")));
+    }
+
+    #[test]
+    fn a_manager_reading_a_workers_goal_is_not_the_worker_reading_it() {
+        assert!(!attributed(None, Some(OTHER_ID)));
+        assert!(!attributed(Some(OTHER_ID), None));
+    }
+
+    #[test]
+    fn the_dispatch_hook_fetching_a_goal_does_not_count_as_the_worker_reading() {
+        // The enforcement hook GETs this endpoint on every WO dispatch and
+        // declares no reader. If that stamped, every session under active
+        // dispatch would look like a diligent reader.
+        assert!(!attributed(None, None));
+    }
+
+    #[test]
+    fn a_prefix_shorter_than_a_short_id_is_not_a_match() {
+        // Guard the loose comparison: one hex character must not match half
+        // the fleet.
+        assert!(!attributed(None, Some("e")));
+        assert!(!attributed(None, Some("e2b9c4")));
+    }
+
+    #[test]
+    fn an_explicit_reader_beats_the_header() {
+        // Both present and disagreeing: the explicit parameter is the caller's
+        // own statement about itself and wins.
+        let h = headers(Some(OTHER_ID));
+        let r = declared_reader(&h, &q(Some(SELF_ID))).unwrap();
+        assert!(same_session_id(&r, SELF_ID));
+    }
+}
+
 pub async fn get_session_goal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<GoalReadQuery>,
 ) -> impl IntoResponse {
+    // A session reading its OWN record is the one read worth recording, and it
+    // is recorded before the body is built so the answer a caller gets already
+    // reflects it. Persist first, memory second, exactly as the goal WRITE
+    // path does: a stamp that survives only until the next restart would claim
+    // a worker had read something it may never have.
+    let self_read = {
+        let instances = state.instances.read().await;
+        let known = instances.iter().any(|i| i.id == id);
+        let is_self = declared_reader(&headers, &q)
+            .map(|r| same_session_id(&r, &id))
+            .unwrap_or(false);
+        // read_only serves a frozen view; recording a read would be a write.
+        known && is_self && !state.read_only
+    };
+    if self_read {
+        let profile = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| i.source_profile.clone())
+        };
+        if let Some(profile) = profile {
+            let stamped_at = chrono::Utc::now();
+            let persist_id = id.clone();
+            // Best effort: a session must still be able to READ its goal when
+            // the ledger write fails. Losing the stamp understates the read,
+            // which is the safe direction — refusing the read is not.
+            let _ = persist_session_update(
+                profile,
+                "goal read",
+                state.file_watch.clone(),
+                move |instances| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                        inst.goal_last_read_at = Some(stamped_at);
+                        inst.goal_read_count = inst.goal_read_count.saturating_add(1);
+                    }
+                },
+            )
+            .await;
+            let mut instances = state.instances.write().await;
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                inst.goal_last_read_at = Some(stamped_at);
+                inst.goal_read_count = inst.goal_read_count.saturating_add(1);
+            }
+        }
+    }
+
     let instances = state.instances.read().await;
     let Some(inst) = instances.iter().find(|i| i.id == id) else {
         return (
@@ -2970,6 +3158,8 @@ pub async fn get_session_goal(
             "goal_len": inst.goal.as_deref().map(str::chars).map(Iterator::count).unwrap_or(0),
             "goal_max": GOAL_MAX_CHARS,
             "perpetual": inst.goal_perpetual,
+            "goal_last_read_at": inst.goal_last_read_at,
+            "goal_read_count": inst.goal_read_count,
         })),
     )
         .into_response()
@@ -13145,6 +13335,8 @@ mod workspace_ordering_tests {
             goal: None,
             goal_missing: false,
             goal_stale: false,
+            goal_last_read_at: None,
+            goal_read_count: 0,
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,

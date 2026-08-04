@@ -452,6 +452,12 @@ pub struct WorkspaceRepo {
     pub base_branch_override: Option<String>,
 }
 
+/// Keeps a never-incremented counter out of the stored record, so an existing
+/// session file is untouched until the thing being counted actually happens.
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1115,6 +1121,26 @@ pub struct Instance {
     /// happens to say "perpetual". See per-dev #211.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub goal_perpetual: bool,
+
+    /// When this session last read its OWN goal record, and how many times it
+    /// ever has. `None` / `0` means it never has — which is the state worth
+    /// seeing: a worker running purely off message bodies drops whatever the
+    /// goal says and nobody upstream can tell, because the record looks set
+    /// and looks read. One such session was found working from dispatch text
+    /// alone with a deliverable silently missed.
+    ///
+    /// Only a SELF read counts. A manager reading a worker's goal, a
+    /// dispatch-time enforcement hook fetching it, or a plain curl must not
+    /// stamp it: those reads say nothing about whether the worker ever looked,
+    /// and counting them would make every session look diligent. The reader
+    /// declares itself and must match this session; an undeclared read leaves
+    /// the field alone, so `None` means "no self read proven", never "no read
+    /// happened". See per-dev WO#1159 D3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_last_read_at: Option<DateTime<Utc>>,
+
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub goal_read_count: u64,
 
     /// When a work-order shaped message (`WO#<n>` or "work order" in the
     /// body) last flowed to this session through the daemon's send API.
@@ -1804,6 +1830,8 @@ impl Instance {
             goal: None,
             goal_updated_at: None,
             goal_perpetual: false,
+            goal_last_read_at: None,
+            goal_read_count: 0,
             last_wo_dispatch_at: None,
             view: View::Terminal,
             agent_name: None,
