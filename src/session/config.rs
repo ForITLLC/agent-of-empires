@@ -1620,9 +1620,50 @@ fn shell_quote_value(value: &str) -> String {
     if plain {
         return value.to_string();
     }
+    // Already quoted by whoever wrote it: re-quoting would nest and the agent
+    // would receive a model id with literal quote characters in it.
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        return value.to_string();
+    }
     // Single quotes protect everything except a single quote, which has to be
     // closed, escaped, and reopened.
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Quote a glob-active `--model` / `-m` VALUE inside a free-form extra-args
+/// string, leaving every other token alone.
+///
+/// The session's own `extra_args` is spliced into the launch line verbatim and
+/// may legitimately carry several flags, so it cannot be quoted wholesale —
+/// but the model value inside it is exactly the token the fleet generates a
+/// glob for. `aoe add` seeds `extra_args` FROM the profile pin, so this is the
+/// path a freshly created session actually takes; the injection path below
+/// only fires when `extra_args` carries no model at all. Fixing one and not
+/// the other leaves the common case broken, which is how the first attempt at
+/// WO#1174 D1 still died on a live pane.
+pub fn quote_model_value_in_args(args: &str) -> String {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        let tok = toks[i];
+        if let Some((lhs, value)) = tok.split_once('=') {
+            if (lhs == "--model" || lhs == "-m") && !value.is_empty() {
+                out.push(format!("{lhs}={}", shell_quote_value(value)));
+                i += 1;
+                continue;
+            }
+        }
+        if (tok == "--model" || tok == "-m") && i + 1 < toks.len() {
+            out.push(tok.to_string());
+            out.push(shell_quote_value(toks[i + 1]));
+            i += 2;
+            continue;
+        }
+        out.push(tok.to_string());
+        i += 1;
+    }
+    out.join(" ")
 }
 
 /// What a single mouse click on a session row does in the Agent view.
