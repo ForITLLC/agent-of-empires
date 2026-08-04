@@ -1630,6 +1630,14 @@ fn shell_quote_value(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// Marker proving this binary quotes glob-active model values at launch.
+///
+/// Greppable with `strings`, so an auditor can tell a fixed binary from a
+/// pre-fix one without spawning a pane. Pair it with a control probe: a check
+/// that cannot find its own control is broken, and a broken check must never
+/// read as "safe".
+pub const MODEL_PIN_QUOTING_CAPABILITY: &str = "aoe-cap:model-pin-quoting/1";
+
 /// Quote a glob-active `--model` / `-m` VALUE inside a free-form extra-args
 /// string, leaving every other token alone.
 ///
@@ -1642,6 +1650,16 @@ fn shell_quote_value(value: &str) -> String {
 /// the other leaves the common case broken, which is how the first attempt at
 /// WO#1174 D1 still died on a live pane.
 pub fn quote_model_value_in_args(args: &str) -> String {
+    // A binary must be able to SAY whether it carries this fix.
+    //
+    // The obvious probe — grepping the binary for this function's name —
+    // answers zero on a fixed binary AND on a broken one, because an optimized
+    // release build never emits Rust symbol names. A reviewer read that zero,
+    // could not tell it from absence, and correctly refused to act on it. A
+    // string LITERAL does survive (`"pane died at launch"` greps 1 on the
+    // fixed binary and 0 on the pre-fix one), so the capability is declared as
+    // one and referenced at runtime to keep it. See per-dev WO#1177 D1.
+    tracing::trace!(target: "session.launch", capability = MODEL_PIN_QUOTING_CAPABILITY);
     let toks: Vec<&str> = args.split_whitespace().collect();
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
     let mut i = 0;
