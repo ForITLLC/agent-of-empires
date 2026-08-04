@@ -173,6 +173,20 @@ pub struct SessionResponse {
     /// and permanent-delete actions. See #2489.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<String>,
+    /// Whether this record is a LIVE session or a corpse: `live`, `archived`
+    /// or `trashed`.
+    ///
+    /// Liveness used to require reading two nullable timestamps and knowing
+    /// that either one means dead. A consumer that filtered `archived_at` and
+    /// forgot `trashed_at` counted corpses as live, and that is not
+    /// hypothetical: it happened twice in one month, once putting a trashed
+    /// probe corpse into a live enumerate as an off-pool placement bug that
+    /// did not exist. A distinction every reader has to recompute is one some
+    /// readers will get wrong, so it is computed once, here.
+    ///
+    /// `trashed` wins over `archived`: a record that is both is on its way
+    /// out, and the stronger state is the honest one. See per-dev WO#1171 D2.
+    pub lifecycle: &'static str,
     /// Unread marker, mirroring `Instance::unread`: `true` when the session
     /// needs attention (a finished turn the user hasn't engaged with, or a
     /// manual flag), omitted when read. The web sidebar paints an unread
@@ -550,6 +564,7 @@ impl SessionResponse {
             goal: inst.goal.clone(),
             goal_missing: inst.goal.is_none() && goal_flags_apply(inst),
             goal_stale: goal_stale_at(inst, chrono::Utc::now()),
+            lifecycle: lifecycle_of(inst),
             goal_last_read_at: inst.goal_last_read_at,
             goal_read_count: inst.goal_read_count,
             goal_read_state: goal_read_state(inst).0,
@@ -743,6 +758,13 @@ fn truncate_title(s: &str, max: usize) -> String {
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     pub workspace_ordering: Vec<String>,
+    /// How many of `sessions` are live, archived and trashed.
+    ///
+    /// This list returns corpses as well as live sessions, so `sessions.len()`
+    /// is not a fleet size and must never be used as one. Publishing the split
+    /// means a reader gets the denominator without deriving it — the
+    /// derivation is exactly what has been got wrong. See per-dev WO#1171 D2.
+    pub census: SessionCensus,
     /// Fleet-wide MCP gateway surface badge (per-dev WO 6137C598 B2). Set by
     /// external monitors via `POST /api/mcp-surface` when the fastmcp gateway
     /// is truncated or unreachable; absent while healthy, so the field only
@@ -1154,9 +1176,11 @@ pub async fn list_sessions(
 
     let mcp_surface = state.mcp_surface.read().expect("mcp_surface lock").clone();
 
+    let census = SessionCensus::of(sessions.iter().map(|s| s.lifecycle));
     Json(SessionsEnvelope {
         sessions,
         workspace_ordering,
+        census,
         mcp_surface,
     })
 }
@@ -3017,6 +3041,47 @@ fn declared_reader(headers: &axum::http::HeaderMap, q: &GoalReadQuery) -> Option
         })
 }
 
+/// The live/dead split of a session list, so the denominator is published
+/// rather than derived.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionCensus {
+    /// Rows in the list, live and dead together. Not a fleet size.
+    pub total: usize,
+    pub live: usize,
+    pub archived: usize,
+    pub trashed: usize,
+}
+
+impl SessionCensus {
+    /// Counts the lifecycle values of a list. Takes the values rather than the
+    /// rows so the split can be exercised without standing up a full response.
+    fn of<'a>(lifecycles: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut c = SessionCensus::default();
+        for l in lifecycles {
+            c.total += 1;
+            match l {
+                "trashed" => c.trashed += 1,
+                "archived" => c.archived += 1,
+                _ => c.live += 1,
+            }
+        }
+        c
+    }
+}
+
+/// Live session or corpse, decided once so no consumer has to.
+///
+/// `trashed` outranks `archived`: a record carrying both is on its way out.
+fn lifecycle_of(inst: &Instance) -> &'static str {
+    if inst.trashed_at.is_some() {
+        "trashed"
+    } else if inst.archived_at.is_some() {
+        "archived"
+    } else {
+        "live"
+    }
+}
+
 /// What a `goal_read_count` actually licenses a reader to conclude.
 ///
 /// The count alone is not evidence. It was read sixteen minutes after it
@@ -3025,6 +3090,17 @@ fn declared_reader(headers: &axum::http::HeaderMap, q: &GoalReadQuery) -> Option
 /// truth. The caveat existed, in a commit message, and no consumer of this API
 /// ever sees a commit message. So it ships in the payload.
 fn goal_read_state(inst: &Instance) -> (&'static str, &'static str) {
+    // A corpse cannot read anything, so it must never sit in a read-state
+    // denominator. Counting archived and trashed records alongside live ones
+    // turned 41-of-42 into 133 — the same population error, one layer up, as
+    // the one this field exists to prevent.
+    if lifecycle_of(inst) != "live" {
+        return (
+            "inapplicable_dead",
+            "NOT A READ STATE: this session is archived or trashed and cannot read anything. \
+             Exclude it from any read-state count; see `lifecycle`.",
+        );
+    }
     if inst.goal_read_count > 0 {
         return (
             "read",
@@ -3052,6 +3128,101 @@ fn goal_read_state(inst: &Instance) -> (&'static str, &'static str) {
         "this session has NOT read its own goal record since goal_read_tracking_since, and \
          attributed reads are known to work here because a caller has identified itself before.",
     )
+}
+
+/// A corpse must never be countable as a session.
+///
+/// Liveness took two nullable timestamps and the knowledge that either one
+/// means dead. Filtering `archived_at` and forgetting `trashed_at` counted
+/// corpses as live twice in one month — once putting a trashed probe corpse
+/// into a live enumerate as an off-pool placement bug that did not exist, and
+/// once turning 42 sessions into 133 in a read-state census. A distinction
+/// every reader recomputes is one some readers get wrong.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn inst() -> Instance {
+        Instance::new("t", "/tmp")
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+
+    #[test]
+    fn a_plain_session_is_live() {
+        assert_eq!(lifecycle_of(&inst()), "live");
+    }
+
+    #[test]
+    fn archived_and_trashed_are_both_dead() {
+        let mut a = inst();
+        a.archived_at = Some(now());
+        assert_eq!(lifecycle_of(&a), "archived");
+
+        let mut t = inst();
+        t.trashed_at = Some(now());
+        assert_eq!(lifecycle_of(&t), "trashed");
+    }
+
+    #[test]
+    fn trashed_outranks_archived() {
+        // 12 live records carry both. Reporting the weaker state would let a
+        // reader filtering only `trashed` count a record on its way out.
+        let mut both = inst();
+        both.archived_at = Some(now());
+        both.trashed_at = Some(now());
+        assert_eq!(lifecycle_of(&both), "trashed");
+    }
+
+    #[test]
+    fn a_dead_record_has_no_read_state_at_all() {
+        // The corpse-in-the-denominator error, closed at the source: a dead
+        // record cannot be counted as untracked, never_read, or anything else
+        // that implies it might have read something.
+        for kill in [0, 1] {
+            let mut i = inst();
+            if kill == 0 {
+                i.archived_at = Some(now());
+            } else {
+                i.trashed_at = Some(now());
+            }
+            let (state, note) = goal_read_state(&i);
+            assert_eq!(state, "inapplicable_dead");
+            assert!(note.contains("NOT A READ STATE"), "{note}");
+            assert!(
+                note.contains("lifecycle"),
+                "the note must point at the field: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_record_with_a_real_read_history_still_reads_as_dead() {
+        // Archiving a session that DID read its goal must not resurrect it
+        // into the live population just because the counter is non-zero.
+        let mut i = inst();
+        i.goal_read_count = 9;
+        i.goal_read_tracking_since = Some(now());
+        i.goal_reader_declared_at = Some(now());
+        assert_eq!(goal_read_state(&i).0, "read");
+        i.archived_at = Some(now());
+        assert_eq!(goal_read_state(&i).0, "inapplicable_dead");
+    }
+
+    #[test]
+    fn the_census_publishes_the_denominator() {
+        // The reader should never have to derive this — deriving it is the
+        // thing that went wrong.
+        let c = SessionCensus::of(["live", "live", "archived", "trashed", "trashed"]);
+        assert_eq!((c.total, c.live, c.archived, c.trashed), (5, 2, 1, 2));
+        assert_eq!(
+            c.live + c.archived + c.trashed,
+            c.total,
+            "every row must land in exactly one bucket"
+        );
+    }
 }
 
 /// A zero must never be readable as an accusation.
@@ -13544,6 +13715,7 @@ mod workspace_ordering_tests {
             goal_stale: false,
             goal_last_read_at: None,
             goal_read_count: 0,
+            lifecycle: "live",
             goal_read_state: "untracked",
             goal_read_note: "",
             goal_read_tracking_since: None,
