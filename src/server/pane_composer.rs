@@ -87,87 +87,99 @@ fn plain_owned(line: &str) -> String {
     crate::tmux::utils::strip_ansi(line).trim_end().to_string()
 }
 
-/// True when EVERY visible glyph of `raw` is drawn faint.
-///
-/// Tracks the SGR state across the line: 2 sets faint, 22/0 clear it. Only
-/// text that appears while faint is active counts as the client's own
-/// drawing, so a line mixing a person's text with a faint suffix is NOT
-/// classified as chrome — the inverse leg matters more, and hiding a real
-/// draft is worse than the bug being fixed.
-fn all_faint(raw: &str) -> Option<bool> {
-    let mut faint = false;
-    let mut saw_visible = false;
-    let mut any_bright = false;
-    let mut rest = raw;
-    let mut saw_sgr = false;
-    while let Some(idx) = rest.find('\u{1b}') {
-        let (before, tail) = rest.split_at(idx);
-        if before.chars().any(|c| !c.is_whitespace()) {
-            saw_visible = true;
-            if !faint {
-                any_bright = true;
-            }
+/// Note whether `s` puts any of the human's own glyphs on screen, and at what
+/// intensity. Box edges are the client's frame, never anyone's text.
+fn note_glyphs(s: &str, faint: bool, saw: &mut bool, bright: &mut bool) {
+    if s.chars()
+        .any(|c| !c.is_whitespace() && !VERTICALS.contains(c))
+    {
+        *saw = true;
+        if !faint {
+            *bright = true;
         }
-        let Some(end) = tail.find('m') else { break };
-        let params = &tail[2..end];
-        if tail.starts_with("\u{1b}[") {
-            saw_sgr = true;
-            for p in params.split(';') {
+    }
+}
+
+/// Replay one line's SGR codes, recording whether any visible glyph is drawn
+/// while faint is OFF.
+///
+/// `faint` is owned by the CALLER and carried across lines, because that is
+/// what a terminal does: tmux emits an escape only when an attribute CHANGES,
+/// so the continuation of a wrapped faint line carries no escape at all and is
+/// still faint. Verified against a live capture — judging each line in
+/// isolation made a wrapped human draft read as `unknown`, which is the field
+/// going quiet about exactly what it exists to expose.
+fn scan(raw: &str, faint: &mut bool, saw: &mut bool, bright: &mut bool) {
+    let mut rest = raw;
+    loop {
+        let Some(at) = rest.find('\u{1b}') else {
+            note_glyphs(rest, *faint, saw, bright);
+            return;
+        };
+        let (chunk, tail) = rest.split_at(at);
+        note_glyphs(chunk, *faint, saw, bright);
+        let Some(end) = tail.find(|c: char| c.is_ascii_alphabetic()) else {
+            return;
+        };
+        if tail.starts_with("\u{1b}[") && tail[end..].starts_with('m') {
+            for p in tail[2..end].split(';') {
                 match p.trim() {
-                    "2" => faint = true,
-                    "22" | "0" | "" => faint = false,
+                    "2" => *faint = true,
+                    "0" | "22" | "" => *faint = false,
                     _ => {}
                 }
             }
         }
         rest = &tail[end + 1..];
     }
-    if rest.chars().any(|c| !c.is_whitespace()) {
-        saw_visible = true;
-        if !faint {
-            any_bright = true;
-        }
-    }
-    if !saw_sgr {
-        return None; // nothing to judge by
-    }
-    if !saw_visible {
-        return Some(false);
-    }
-    Some(!any_bright)
 }
 
-/// Classify the widget's contents from the raw lines that produced them.
-fn classify_origin(raw_draft_lines: &[&str], had_escapes: bool) -> DraftOrigin {
+/// Classify the widget's contents from the raw bytes that produced them.
+///
+/// `before` is everything above the widget: it decides the intensity the
+/// widget INHERITS, so a client that leaves faint on above the box cannot make
+/// a typed draft look like chrome.
+fn classify_origin(before: &[&str], widget: &[&str], had_escapes: bool) -> DraftOrigin {
     if !had_escapes {
+        // A stripped capture carries no styling at all, so there is nothing to
+        // judge by. An honest unknown is safe; a confident guess is what puts
+        // words in someone's mouth.
         return DraftOrigin::Unknown;
     }
-    let mut verdicts = Vec::new();
-    for line in raw_draft_lines {
-        // Judge the CONTENT only. The prompt marker and the box are the
-        // client's own chrome by definition; counting them as bright text
-        // would classify every widget as human-typed and defeat the field.
-        let content = PROMPTS
-            .iter()
-            .find_map(|p| line.find(*p).map(|i| &line[i + p.len()..]))
-            .unwrap_or(line);
-        if crate::tmux::utils::strip_ansi(content).trim().is_empty() {
-            continue;
-        }
-        match all_faint(content) {
-            Some(v) => verdicts.push(v),
-            None => return DraftOrigin::Unknown,
-        }
+    let mut faint = false;
+    let (mut ignore_saw, mut ignore_bright) = (false, false);
+    for line in before {
+        scan(line, &mut faint, &mut ignore_saw, &mut ignore_bright);
     }
-    if verdicts.is_empty() {
+
+    let (mut saw, mut bright) = (false, false);
+    for (i, line) in widget.iter().enumerate() {
+        let mut line: &str = line;
+        if i == 0 {
+            // The prompt marker is the client's own chrome by definition, and
+            // counting its glyph as typed text would make every widget look
+            // human-typed. Its escapes still set the intensity the draft is
+            // drawn in, so replay those and drop only the glyph.
+            if let Some((at, marker)) = PROMPTS.iter().find_map(|p| line.find(*p).map(|i| (i, *p)))
+            {
+                scan(&line[..at], &mut faint, &mut ignore_saw, &mut ignore_bright);
+                line = &line[at + marker.len()..];
+            }
+        }
+        scan(line, &mut faint, &mut saw, &mut bright);
+    }
+
+    if !saw {
         // An empty widget has no contents, so there is nobody to attribute
         // them to. Saying so beats inventing an author for "".
         return DraftOrigin::Unknown;
     }
-    if verdicts.iter().all(|v| *v) {
-        DraftOrigin::ClientRendered
-    } else {
+    // Any bright glyph means a person put something there. Biased on purpose:
+    // hiding a real draft is worse than the bug being fixed.
+    if bright {
         DraftOrigin::HumanTyped
+    } else {
+        DraftOrigin::ClientRendered
     }
 }
 
@@ -240,9 +252,13 @@ pub fn split_pane_composer(content: &str) -> (String, Option<Composer>) {
     }
 
     // Attribute the contents from the RAW bytes that produced them.
-    let raw_draft: Vec<&str> = body[first..].to_vec();
+    let widget_start = top + 1 + first;
     let had_escapes = content.contains('\u{1b}');
-    let origin = classify_origin(&raw_draft, had_escapes);
+    let origin = classify_origin(
+        &lines[..widget_start],
+        &lines[widget_start..bot],
+        had_escapes,
+    );
 
     let history = lines[..top].join("\n");
     (
@@ -418,6 +434,68 @@ mod tests {
         let (history, composer) = split_pane_composer(GHOST_ANSI);
         assert!(composer.is_some(), "ansi capture must still split");
         assert!(!history.contains("prove every line"));
+    }
+
+    /// REAL bytes from per-dev's own pane, typed and never sent. The draft
+    /// WRAPPED, and tmux emits an escape only when an attribute CHANGES, so
+    /// the continuation line carries none at all. Judging each line on its own
+    /// lost this to `unknown` — a live-caught failure of the leg that matters
+    /// most: the field went quiet about a draft a person really typed.
+    const WRAPPED_HUMAN: &str = concat!(
+        "  some committed output\n",
+        "──────────────────────────────────────────────────────────────\n",
+        "\u{1b}[38;5;246m❯\u{a0}\u{1b}[39mWO#1128 inverse-leg specimen:\n",
+        "typed by a human, never sent\n",
+        "──────────────────────────────────────────────────────────────\n",
+        "  ⏵⏵ bypass permissions"
+    );
+
+    /// The same wrapping behaviour applied to CHROME, verified in a scratch
+    /// tmux session: faint text that wraps emits `2` once and nothing on the
+    /// continuation, which stays faint.
+    const WRAPPED_GHOST: &str = concat!(
+        "  some committed output\n",
+        "──────────────────────────────────────────────────────────────\n",
+        "\u{1b}[39m❯\u{a0}\u{1b}[2mfaint ghost long enough to wrap a\n",
+        "cross more than one terminal line for su\n",
+        "re\u{1b}[0m\n",
+        "──────────────────────────────────────────────────────────────\n",
+        "  ⏵⏵ bypass permissions"
+    );
+
+    #[test]
+    fn a_wrapped_human_draft_is_not_lost_to_unknown() {
+        let (_, composer) = split_pane_composer(WRAPPED_HUMAN);
+        let composer = composer.expect("widget present");
+        assert_eq!(composer.origin, DraftOrigin::HumanTyped);
+        assert!(composer.draft.contains("typed by a human, never sent"));
+    }
+
+    #[test]
+    fn a_wrapped_ghost_stays_chrome_across_the_line_break() {
+        let (_, composer) = split_pane_composer(WRAPPED_GHOST);
+        assert_eq!(
+            composer.expect("widget present").origin,
+            DraftOrigin::ClientRendered
+        );
+    }
+
+    #[test]
+    fn faint_state_entering_the_widget_does_not_leak_onto_a_typed_draft() {
+        // History above the box left faint ON and never cleared it. The widget
+        // re-establishes normal intensity, and the draft must read as typed.
+        let pane = concat!(
+            "\u{1b}[2m  dimmed committed output\n",
+            "──────────────────────────────────────────────────────────────\n",
+            "\u{1b}[0m\u{1b}[39m❯ ship the thing\n",
+            "──────────────────────────────────────────────────────────────\n",
+            "  footer"
+        );
+        let (_, composer) = split_pane_composer(pane);
+        assert_eq!(
+            composer.expect("widget present").origin,
+            DraftOrigin::HumanTyped
+        );
     }
 
     #[test]
