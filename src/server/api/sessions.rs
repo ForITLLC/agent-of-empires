@@ -12924,27 +12924,29 @@ pub async fn read_output(
         if !tmux_session.exists() {
             return Err(CaptureError::NotRunning);
         }
-        let raw = tmux_session
-            .capture_pane(lines)
-            .map_err(CaptureError::Tmux)?;
-        if want_ansi {
-            Ok(raw)
-        } else {
-            Ok(crate::tmux::utils::strip_ansi(&raw))
-        }
+        // Capture RAW regardless of `format`. Provenance is judged from the
+        // terminal's own styling, so stripping before the split would destroy
+        // the only evidence of where the widget's contents came from and every
+        // format=text read would have to answer "unknown".
+        tmux_session.capture_pane(lines).map_err(CaptureError::Tmux)
     })
     .await;
 
     match capture_result {
-        Ok(Ok(content)) => {
+        Ok(Ok(raw)) => {
             // Committed history and the LIVE input widget are separate regions
             // (WO#1124). A capture renders typed-but-unsent text exactly like
             // sent text, and a reader once took another session's unsubmitted
             // "send it" as an order. The unsent text is still returned — as its
-            // own region, marked submitted:false — so it reads as data and
-            // never as an utterance. Nothing is blocked here; this only tells
-            // one region from another.
-            let (history, composer) = crate::server::pane_composer::split_pane_composer(&content);
+            // own region, marked submitted:false, and carrying where it came
+            // from — so it reads as data and never as an utterance. Nothing is
+            // blocked here; this only tells one region from another.
+            let (history, composer) = crate::server::pane_composer::split_pane_composer(&raw);
+            let history = if want_ansi {
+                history
+            } else {
+                crate::tmux::utils::strip_ansi(&history)
+            };
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
