@@ -24,13 +24,19 @@ fn print_power_value(v: &serde_json::Value) {
     let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("?");
     let live = v.get("live_wakes").and_then(|n| n.as_u64()).unwrap_or(0);
     println!("power: {state} (live wakes: {live})");
-    if let Some(cancelled) = v.get("cancelled_wakes").and_then(|c| c.as_array()) {
-        if cancelled.is_empty() {
-            println!("cancelled wakes: none");
-        } else {
-            println!("cancelled wakes ({}):", cancelled.len());
-            for id in cancelled {
-                println!("  - {}", id.as_str().unwrap_or("?"));
+    for (key, label) in [
+        ("cancelled_wakes", "cancelled wakes"),
+        ("stopping_sessions", "stopping sessions"),
+        ("restoring_sessions", "restoring sessions"),
+    ] {
+        if let Some(items) = v.get(key).and_then(|c| c.as_array()) {
+            if items.is_empty() {
+                println!("{label}: none");
+            } else {
+                println!("{label} ({}):", items.len());
+                for id in items {
+                    println!("  - {}", id.as_str().unwrap_or("?"));
+                }
             }
         }
     }

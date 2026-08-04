@@ -77,6 +77,7 @@ pub use sessions::{
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
+pub(crate) use sessions::{power_restore_sessions, power_stop_sessions, power_stop_targets};
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
 // Trash retention sweep, driven by the daemon's hourly loop; not a route handler.

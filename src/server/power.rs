@@ -51,6 +51,12 @@ struct PowerFile {
     changed_by: String,
     #[serde(default)]
     wakes: Vec<WakeEntry>,
+    /// Session ids whose panes the OFF flip stopped. ON restores EXACTLY
+    /// this set and consumes it; persisting it is what lets the restore
+    /// survive a daemon restart and never resurrect sessions OFF did not
+    /// stop.
+    #[serde(default)]
+    stopped_sessions: Vec<String>,
 }
 
 impl Default for PowerFile {
@@ -60,6 +66,7 @@ impl Default for PowerFile {
             since_ms: now_ms(),
             changed_by: "default".to_string(),
             wakes: Vec::new(),
+            stopped_sessions: Vec::new(),
         }
     }
 }
@@ -180,6 +187,28 @@ impl PowerRegistry {
         Some(entry)
     }
 
+    /// Persist the set of sessions the OFF flip stopped. Overwrites: one OFF,
+    /// one set.
+    pub fn record_stopped(&self, ids: &[String]) {
+        let mut f = self.lock();
+        f.stopped_sessions = ids.to_vec();
+        self.save_locked(&mut f);
+    }
+
+    /// The persisted OFF-stopped set, without consuming it.
+    pub fn stopped(&self) -> Vec<String> {
+        self.lock().stopped_sessions.clone()
+    }
+
+    /// Consume the OFF-stopped set (persisted): ON restores exactly this set,
+    /// exactly once.
+    pub fn take_stopped(&self) -> Vec<String> {
+        let mut f = self.lock();
+        let out = std::mem::take(&mut f.stopped_sessions);
+        self.save_locked(&mut f);
+        out
+    }
+
     pub fn list(&self, session_id: Option<&str>) -> Vec<WakeEntry> {
         self.lock()
             .wakes
@@ -280,15 +309,37 @@ pub async fn set_power(
     };
     let changed_by = req.changed_by.unwrap_or_else(|| "api".to_string());
     let cancelled = state.power.set(on, &changed_by);
+    let mut body = power_json(&state.power);
+    body["cancelled_wakes"] = serde_json::json!(cancelled);
+    if on {
+        // Restore EXACTLY the set OFF stopped; consuming it here means a
+        // repeat ON restores nothing extra.
+        let restore = state.power.take_stopped();
+        body["restoring_sessions"] = serde_json::json!(restore);
+        if !restore.is_empty() {
+            tokio::spawn(super::api::power_restore_sessions(
+                Arc::clone(&state),
+                restore,
+            ));
+        }
+    } else {
+        // Stop every live pane the daemon owns. A stopped pane cannot
+        // process a harness wakeup regardless of what hook config its
+        // session cached, so OFF does not depend on hook adoption.
+        let targets = super::api::power_stop_targets(&state).await;
+        state.power.record_stopped(&targets);
+        body["stopping_sessions"] = serde_json::json!(targets);
+        if !targets.is_empty() {
+            tokio::spawn(super::api::power_stop_sessions(Arc::clone(&state), targets));
+        }
+    }
     tracing::info!(
         target: "power.switch",
         state = if on { "on" } else { "off" },
         changed_by = %changed_by,
-        cancelled_wakes = cancelled.len(),
+        cancelled_wakes = body["cancelled_wakes"].as_array().map(|a| a.len()).unwrap_or(0),
         "master power switch flipped"
     );
-    let mut body = power_json(&state.power);
-    body["cancelled_wakes"] = serde_json::json!(cancelled);
     Json(body).into_response()
 }
 
@@ -401,6 +452,30 @@ mod tests {
         let back_on = r.set(true, "ben");
         assert!(back_on.is_empty());
         assert!(r.arm("sess-a", "schedule_wakeup", None, "").is_some());
+    }
+
+    #[test]
+    fn off_stop_set_is_recorded_taken_once_and_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let r = reg(dir.path());
+            r.set(false, "ben");
+            r.record_stopped(&["sess-a".to_string(), "sess-b".to_string()]);
+        }
+        let r2 = reg(dir.path());
+        assert_eq!(
+            r2.stopped(),
+            vec!["sess-a".to_string(), "sess-b".to_string()],
+            "the stopped set must survive a daemon restart"
+        );
+        let taken = r2.take_stopped();
+        assert_eq!(taken, vec!["sess-a".to_string(), "sess-b".to_string()]);
+        assert!(
+            r2.take_stopped().is_empty(),
+            "take consumes: ON restores the set exactly once"
+        );
+        let r3 = reg(dir.path());
+        assert!(r3.stopped().is_empty(), "consumption is persisted");
     }
 
     #[test]

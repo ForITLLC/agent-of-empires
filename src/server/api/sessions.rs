@@ -4750,6 +4750,180 @@ async fn finish_detached_restart(state: &Arc<AppState>, id: &str) {
         .remove(id);
 }
 
+/// Sessions the master-power OFF flip should stop: live panes only. Already
+/// stopped, mid-lifecycle and archived rows have no pane to stop, and
+/// including them would make ON "restore" sessions OFF never touched.
+pub(crate) async fn power_stop_targets(state: &Arc<AppState>) -> Vec<String> {
+    let instances = state.instances.read().await;
+    instances
+        .iter()
+        .filter(|i| {
+            !matches!(
+                i.status,
+                Status::Stopped | Status::Deleting | Status::Creating
+            ) && !i.is_archived()
+        })
+        .map(|i| i.id.clone())
+        .collect()
+}
+
+/// The OFF cascade: stop each named session's pane, sequentially, with the
+/// same persistence and side effects as `stop_session`. Runs detached from
+/// the flip request; a per-session failure is logged and never aborts the
+/// rest, because a partial OFF that silently stops stopping is the exact
+/// claim-not-fact failure the switch exists to end.
+pub(crate) async fn power_stop_sessions(state: Arc<AppState>, ids: Vec<String>) {
+    for id in ids {
+        let lock = state.instance_lock(&id).await;
+        let _guard = lock.lock().await;
+
+        let snapshot = {
+            let instances = state.instances.read().await;
+            instances.iter().find(|i| i.id == id).cloned()
+        };
+        let Some(inst) = snapshot else {
+            tracing::warn!(target: "power.cascade", session = %id, "off: instance vanished");
+            continue;
+        };
+        if matches!(
+            inst.status,
+            Status::Stopped | Status::Deleting | Status::Creating
+        ) {
+            continue;
+        }
+        let profile = inst.source_profile.clone();
+        let is_structured = inst.is_structured();
+
+        let persist_id = id.clone();
+        if persist_session_update(
+            profile,
+            "power off stop",
+            state.file_watch.clone(),
+            move |instances| {
+                if let Some(row) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    row.status = Status::Stopped;
+                    if is_structured {
+                        row.mark_idle_dormant();
+                    }
+                }
+            },
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(target: "power.cascade", session = %id, "off: persist failed; pane left running");
+            continue;
+        }
+        {
+            let mut instances = state.instances.write().await;
+            if let Some(row) = instances.iter_mut().find(|i| i.id == id) {
+                row.status = Status::Stopped;
+                if is_structured {
+                    row.mark_idle_dormant();
+                }
+            }
+        }
+        if is_structured {
+            match state.acp_supervisor.shutdown(&id).await {
+                Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+                Err(e) => tracing::warn!(
+                    target: "power.cascade",
+                    session = %id,
+                    "off: worker shutdown failed: {e}"
+                ),
+            }
+        } else {
+            let inst_for_stop = inst.clone();
+            match tokio::task::spawn_blocking(move || inst_for_stop.stop()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(target: "power.cascade", session = %id, "off: pane stop failed: {e}")
+                }
+                Err(e) => {
+                    tracing::warn!(target: "power.cascade", session = %id, "off: stop join failed: {e}")
+                }
+            }
+        }
+        tracing::info!(target: "power.cascade", session = %id, "off: pane stopped");
+    }
+    tracing::info!(target: "power.cascade", "off: stop cascade complete");
+}
+
+/// The ON cascade: restore exactly the persisted OFF-stopped set. Plain
+/// sessions go through the detached-restart machinery (corpse-pane cleanup +
+/// resume + wake); structured sessions are un-parked for the reconciler.
+/// A session that is no longer Stopped is skipped: restore must never touch
+/// what OFF did not stop.
+pub(crate) async fn power_restore_sessions(state: Arc<AppState>, ids: Vec<String>) {
+    for id in ids {
+        let (is_structured, is_stopped, profile) = {
+            let instances = state.instances.read().await;
+            let Some(inst) = instances.iter().find(|i| i.id == id) else {
+                tracing::warn!(target: "power.cascade", session = %id, "on: instance vanished");
+                continue;
+            };
+            (
+                inst.is_structured(),
+                matches!(inst.status, Status::Stopped),
+                inst.source_profile.clone(),
+            )
+        };
+        if !is_stopped {
+            tracing::info!(target: "power.cascade", session = %id, "on: not stopped; skipping");
+            continue;
+        }
+        if is_structured {
+            let persist_id = id.clone();
+            if persist_session_update(
+                profile,
+                "power on unpark",
+                state.file_watch.clone(),
+                move |instances| {
+                    if let Some(row) = instances.iter_mut().find(|i| i.id == persist_id) {
+                        row.idle_dormant_since = None;
+                        row.status = Status::Idle;
+                        row.last_error = None;
+                    }
+                },
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!(target: "power.cascade", session = %id, "on: unpark persist failed");
+                continue;
+            }
+            let mut instances = state.instances.write().await;
+            if let Some(row) = instances.iter_mut().find(|i| i.id == id) {
+                row.idle_dormant_since = None;
+                row.status = Status::Idle;
+                row.last_error = None;
+            }
+            continue;
+        }
+        let fresh = {
+            let mut inflight = state
+                .restart_inflight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            inflight.insert(id.clone())
+        };
+        if !fresh {
+            continue;
+        }
+        crate::session::recovery::mark_recently_restarted(&state.recently_restarted, &id);
+        {
+            let mut instances = state.instances.write().await;
+            if let Some(row) = instances.iter_mut().find(|i| i.id == id) {
+                row.status = Status::Starting;
+                row.last_error = None;
+            }
+        }
+        run_detached_restart(state.clone(), id.clone()).await;
+        tracing::info!(target: "power.cascade", session = %id, "on: restore cascade ran");
+    }
+    tracing::info!(target: "power.cascade", "on: restore cascade complete");
+}
+
 pub async fn update_session_snooze(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
