@@ -497,6 +497,12 @@ async fn run(
         Some(Commands::Send(args)) => cli::send::run(&profile, args).await,
         Some(Commands::Status(args)) => cli::status::run(&profile, args).await,
         Some(Commands::Killall(args)) => cli::killall::run(args).await,
+        #[cfg(feature = "serve")]
+        Some(Commands::On) => cli::power::set(true).await,
+        #[cfg(feature = "serve")]
+        Some(Commands::Off) => cli::power::set(false).await,
+        #[cfg(feature = "serve")]
+        Some(Commands::Power) => cli::power::status().await,
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
         Some(Commands::Plugin { command }) => cli::plugin::run(command).await,

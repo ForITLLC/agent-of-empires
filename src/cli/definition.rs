@@ -117,6 +117,21 @@ pub enum Commands {
     /// workers, and all aoe tmux sessions. Destructive and unprompted.
     Killall(KillallArgs),
 
+    /// Master kill switch: allow aoe activity again (wakes, sends, session
+    /// creates, restarts) after `aoe off`
+    #[cfg(feature = "serve")]
+    On,
+
+    /// Master kill switch: stop ALL aoe activity. Flips the daemon's
+    /// authoritative power state to OFF and cancels every registered wakeup,
+    /// including ones armed before the flip
+    #[cfg(feature = "serve")]
+    Off,
+
+    /// Show the master power state (see `aoe on` / `aoe off`)
+    #[cfg(feature = "serve")]
+    Power,
+
     /// Internal: trap for `aoe stop`, which is not a command in aoe (stopping
     /// is always scoped to a noun). Redirects users to `session stop`,
     /// `acp stop`, `serve --stop`, or `killall`. Hidden from help.
@@ -323,6 +338,12 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Send(_) => "send",
         Commands::Status(_) => "status",
         Commands::Killall(_) => "killall",
+        #[cfg(feature = "serve")]
+        Commands::On => "on",
+        #[cfg(feature = "serve")]
+        Commands::Off => "off",
+        #[cfg(feature = "serve")]
+        Commands::Power => "power",
         // Hidden trap; never a user action, never counted.
         Commands::Stop { .. } => return None,
         Commands::Session { .. } => "session",

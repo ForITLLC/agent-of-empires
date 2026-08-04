@@ -19,6 +19,7 @@ pub mod login;
 mod charter_drift;
 mod pane;
 pub(crate) mod pane_watchdog;
+pub mod power;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
@@ -424,6 +425,11 @@ pub struct AppState {
     /// racing a second kill+start against the first. Synchronous mutex:
     /// critical sections are tiny and never span an `await`.
     pub restart_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Master power switch + wake registry (`GET/POST /api/power`,
+    /// `/api/wakes`). One authoritative ON/OFF for the whole install,
+    /// persisted in the app dir; OFF refuses session create, send, ensure,
+    /// restart and wake arming, and cancels already-registered wakes.
+    pub power: Arc<power::PowerRegistry>,
     /// Cached per-profile cleanup defaults for the delete dialog, with a
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).
@@ -1243,6 +1249,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         delete_epoch: std::sync::atomic::AtomicU64::new(0),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        power: Arc::new(power::PowerRegistry::load_from_app_dir()),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
             // forces a fresh resolve instead of handing out an empty map.
@@ -1784,6 +1791,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/ensure", post(api::ensure_session))
         .route("/api/sessions/{id}/send", post(api::send_message))
+        .route("/api/power", get(power::get_power).post(power::set_power))
+        .route("/api/wakes", get(power::list_wakes).post(power::arm_wake))
+        .route(
+            "/api/wakes/{id}",
+            get(power::get_wake).delete(power::cancel_wake),
+        )
         .route(
             "/api/sessions/{id}/paste-image",
             // A base64 screenshot blows past the global 1 MiB cap. 8 MiB
@@ -6449,6 +6462,7 @@ pub mod test_support {
             delete_epoch: std::sync::atomic::AtomicU64::new(0),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            power: Arc::new(power::PowerRegistry::ephemeral()),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
                 refreshed_at: std::time::Instant::now(),
                 entries: HashMap::new(),

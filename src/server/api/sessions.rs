@@ -4554,6 +4554,9 @@ pub async fn restart_session(
     if state.read_only {
         return super::read_only_response();
     }
+    if !state.power.is_on() {
+        return crate::server::power::power_off_response();
+    }
 
     {
         let instances = state.instances.read().await;
@@ -6386,6 +6389,9 @@ pub async fn create_session(
     if state.read_only {
         return super::read_only_response();
     }
+    if !state.power.is_on() {
+        return crate::server::power::power_off_response();
+    }
     let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
@@ -7087,6 +7093,9 @@ pub async fn ensure_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if !state.power.is_on() {
+        return crate::server::power::power_off_response();
+    }
     // CityHall: only act on structured sessions this mode created; refuse a
     // non-structured (or unknown) target so a locked-down client cannot
     // respawn/destroy/edit an enumerated plain session. See #7.
@@ -12205,6 +12214,9 @@ pub async fn send_message(
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
+    }
+    if !state.power.is_on() {
+        return crate::server::power::power_off_response();
     }
     // Terminal keystroke injection: CityHall sessions are structured-view only
     // (the composer drives the agent via the ACP prompt route), so close this

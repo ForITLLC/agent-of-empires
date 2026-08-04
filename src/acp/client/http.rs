@@ -483,6 +483,28 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `GET /api/power`: the daemon's authoritative master power state.
+    pub async fn get_power(&self) -> Result<serde_json::Value, HttpError> {
+        let url = format!("{}/api/power", self.endpoint.base_url);
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, "power").await?;
+        Ok(res.json().await?)
+    }
+
+    /// `POST /api/power`: flip the master switch. Flipping OFF also cancels
+    /// every wake registered with the daemon; the response enumerates the
+    /// cancelled ids so OFF is verifiable, not just claimed.
+    pub async fn set_power(&self, on: bool) -> Result<serde_json::Value, HttpError> {
+        let url = format!("{}/api/power", self.endpoint.base_url);
+        let body = serde_json::json!({
+            "state": if on { "on" } else { "off" },
+            "changed_by": "cli",
+        });
+        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        let res = check_status(res, "power").await?;
+        Ok(res.json().await?)
+    }
+
     /// `POST /api/sessions/{id}/acp/mode`: set the active session
     /// permission mode (an ACP `session/set_mode` round-trip). The new
     /// mode echoes back over the WebSocket as `CurrentModeChanged`;
