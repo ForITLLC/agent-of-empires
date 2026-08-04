@@ -4527,6 +4527,226 @@ pub async fn start_session(
     }
 }
 
+/// Restart a session with the full kill+start cascade running in a DETACHED
+/// daemon task, so the caller does not need to survive the sequence. This is
+/// the self-restart hatch: a session whose own tooling is wedged (e.g. a dead
+/// MCP gateway) can `curl -X POST` its own id and be torn down mid-request
+/// without stranding itself stopped-but-not-started — the daemon owns the
+/// cascade from the moment this handler returns.
+///
+/// Contract:
+/// - Responds `202 { "status": "restarting" }` immediately; the response is
+///   emitted BEFORE the cascade completes (kill, start, resume, wake all
+///   happen after). Poll `GET /api/sessions` for the status to settle.
+/// - Safe to call twice: a repeat POST while the cascade is in flight gets
+///   `202 { "status": "already_restarting" }` instead of racing a second
+///   kill+start against the first. After the cascade settles the route is
+///   status-agnostic (Running/Stopped/Error all restart), so a repeat POST
+///   also RECOVERS any strand rather than creating one. The only residual
+///   strand window is the daemon itself dying mid-cascade, which the startup
+///   recovery cascade already covers.
+/// - Structured (ACP) sessions are rejected 409, mirroring the CLI's
+///   `bail_if_acp`: their lifecycle belongs to the acp reconciler.
+pub async fn restart_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+
+    {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return super::session_not_found();
+        };
+        if inst.is_structured() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "structured_session",
+                    "message": "Structured-view (ACP) sessions are managed by the acp reconciler; use stop/start instead",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // In-flight guard: only one daemon-owned cascade per session. `insert`
+    // returning false means a prior POST's cascade is still running.
+    {
+        let mut inflight = state
+            .restart_inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !inflight.insert(id.clone()) {
+            return (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "already_restarting",
+                    "session_id": id,
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Suppress the status poller / recovery cascade for this id while the
+    // detached task owns the restart, exactly like the startup-recovery
+    // workers, so the mid-cascade dead pane never trips a phantom Error.
+    crate::session::recovery::mark_recently_restarted(&state.recently_restarted, &id);
+
+    // Show Starting immediately so a poll between the 202 and the cascade's
+    // first side effect reads as a restart, not a crash.
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            inst.status = Status::Starting;
+            inst.last_error = None;
+        }
+    }
+
+    let task_state = state.clone();
+    let task_id = id.clone();
+    tokio::spawn(async move {
+        run_detached_restart(task_state, task_id).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "restarting",
+            "session_id": id,
+            "note": "restart runs server-side; this response returns before the sequence completes",
+        })),
+    )
+        .into_response()
+}
+
+/// The detached half of [`restart_session`]: runs the kill+start cascade off
+/// the request, then persists the merged result. MUST clear the in-flight
+/// mark and the recovery suppression on every exit path — a leaked in-flight
+/// entry would wedge the endpoint into `already_restarting` forever.
+async fn run_detached_restart(state: Arc<AppState>, id: String) {
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    // Fresh snapshot under the lock; the pre-restart clone is the
+    // compare-and-swap baseline for apply_post_restart_sync.
+    let snapshot = {
+        let instances = state.instances.read().await;
+        instances.iter().find(|i| i.id == id).cloned()
+    };
+    let Some(instance) = snapshot else {
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "detached restart: instance vanished before cascade"
+        );
+        finish_detached_restart(&state, &id).await;
+        return;
+    };
+    let profile = instance.source_profile.clone();
+    let sync_base = instance.clone();
+
+    let wake_message = crate::session::profile_config::resolve_config_or_warn(&profile)
+        .session
+        .restart_wake_message
+        .clone();
+
+    let request_id = id.clone();
+    let restart_result = tokio::task::spawn_blocking(move || {
+        crate::session::restart::perform_restart(crate::session::restart::RestartRequest {
+            session_id: request_id,
+            instance,
+            size: None,
+            wake_message,
+        })
+    })
+    .await;
+
+    match restart_result {
+        Ok(result) => {
+            let (status, last_error) = match &result.outcome {
+                Ok(_) => (None, None),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "http.api.sessions",
+                        session = %id,
+                        "detached restart cascade failed: {e}"
+                    );
+                    (Some(Status::Error), Some(e.clone()))
+                }
+            };
+            let working = (*result.instance).clone();
+            {
+                let mut instances = state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    apply_post_restart_sync(inst, &sync_base, &working);
+                    if let Some(s) = status {
+                        inst.status = s;
+                        inst.last_error = last_error.clone();
+                    }
+                }
+            }
+            let persist_id = id.clone();
+            if persist_session_update(
+                profile,
+                "detached restart",
+                state.file_watch.clone(),
+                move |instances| {
+                    if let Some(stored) = instances.iter_mut().find(|i| i.id == persist_id) {
+                        stored.merge_post_restart(&working);
+                        if let Some(s) = status {
+                            stored.status = s;
+                            stored.last_error = last_error.clone();
+                        }
+                    }
+                },
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    "detached restart: persist failed; memory is authoritative until next save"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "http.api.sessions",
+                session = %id,
+                "detached restart cascade panicked: {e}"
+            );
+            let mut instances = state.instances.write().await;
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                inst.status = Status::Error;
+                inst.last_error = Some(format!("restart cascade panicked: {e}"));
+            }
+        }
+    }
+
+    finish_detached_restart(&state, &id).await;
+}
+
+/// Clear the restart bookkeeping: recovery suppression drains on the same
+/// path the startup-recovery workers use, then the in-flight mark drops so a
+/// later POST can run a fresh cascade.
+async fn finish_detached_restart(state: &Arc<AppState>, id: &str) {
+    crate::session::recovery::drain_recovery_pending(
+        &state.recovery_pending,
+        &state.recently_restarted,
+        id,
+    );
+    state
+        .restart_inflight
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(id);
+}
+
 pub async fn update_session_snooze(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

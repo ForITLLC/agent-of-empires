@@ -418,6 +418,12 @@ pub struct AppState {
     /// race where a candidate waiting on a `STARTUP_RECOVERY_CONCURRENCY`
     /// permit ages out of suppression and trips a phantom `Status::Error`.
     pub recovery_pending: crate::session::recovery::RecoveryPending,
+    /// Session ids with an in-flight daemon-owned restart cascade
+    /// (`POST /api/sessions/{id}/restart`). A repeat POST while the detached
+    /// cascade is still running returns 202 `already_restarting` instead of
+    /// racing a second kill+start against the first. Synchronous mutex:
+    /// critical sections are tiny and never span an `await`.
+    pub restart_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Cached per-profile cleanup defaults for the delete dialog, with a
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).
@@ -1236,6 +1242,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         delete_epoch: std::sync::atomic::AtomicU64::new(0),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
+        restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
             // forces a fresh resolve instead of handing out an empty map.
@@ -1828,6 +1835,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/summarize", post(api::summarize_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
+        .route("/api/sessions/{id}/restart", post(api::restart_session))
         .route(
             "/api/sessions/{id}/terminal",
             post(api::ensure_terminal).delete(api::kill_terminal),
@@ -6440,6 +6448,7 @@ pub mod test_support {
             recently_restarted: crate::session::recovery::new_recently_restarted(),
             delete_epoch: std::sync::atomic::AtomicU64::new(0),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
+            restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
                 refreshed_at: std::time::Instant::now(),
                 entries: HashMap::new(),

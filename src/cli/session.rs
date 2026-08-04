@@ -1881,6 +1881,19 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "restart")?;
+
+    // Daemon-first: when a serve daemon is up, hand it the cascade via
+    // `POST /api/sessions/{id}/restart` so the kill+start sequence survives
+    // the caller (a session can restart ITSELF this way). Fall back to the
+    // legacy in-process path ONLY when no daemon is reachable or the POST
+    // itself is rejected; once the daemon accepts (202) there is no
+    // fallback, because a second local cascade would race the server-side
+    // one.
+    #[cfg(feature = "serve")]
+    if try_daemon_restart(&inst.id, &inst.title).await? {
+        return Ok(());
+    }
+
     let mut working = inst.clone();
     working.source_profile = owning_profile.clone();
 
@@ -1996,6 +2009,94 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Attempt the restart through the serve daemon's server-side endpoint.
+/// Returns `Ok(true)` when the daemon owned the restart to a terminal
+/// outcome, `Ok(false)` when the caller should run the legacy local path
+/// (no daemon, or the POST was rejected before acceptance), and `Err` when
+/// the daemon accepted the cascade but it ended in failure; after
+/// acceptance the local path must never run, so failure is reported rather
+/// than retried locally.
+#[cfg(feature = "serve")]
+async fn try_daemon_restart(session_id: &str, title: &str) -> Result<bool> {
+    use crate::acp::client::{discovery, HttpClient};
+
+    let Ok(endpoint) = discovery::discover_local() else {
+        return Ok(false);
+    };
+    let Ok(client) = HttpClient::new(endpoint) else {
+        return Ok(false);
+    };
+    if client.restart_session(session_id).await.is_err() {
+        return Ok(false);
+    }
+
+    // Accepted: the cascade now runs daemon-side regardless of what this
+    // process does. Poll the session list until the status leaves
+    // `Starting`; on timeout report success-in-progress instead of failing,
+    // since the restart itself is no longer this process's to abort.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let Ok(sessions) = client.list_sessions::<serde_json::Value>().await else {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            continue;
+        };
+        let status = sessions
+            .iter()
+            .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(session_id))
+            .and_then(|s| s.get("status").and_then(|v| v.as_str()).map(str::to_string));
+        match status.as_deref() {
+            Some("Starting") => {}
+            Some("Error") => {
+                bail!("Daemon-side restart failed for {title}; see `aoe list` for the error");
+            }
+            Some(_) => {
+                println!("✓ Restarted session: {} (daemon-side)", title);
+                return Ok(true);
+            }
+            None => {
+                bail!("Session {title} disappeared while the daemon-side restart was running");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    println!(
+        "✓ Restart accepted for {}; still settling daemon-side (watch `aoe list`)",
+        title
+    );
+    Ok(true)
+}
+
+/// Poll the tmux pane until capture-pane content stops changing for two
+/// consecutive samples (the agent has finished printing its startup banner
+/// and is sitting at a prompt) or `max_wait` elapses. Failsafe: always
+/// returns by `max_wait` so the caller's send-keys still runs even if the
+/// pane never settles.
+async fn wait_for_pane_ready(session_id: &str, title: &str, max_wait: std::time::Duration) {
+    let Ok(tmux) = crate::tmux::Session::new(session_id, title) else {
+        return;
+    };
+    let poll_interval = std::time::Duration::from_millis(200);
+    let start = std::time::Instant::now();
+    let mut last: Option<String> = None;
+    while start.elapsed() < max_wait {
+        tokio::time::sleep(poll_interval).await;
+        let Ok(now) = tmux.capture_pane(5) else {
+            continue;
+        };
+        if now.trim().len() > 20 {
+            if last.as_deref() == Some(&now) {
+                return;
+            }
+            last = Some(now);
+        }
+    }
 }
 
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {

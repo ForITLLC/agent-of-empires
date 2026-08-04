@@ -466,6 +466,23 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `POST /api/sessions/{id}/restart`: daemon-owned kill+start cascade.
+    /// A 202 means "accepted and running server-side", not "restarted": the
+    /// daemon finishes the sequence even if the caller dies mid-call, which
+    /// is what makes self-restart safe. A repeat POST while the cascade is
+    /// in flight also gets 202 (`already_restarting`) instead of racing a
+    /// second cascade. Poll `list_sessions` for the status to leave
+    /// `Starting`.
+    pub async fn restart_session(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/restart",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
     /// `POST /api/sessions/{id}/acp/mode`: set the active session
     /// permission mode (an ACP `session/set_mode` round-trip). The new
     /// mode echoes back over the WebSocket as `CurrentModeChanged`;
