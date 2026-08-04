@@ -1321,8 +1321,64 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         );
     }
 
+    confirm_pane_started(&working)?;
     println!("✓ Started session: {}", title);
     Ok(())
+}
+
+/// How long to watch a freshly started pane before believing it.
+///
+/// A launch that dies on a shell error dies immediately — the zsh glob failure
+/// that killed every unpinned session took milliseconds. A healthy agent is
+/// still drawing at this point, so watching briefly costs a little startup
+/// latency and buys the difference between a claim and a fact.
+const START_CONFIRM_WINDOW_MS: u64 = 1_200;
+const START_CONFIRM_INTERVAL_MS: u64 = 100;
+
+/// Turn an observed pane state into a start verdict.
+///
+/// Split out from the polling so the decision is testable without tmux: the
+/// property that matters is that a DEAD pane can never produce `Ok`, whatever
+/// its exit status, and that the message carries enough to diagnose it.
+fn pane_start_verdict(dead: bool, status: Option<i32>, tail: &str) -> Result<()> {
+    if !dead {
+        return Ok(());
+    }
+    let code = status
+        .map(|c| format!("status {c}"))
+        .unwrap_or_else(|| "no exit status reported".to_string());
+    let last = tail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("(no output captured)");
+    bail!("pane died at launch ({code}): {last}")
+}
+
+/// Confirm a freshly started pane is actually ALIVE before reporting success.
+///
+/// `start_with_size` returns Ok once tmux has CREATED the pane. The agent
+/// inside can die microseconds later and, because aoe sets `remain-on-exit`,
+/// the corpse stays put looking like a session. `✓ Started` was printed with
+/// exit 0 over a seven-hour-old corpse — a success code on a dead pane, which
+/// is how a launch-killing bug stayed invisible and what makes any restart
+/// claim unfalsifiable. See per-dev WO#1174 D2.
+fn confirm_pane_started(inst: &crate::session::Instance) -> Result<()> {
+    let Ok(sess) = inst.tmux_session() else {
+        // Not tmux-backed (sandboxed/ACP): nothing to confirm here, and
+        // inventing a verdict would be its own false claim.
+        return Ok(());
+    };
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(START_CONFIRM_WINDOW_MS) {
+        if sess.is_pane_dead() {
+            let tail = sess.capture_pane(40).unwrap_or_default();
+            return pane_start_verdict(true, None, &tail);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(START_CONFIRM_INTERVAL_MS));
+    }
+    pane_start_verdict(sess.is_pane_dead(), None, "")
 }
 
 /// Acp-mode sessions are not backed by tmux; their ACP worker is owned
@@ -1601,6 +1657,10 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
             }
             Ok(())
         })?;
+        if let Err(e) = confirm_pane_started(&working) {
+            eprintln!("Warning: {} started but {e}", working.title);
+            continue;
+        }
         println!("✓ Started {}", working.title);
     }
     Ok(())
@@ -4045,6 +4105,57 @@ mod acp_reject_tests {
             inst_disk.agent_session_id, None,
             "rejected call must not mutate sid",
         );
+    }
+}
+
+/// `✓ Started` must never be printable over a corpse.
+///
+/// It was: `aoe session start` reported success with exit 0 against a pane that
+/// had been dead for seven hours. tmux creating the pane is not the agent
+/// surviving in it, and treating the first as the second is what let a
+/// launch-killing shell-quoting bug run unnoticed — a restart claim nobody
+/// could falsify. See per-dev WO#1174 D2.
+#[cfg(test)]
+mod start_confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn a_live_pane_is_a_successful_start() {
+        assert!(pane_start_verdict(false, None, "").is_ok());
+        assert!(pane_start_verdict(false, Some(0), "anything").is_ok());
+    }
+
+    #[test]
+    fn a_dead_pane_is_never_a_successful_start() {
+        // Whatever it exited with. A zero exit from a pane that is GONE still
+        // means the session the caller asked for is not running.
+        for status in [None, Some(0), Some(1), Some(137)] {
+            assert!(
+                pane_start_verdict(true, status, "boom").is_err(),
+                "a dead pane reported success for status {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_failure_carries_the_line_that_explains_it() {
+        // The whole point is diagnosability: the operator should see the shell
+        // error, not just "it failed".
+        let tail = "some earlier output\nzsh:1: no matches found: claude-fable-5[1m]\n\n";
+        let err = pane_start_verdict(true, Some(1), tail)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no matches found"), "{err}");
+        assert!(err.contains("status 1"), "{err}");
+    }
+
+    #[test]
+    fn a_dead_pane_with_no_output_still_fails_legibly() {
+        let err = pane_start_verdict(true, None, "   \n\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pane died at launch"), "{err}");
+        assert!(err.contains("no output captured"), "{err}");
     }
 }
 

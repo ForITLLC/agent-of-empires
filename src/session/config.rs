@@ -1582,7 +1582,47 @@ pub fn launch_model_flag_injection(extra_args: &str, profile_pin: Option<&str>) 
     if has_model_flag(extra_args) {
         return None;
     }
-    extract_model_flag(profile_pin?)
+    let (flag, value) = scan_model_flag(profile_pin?)?;
+    let quoted = shell_quote_value(&value);
+    if quoted == value {
+        return Some(flag);
+    }
+    // Re-assemble around the quoted value, keeping the flag EXACTLY as the
+    // profile wrote it: claude pins `--model`, codex pins `-m`, and rewriting
+    // one into the other launches the wrong agent's CLI.
+    Some(match flag.split_once('=') {
+        Some((lhs, _)) => format!("{lhs}={quoted}"),
+        None => {
+            let name = flag.split_whitespace().next().unwrap_or("--model");
+            format!("{name} {quoted}")
+        }
+    })
+}
+
+/// Wrap a value so the shell passes it through literally.
+///
+/// This flag is spliced into a `zsh -lc '…'` launch line, so anything the shell
+/// reads as syntax has to be neutralized. `[1m]` is the live case: every claude
+/// profile pins `claude-fable-5[1m]`, zsh reads the brackets as a glob, matches
+/// no file, and aborts the ENTIRE line — `zsh:1: no matches found:
+/// claude-fable-5[1m]`, status 1, pane dead at launch, so an unpinned session
+/// could not start at all.
+///
+/// Quoting rather than stripping is deliberate: the value is legitimate
+/// 1M-context configuration, and removing the suffix would silently run the
+/// session on a different model than its profile asked for.
+fn shell_quote_value(value: &str) -> String {
+    const SAFE: &str = "-_./:=@,+";
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || SAFE.contains(c));
+    if plain {
+        return value.to_string();
+    }
+    // Single quotes protect everything except a single quote, which has to be
+    // closed, escaped, and reopened.
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 /// What a single mouse click on a session row does in the Agent view.

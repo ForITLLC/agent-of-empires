@@ -12885,6 +12885,81 @@ mod tests {
         assert!(cmd_str.contains("--session-id") || cmd_str.contains("--resume"));
     }
 
+    /// The injected pin lands in a SHELL command line, so its value must
+    /// survive the shell.
+    ///
+    /// Every claude profile on this machine pins `--model claude-fable-5[1m]`.
+    /// Appended unquoted, zsh reads `[1m]` as a character-class glob, finds no
+    /// file matching it, and aborts the whole line: `zsh:1: no matches found:
+    /// claude-fable-5[1m]`, status 1, pane dead at launch. An unpinned session
+    /// could not start at all.
+    ///
+    /// The value is legitimate 1M-context configuration — hex ends `5b316d5d`,
+    /// there is no ESC byte and nothing to sanitize. Quoting is the fix;
+    /// stripping would silently change which model a session runs.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_host_command_quotes_a_glob_active_model_pin() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let profile_dir = crate::session::get_app_dir()
+            .unwrap()
+            .join("profiles")
+            .join("globprof");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "[session.agent_extra_args]\nclaude = \"--model claude-fable-5[1m]\"\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "claude".to_string();
+        inst.source_profile = "globprof".to_string();
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("claude"), &None)
+            .unwrap();
+        let cmd_str = cmd.unwrap();
+
+        assert!(
+            cmd_str.contains("claude-fable-5[1m]"),
+            "the pinned value must reach the command intact, not be stripped: {cmd_str}"
+        );
+        assert!(
+            cmd_str.contains("'claude-fable-5[1m]'") || cmd_str.contains("\\[1m\\]"),
+            "the value is glob-active and must be protected from the shell: {cmd_str}"
+        );
+        assert!(
+            !cmd_str.contains("--model claude-fable-5[1m]"),
+            "a bare glob-active word aborts the launch line under zsh: {cmd_str}"
+        );
+    }
+
+    /// Quoting must not fire on values that do not need it, or every existing
+    /// command string changes shape for no reason.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_host_command_leaves_an_ordinary_model_unquoted() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let profile_dir = crate::session::get_app_dir()
+            .unwrap()
+            .join("profiles")
+            .join("plainprof");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "[session.agent_extra_args]\nclaude = \"--model claude-opus-4-8\"\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "claude".to_string();
+        inst.source_profile = "plainprof".to_string();
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("claude"), &None)
+            .unwrap();
+        assert!(cmd.unwrap().contains("--model claude-opus-4-8"));
+    }
+
     /// The live restart-dialog bug: a terminal-launched session whose
     /// `extra_args` carry no `--model` must inherit the profile's pinned model
     /// at spawn, so cycling the restart dialog can never drop a session onto the
