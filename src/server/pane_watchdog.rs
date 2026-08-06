@@ -19,7 +19,7 @@
 //! unwritable state file logs and skips; the daemon never crashes or stalls
 //! on watchdog work.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,6 +43,11 @@ pub(crate) enum PaneSignal {
     Overloaded,
     /// A worker's `ACTION REQUIRED` gate line.
     ActionRequired,
+    /// The session's own account is logged out or its credential is rejected.
+    /// Distinct from [`PaneSignal::DeviceCode`], which is a sign-in prompt the
+    /// session is deliberately driving; this is a credential that stopped
+    /// working underneath it.
+    AuthLoss,
 }
 
 /// Map a rule's `kind` string (config-facing) to the watchdog's action
@@ -53,6 +58,7 @@ fn kind_to_signal(kind: &str) -> Option<PaneSignal> {
         "auth" => Some(PaneSignal::DeviceCode),
         "overload" => Some(PaneSignal::Overloaded),
         "action" => Some(PaneSignal::ActionRequired),
+        "authloss" => Some(PaneSignal::AuthLoss),
         _ => None,
     }
 }
@@ -446,6 +452,10 @@ pub(crate) enum Disposition {
     DeviceCode { paged: bool },
     /// A transient 529 overload banner: red row only, self-clearing.
     Overloaded,
+    /// The account behind this session is logged out or rejecting its
+    /// credential. Worse than a cap: no reset time, no countdown, and a pane
+    /// that reads as merely idle while producing nothing.
+    AuthLoss { paged: bool },
 }
 
 impl Disposition {
@@ -464,6 +474,7 @@ impl Disposition {
             },
             Disposition::DeviceCode { .. } => "DEVICE-CODE".into(),
             Disposition::Overloaded => "OVERLOADED".into(),
+            Disposition::AuthLoss { .. } => "AUTH-LOSS".into(),
         }
     }
 
@@ -489,6 +500,7 @@ impl Disposition {
                 paged,
                 suppressed: None,
             }
+            | Disposition::AuthLoss { paged }
             | Disposition::DeviceCode { paged } => {
                 if *paged {
                     "page-commander"
@@ -556,6 +568,15 @@ impl Disposition {
                     }
                 }
             },
+            Disposition::AuthLoss { paged } => {
+                if *paged {
+                    "account logged out or credential rejected, no reset time, Commander paged"
+                        .into()
+                } else {
+                    "account logged out or credential rejected, no reset time, page held down"
+                        .into()
+                }
+            }
             Disposition::DeviceCode { paged } => {
                 if *paged {
                     "waiting on device-code sign-in, Commander paged".into()
@@ -571,6 +592,34 @@ impl Disposition {
 /// One tailable classification line: `ts title · id · profile · model ·
 /// STATE · DECISION · reason`. Pure so tests assert the emitted line, not
 /// just the decision (WO#450 acceptance).
+/// The DECISION column, corrected for whether paging is actually permitted.
+///
+/// A `Disposition` describes what the rule would do; it has no idea whether the
+/// activity class lets it happen. Left uncorrected, a row reads "page-commander"
+/// while `wake` silently declines, and "page-commander" is precisely the
+/// sentence an operator reads to conclude someone already knows.
+fn effective_decision(disp: &Disposition, paging_on: bool) -> &'static str {
+    match disp.decision() {
+        "page-commander" if !paging_on => "page-withheld-class-off",
+        other => other,
+    }
+}
+
+/// The REASON column, with the same correction, stating what DID still happen.
+/// A bare "withheld" reads as silence and sends the reader hunting for the
+/// poller that no longer exists.
+fn effective_reason(disp: &Disposition, paging_on: bool) -> String {
+    let reason = disp.reason();
+    if disp.decision() == "page-commander" && !paging_on {
+        format!(
+            "{reason} [page WITHHELD: pane_watchdog_page is off; \
+             detection and the /api/events push still ran]"
+        )
+    } else {
+        reason
+    }
+}
+
 pub(crate) fn class_line(
     ts: u64,
     title: &str,
@@ -578,12 +627,13 @@ pub(crate) fn class_line(
     profile: &str,
     model: &str,
     disp: &Disposition,
+    paging_on: bool,
 ) -> String {
     format!(
         "{ts} {title} · {id} · {profile} · {model} · {} · {} · {}",
         disp.state(),
-        disp.decision(),
-        disp.reason()
+        effective_decision(disp, paging_on),
+        effective_reason(disp, paging_on)
     )
 }
 
@@ -596,6 +646,7 @@ pub(crate) fn classification_json(
     profile: &str,
     model: &str,
     disp: &Disposition,
+    paging_on: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "ts": ts,
@@ -604,8 +655,11 @@ pub(crate) fn classification_json(
         "profile": profile,
         "model": model,
         "state": disp.state(),
-        "decision": disp.decision(),
-        "reason": disp.reason(),
+        "decision": effective_decision(disp, paging_on),
+        "reason": effective_reason(disp, paging_on),
+        // Stated per row rather than inferred from the decision text, so a
+        // consumer can tell "nothing needed paging" from "paging is off".
+        "paging_enabled": paging_on,
     })
 }
 
@@ -797,6 +851,10 @@ struct PaneScan {
     /// WO#450 ADDENDUM scrollback discriminators (`action_page_suppressed`,
     /// `fable_page_suppressed`).
     working: bool,
+    /// The account's utilization as this pane's footer last rendered it, or
+    /// `None` when the footer has scrolled out of the captured tail. Belongs
+    /// to the ACCOUNT; the pane is only where it happened to be visible.
+    usage: Option<crate::pane_rules::UsageMeter>,
 }
 
 /// Capture and classify every registered non-structured session's pane tail.
@@ -859,6 +917,9 @@ fn scan_panes(
                     Some(g) => format!("gate:{g}"),
                     None => format!("sess:{}|fp:{}", inst.id, fp),
                 });
+            // The leading indicator, read from the same capture as the rules.
+            // Present on every healthy pane, long before any banner exists.
+            let usage = pane_rules::parse_usage_meter(&content);
             let drift = charter_drift::detect(&inst.title, &inst.project_path, &content);
             // Fable model-drift is gated on the session's own model pin, so a
             // non-Fable session's Sonnet/Opus subagent never fires here.
@@ -879,6 +940,7 @@ fn scan_panes(
                 fable_hit,
                 model: pane_rules::model_pin(&inst.extra_args).unwrap_or_else(|| "-".into()),
                 working,
+                usage,
             })
         })
         .collect();
@@ -920,6 +982,19 @@ struct Watchdog {
     /// once per [`NON_POOL_PAGE_COOLDOWN`], so a daemon bounce does not re-flood
     /// every parked non-pool cap.
     last_non_pool_page: HashMap<String, NonPoolPage>,
+    /// Last classification state pushed to the event bus per session, so a
+    /// standing condition is announced on entry and not on every tick.
+    ///
+    /// Deliberately NOT persisted, unlike the page dampeners above. A daemon
+    /// bounce SHOULD re-announce every standing cap: a subscriber that comes
+    /// up alongside the daemon has no other way to learn the fleet's current
+    /// state, and re-stating a condition costs a subscriber one deduplication
+    /// while missing one costs a human their afternoon.
+    last_event_state: HashMap<String, String>,
+    /// Whether each (account, window) was last seen above the usage threshold.
+    /// Keyed by ACCOUNT, never by session: one account has one meter however
+    /// many panes render it.
+    last_usage_above: HashMap<(String, &'static str), bool>,
 }
 
 impl Watchdog {
@@ -934,6 +1009,8 @@ impl Watchdog {
             last_fable_fp: load_fable_fp(),
             last_cap_fp: load_cap_fp(),
             last_non_pool_page: load_non_pool_page(),
+            last_event_state: HashMap::new(),
+            last_usage_above: HashMap::new(),
         }
     }
 
@@ -1059,6 +1136,40 @@ impl Watchdog {
         // tick — state, decision, reason — appended to the tailable log and
         // snapshotted for GET /api/watchdog/classifications.
         let ts = unix_secs();
+        // Resolved once per tick, not per row, so every row in a snapshot
+        // reports the same answer to "was anyone actually woken".
+        let cfg = crate::session::config::Config::load_or_warn();
+        let paging_on = paging_allowed(&cfg.activity);
+
+        // The LEADING indicator, resolved before any per-session
+        // classification. It is an account-level fact, so it is computed from
+        // every pane at once and announced once per account, not once per pane
+        // and not once per tick. A cap banner is this same fact arriving too
+        // late to act on.
+        let threshold = cfg.watchdog.usage_threshold();
+        let meters = account_meters(scans.iter().map(|s| (s.profile.as_str(), s.usage)));
+        for (profile, window, pct) in usage_alerts(&meters, threshold, &mut self.last_usage_above) {
+            let (kind, label) = if window == "5h" {
+                ("usage_5h", "5-hour")
+            } else {
+                ("usage_weekly", "weekly")
+            };
+            super::event_bus::emit_and_fan_out(
+                state,
+                kind,
+                // The subject is the ACCOUNT. Naming it in the id slot keeps a
+                // subscriber's dedup keyed on the thing that runs out, rather
+                // than on whichever session happened to render the number.
+                &format!("account:{profile}"),
+                &profile,
+                &profile,
+                &format!(
+                    "{profile} is at {pct}% of its {label} allowance (threshold \
+                     {threshold}%), read from the account's own meter rather than \
+                     from a cap banner"
+                ),
+            );
+        }
         let mut class_lines = String::new();
         let mut class_rows: Vec<serde_json::Value> = Vec::new();
         for scan in scans {
@@ -1090,6 +1201,21 @@ impl Watchdog {
                 },
                 Some(signal) => self.handle_signal(&scan, signal, now).await,
             };
+            // Push, at the moment of detection. The classification row below
+            // is the record; this is the notification, and it goes out whether
+            // or not anyone happens to be reading the record.
+            if is_event_edge(&mut self.last_event_state, &scan.id, &disp.state()) {
+                if let Some(kind) = event_kind(&disp) {
+                    super::event_bus::emit_and_fan_out(
+                        state,
+                        kind,
+                        &scan.id,
+                        &scan.title,
+                        &scan.profile,
+                        &disp.reason(),
+                    );
+                }
+            }
             class_lines.push_str(&class_line(
                 ts,
                 &scan.title,
@@ -1097,6 +1223,7 @@ impl Watchdog {
                 &scan.profile,
                 &scan.model,
                 &disp,
+                paging_on,
             ));
             class_lines.push('\n');
             class_rows.push(classification_json(
@@ -1106,6 +1233,7 @@ impl Watchdog {
                 &scan.profile,
                 &scan.model,
                 &disp,
+                paging_on,
             ));
         }
         if let Some(path) = class_log_path() {
@@ -1230,6 +1358,26 @@ impl Watchdog {
             .get(&scan.id)
             .is_some_and(|last| now.duration_since(*last) < ACTION_COOLDOWN);
         match signal {
+            // A logged-out account cannot be relocated onto another account's
+            // headroom, so there is nothing to attempt: page if the class
+            // allows, and let the row and the push carry the fact.
+            PaneSignal::AuthLoss => {
+                if !cooling {
+                    wake(
+                        "auth-loss",
+                        &scan.id,
+                        format!(
+                            "session '{}' ({}) is logged out or its credential was \
+                             rejected on profile '{}'; there is no reset time and it \
+                             will produce nothing until someone signs it back in",
+                            scan.title, scan.id, scan.profile
+                        ),
+                    )
+                    .await;
+                    self.last_session_action.insert(scan.id.clone(), now);
+                }
+                Disposition::AuthLoss { paged: !cooling }
+            }
             PaneSignal::Capped if cooling => Disposition::LiveCap {
                 kind: scan.cap_kind.unwrap_or(capacity::CapKind::Unknown).as_str(),
                 action: CapAction::Cooldown,
@@ -1886,6 +2034,7 @@ fn mirror_urgent(scan: &PaneScan, signal: PaneSignal) {
         PaneSignal::Capped => ("cap", URGENT_TTL_BLOCKED, "usage/session cap banner"),
         PaneSignal::DeviceCode => ("auth", URGENT_TTL_BLOCKED, "device-code sign-in prompt"),
         PaneSignal::Overloaded => ("overload", URGENT_TTL_OVERLOAD, "529 server overload"),
+        PaneSignal::AuthLoss => ("auth", URGENT_TTL_BLOCKED, "account logged out"),
         // ACTION REQUIRED gates flow through the wake channel; the row-level
         // attention state for them stays owned by the worker's stop-hook.
         PaneSignal::ActionRequired => return,
@@ -1898,6 +2047,105 @@ fn mirror_urgent(scan: &PaneScan, signal: PaneSignal) {
             error = %e,
             "urgent mirror write failed"
         );
+    }
+}
+
+/// The highest meter reading per profile.
+///
+/// Every session on an account renders the SAME two numbers, so N panes are N
+/// views of one fact. Panes disagree only when one is mid-refresh, and the
+/// highest reading is the least stale of them; under-reporting here is the
+/// failure that matters, because it is the one that arrives too late.
+fn account_meters<'a>(
+    panes: impl Iterator<Item = (&'a str, Option<crate::pane_rules::UsageMeter>)>,
+) -> BTreeMap<String, crate::pane_rules::UsageMeter> {
+    let mut out: BTreeMap<String, crate::pane_rules::UsageMeter> = BTreeMap::new();
+    for (profile, meter) in panes {
+        // A pane whose footer has scrolled off contributes nothing. Reading it
+        // as zero would drag its account's number down.
+        let Some(m) = meter else { continue };
+        let slot = out.entry(profile.to_string()).or_insert(m);
+        slot.five_hour_pct = slot.five_hour_pct.max(m.five_hour_pct);
+        slot.weekly_pct = slot.weekly_pct.max(m.weekly_pct);
+    }
+    out
+}
+
+/// Accounts that crossed the threshold on THIS tick, as (profile, window, pct).
+///
+/// Edge-triggered per (account, window). A meter that is still high is not news
+/// and re-announcing it every tick is how an alert becomes a stream nobody
+/// reads. The latch clears when the reading falls back under, which is what a
+/// window reset looks like, so the alarm re-arms for the next window instead of
+/// warning once per daemon lifetime.
+fn usage_alerts(
+    meters: &BTreeMap<String, crate::pane_rules::UsageMeter>,
+    threshold: u8,
+    last: &mut HashMap<(String, &'static str), bool>,
+) -> Vec<(String, &'static str, u8)> {
+    let mut hits = Vec::new();
+    for (profile, m) in meters {
+        for (window, pct) in [("5h", m.five_hour_pct), ("wk", m.weekly_pct)] {
+            let above = pct >= threshold;
+            let key = (profile.clone(), window);
+            let was = last.insert(key, above).unwrap_or(false);
+            if above && !was {
+                hits.push((profile.clone(), window, pct));
+            }
+        }
+    }
+    hits
+}
+
+/// The push-event kind for a tick's disposition, or `None` when nothing
+/// happened that a subscriber needs to hear about.
+///
+/// The watchdog already knew about every one of these the instant it read the
+/// pane. What it did with that knowledge was write a file and wait to be
+/// asked, and when the asking stopped, the knowledge went nowhere. This
+/// function is the other half: what it noticed, it now says out loud.
+///
+/// A page that a cooldown suppressed is still an event. The cooldowns govern
+/// how often the COMMANDER is woken; they were never meant to decide whether
+/// the fleet is allowed to know a session is capped.
+fn event_kind(disp: &Disposition) -> Option<&'static str> {
+    match disp {
+        // Parked is the worse cap, not the quieter one: it means the daemon
+        // found nowhere to move the session to.
+        Disposition::LiveCap { .. } | Disposition::Parked { .. } => Some("cap"),
+        Disposition::DeviceCode { .. } => Some("auth"),
+        // Its own kind, never folded into `cap`: a subscriber that cannot tell
+        // them apart waits for a reset that is never coming.
+        Disposition::AuthLoss { .. } => Some("auth_loss"),
+        Disposition::Overloaded => Some("overload"),
+        Disposition::FableDrift { .. } => Some("model_drift"),
+        Disposition::ActionGate {
+            suppressed: None, ..
+        } => Some("action_required"),
+        // Nothing happened, or the watchdog already proved the matched text was
+        // scrollback. Emitting these would teach every subscriber to filter us
+        // out, which is how a notification rail dies without anyone noticing.
+        Disposition::Serving
+        | Disposition::ReplayedBanner { .. }
+        | Disposition::ActionGate {
+            suppressed: Some(_),
+            ..
+        } => None,
+    }
+}
+
+/// Whether this tick is the EDGE into `state` for `id`, recording it either way.
+///
+/// A cap that is still a cap is not news. Re-announcing one every tick would
+/// rebuild, on the push rail, the same unreadable flood that made the previous
+/// surface easy to switch off.
+fn is_event_edge(last: &mut HashMap<String, String>, id: &str, state: &str) -> bool {
+    match last.get(id) {
+        Some(prev) if prev == state => false,
+        _ => {
+            last.insert(id.to_string(), state.to_string());
+            true
+        }
     }
 }
 
@@ -1983,6 +2231,19 @@ async fn resolve_commander() -> Option<CommanderTarget> {
     }
 }
 
+/// The activity class governing whether the watchdog may wake a human.
+///
+/// It governs the PAGE and nothing else. Detection still runs, the
+/// classification row is still written, and the `/api/events` push still fires
+/// with this off. That separation is the entire lesson of the incident this
+/// gate comes from: a switch labelled as though it stops noticing, which
+/// actually stops noticing, is how a fleet ends up blind and confident.
+const PAGE_CLASS: &str = "pane_watchdog_page";
+
+fn paging_allowed(activity: &crate::session::config::ActivityConfig) -> bool {
+    activity.is_on(PAGE_CLASS)
+}
+
 /// Escalate through the operator's urgent-wake channel: the first
 /// non-comment line of `~/.claude-urgent-wake-command` (override via
 /// `URGENT_WAKE_COMMAND_FILE`) run through `bash -lc` with the context in
@@ -1990,6 +2251,17 @@ async fn resolve_commander() -> Option<CommanderTarget> {
 /// (resolved cross-profile, since it never runs under the daemon's default
 /// profile).
 async fn wake(kind: &str, session: &str, reason: String) {
+    let activity = crate::session::config::Config::load_or_warn().activity;
+    if !paging_allowed(&activity) {
+        tracing::info!(
+            target: "server.pane_watchdog",
+            kind, session, %reason, class = PAGE_CLASS,
+            "page withheld: activity class is off. Detection, the \
+             classification row and the /api/events push are unaffected; \
+             turn it on with `aoe activity pane_watchdog_page on`"
+        );
+        return;
+    }
     let message = format!("URGENT [pane-watchdog] {kind}: {reason}");
     tracing::warn!(target: "server.pane_watchdog", kind, session, %reason, "escalating");
 
@@ -3042,7 +3314,15 @@ and enter the code H7Q2K9F4P to authenticate.
     // ── WO#450: per-tick classification, every live session gets one line ──
 
     fn disp_line(disp: &Disposition) -> String {
-        class_line(TEST_NOW, "for-tasks", "381b98ed", "xce-main", "fable", disp)
+        class_line(
+            TEST_NOW,
+            "for-tasks",
+            "381b98ed",
+            "xce-main",
+            "fable",
+            disp,
+            true,
+        )
     }
 
     #[test]
@@ -3201,6 +3481,7 @@ and enter the code H7Q2K9F4P to authenticate.
             "xce-main",
             "fable",
             &disp,
+            true,
         );
         assert_eq!(row["ts"], TEST_NOW);
         assert_eq!(row["title"], "for-tasks");
@@ -3400,5 +3681,271 @@ ACTION REQUIRED (Ben): approve the Ramp device login for gna-finance
             "fable-downgrade-verb",
             false
         ));
+    }
+
+    #[test]
+    fn test_the_meter_is_read_per_account_not_per_pane() {
+        use crate::pane_rules::UsageMeter;
+        let m = |a, b| {
+            Some(UsageMeter {
+                five_hour_pct: a,
+                weekly_pct: b,
+            })
+        };
+        // Fifteen live sessions share forit-main's ONE meter. Fifteen events
+        // for one account is the flood that makes an alert unreadable, and the
+        // account is the thing that actually runs out.
+        let mut panes: Vec<(&str, Option<UsageMeter>)> =
+            (0..15).map(|_| ("forit-main", m(87, 37))).collect();
+        panes.push(("gna-main", m(12, 58)));
+        // A pane whose footer has scrolled away contributes nothing rather
+        // than a zero, which would drag the account's reading down.
+        panes.push(("forit-main", None));
+
+        let meters = account_meters(panes.iter().copied());
+        assert_eq!(meters.len(), 2);
+        assert_eq!(meters["forit-main"].five_hour_pct, 87);
+        assert_eq!(meters["gna-main"].weekly_pct, 58);
+
+        // Panes disagree when one is mid-refresh. The HIGHEST reading is the
+        // least stale, and under-reporting here is the failure that matters.
+        let disagreeing = [
+            ("xce-main", m(40, 10)),
+            ("xce-main", m(72, 9)),
+            ("xce-main", m(58, 11)),
+        ];
+        let meters = account_meters(disagreeing.iter().copied());
+        assert_eq!(meters["xce-main"].five_hour_pct, 72);
+        assert_eq!(meters["xce-main"].weekly_pct, 11);
+    }
+
+    #[test]
+    fn test_a_usage_threshold_alerts_once_per_account_per_window() {
+        use crate::pane_rules::UsageMeter;
+        let meters = |five, wk| {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "forit-main".to_string(),
+                UsageMeter {
+                    five_hour_pct: five,
+                    weekly_pct: wk,
+                },
+            );
+            m
+        };
+        let mut last = HashMap::new();
+
+        // Below the line: silence. An alarm that fires early is one an
+        // operator learns to dismiss.
+        assert!(usage_alerts(&meters(79, 20), 80, &mut last).is_empty());
+
+        // Crossing fires once, naming the window that crossed.
+        let hits = usage_alerts(&meters(87, 20), 80, &mut last);
+        assert_eq!(hits, vec![("forit-main".to_string(), "5h", 87)]);
+
+        // Still above on the next tick, and the one after: nothing. This is
+        // the difference between an alert and a stream.
+        assert!(usage_alerts(&meters(88, 20), 80, &mut last).is_empty());
+        assert!(usage_alerts(&meters(99, 20), 80, &mut last).is_empty());
+
+        // The two windows are independent: weekly crossing while 5h is still
+        // high is its own event, and its own problem.
+        let hits = usage_alerts(&meters(99, 81), 80, &mut last);
+        assert_eq!(hits, vec![("forit-main".to_string(), "wk", 81)]);
+
+        // The 5h window resets, so the meter falls and the alarm re-arms. A
+        // latch that never re-arms only ever warns once per daemon lifetime.
+        assert!(usage_alerts(&meters(3, 82), 80, &mut last).is_empty());
+        let hits = usage_alerts(&meters(90, 82), 80, &mut last);
+        assert_eq!(hits, vec![("forit-main".to_string(), "5h", 90)]);
+
+        // A configured threshold is honoured, not just the default.
+        let mut fresh = HashMap::new();
+        assert!(usage_alerts(&meters(50, 10), 95, &mut fresh).is_empty());
+        assert_eq!(
+            usage_alerts(&meters(96, 10), 95, &mut fresh),
+            vec![("forit-main".to_string(), "5h", 96)]
+        );
+    }
+
+    #[test]
+    fn test_auth_loss_is_pushed_as_its_own_kind() {
+        // Logged out is not capped. A cap has a reset time and a healthy
+        // account; an auth loss has neither, and a subscriber that cannot tell
+        // them apart will wait for a reset that is never coming.
+        assert_eq!(
+            event_kind(&Disposition::AuthLoss { paged: true }),
+            Some("auth_loss")
+        );
+        assert_ne!(
+            event_kind(&Disposition::AuthLoss { paged: false }),
+            event_kind(&Disposition::LiveCap {
+                kind: "usage",
+                action: CapAction::Cooldown
+            })
+        );
+        assert_eq!(Disposition::AuthLoss { paged: true }.state(), "AUTH-LOSS");
+    }
+
+    #[test]
+    fn test_a_withheld_page_is_never_reported_as_a_page() {
+        // The disposition computes what the rule WOULD do. When the class is
+        // off, no row may claim a human was woken, because that sentence is
+        // exactly what an operator reads to conclude somebody knows.
+        let capped = Disposition::LiveCap {
+            kind: "usage",
+            action: CapAction::NonPool { paged: true },
+        };
+        assert_eq!(capped.decision(), "page-commander");
+        assert_eq!(effective_decision(&capped, true), "page-commander");
+        assert_eq!(
+            effective_decision(&capped, false),
+            "page-withheld-class-off"
+        );
+        assert!(effective_reason(&capped, true).ends_with("paged"));
+        let withheld = effective_reason(&capped, false);
+        assert!(withheld.contains("WITHHELD"), "{withheld}");
+        // The correction has to say what still happened, or a reader takes it
+        // for silence and goes looking for a poller that no longer exists.
+        assert!(withheld.contains("/api/events"), "{withheld}");
+
+        // A row that was never going to page reads identically either way: the
+        // correction must not invent a suppression that did not occur.
+        for disp in [
+            Disposition::Serving,
+            Disposition::Overloaded,
+            Disposition::Parked {
+                kind: "usage",
+                all_probed: false,
+            },
+        ] {
+            assert_eq!(effective_decision(&disp, false), disp.decision());
+            assert_eq!(effective_reason(&disp, false), disp.reason());
+        }
+    }
+
+    #[test]
+    fn test_paging_is_governed_by_its_own_class() {
+        use crate::session::config::ActivityConfig;
+
+        let mut off = ActivityConfig::default();
+        assert!(
+            !paging_allowed(&off),
+            "the class defaults off, so the watchdog must not page"
+        );
+        off.set(PAGE_CLASS, true);
+        assert!(paging_allowed(&off));
+
+        // `is_on` reads an unknown name as FALSE, so a typo in PAGE_CLASS would
+        // mute the watchdog permanently while looking like a working gate.
+        // Prove the name is real through the same name-keyed setter the CLI
+        // uses, which reports an unknown class rather than accepting it.
+        let mut probe = ActivityConfig::default();
+        assert!(
+            probe.set(PAGE_CLASS, true),
+            "PAGE_CLASS is not a real activity class"
+        );
+
+        // Neighbouring classes must not open this one. `push_notify` in
+        // particular reads like it would govern a page, and does not.
+        let mut other = ActivityConfig::default();
+        other.set("push_notify", true);
+        other.set("session_auto_restart", true);
+        assert!(!paging_allowed(&other));
+    }
+
+    #[test]
+    fn test_event_kind_covers_every_disposition() {
+        let cases: [(Disposition, Option<&str>); 11] = [
+            // A cap is a cap whether the daemon could place the session or
+            // not: parking is the WORSE outcome, so it must not be the quiet
+            // one.
+            (
+                Disposition::LiveCap {
+                    kind: "usage",
+                    action: CapAction::Moved {
+                        target: "gna-main".into(),
+                        ok: true,
+                    },
+                },
+                Some("cap"),
+            ),
+            (
+                Disposition::LiveCap {
+                    kind: "usage",
+                    action: CapAction::Cooldown,
+                },
+                Some("cap"),
+            ),
+            (
+                Disposition::Parked {
+                    kind: "usage",
+                    all_probed: true,
+                },
+                Some("cap"),
+            ),
+            (Disposition::DeviceCode { paged: true }, Some("auth")),
+            (Disposition::Overloaded, Some("overload")),
+            (
+                Disposition::ActionGate {
+                    paged: true,
+                    suppressed: None,
+                },
+                Some("action_required"),
+            ),
+            (
+                Disposition::FableDrift {
+                    rule: "fable-credit-out".into(),
+                    paged: false,
+                },
+                Some("model_drift"),
+            ),
+            // Nothing happened, or the watchdog already proved the text was
+            // scrollback. Emitting these would teach subscribers to ignore us.
+            (Disposition::Serving, None),
+            (Disposition::ReplayedBanner { why: "stale" }, None),
+            (
+                Disposition::ActionGate {
+                    paged: false,
+                    suppressed: Some("commander-exempt"),
+                },
+                None,
+            ),
+            // A page suppressed by a cooldown is still a cap: the cooldown
+            // governs how loudly the COMMANDER is woken, never whether the
+            // event exists.
+            (
+                Disposition::LiveCap {
+                    kind: "session",
+                    action: CapAction::NonPool { paged: false },
+                },
+                Some("cap"),
+            ),
+        ];
+        for (disp, expected) in cases {
+            assert_eq!(event_kind(&disp), expected, "{}", disp.state());
+        }
+    }
+
+    #[test]
+    fn test_event_edge_fires_on_entry_not_every_tick() {
+        let mut last: HashMap<String, String> = HashMap::new();
+        // First sight of a state is news.
+        assert!(is_event_edge(&mut last, "s1", "LIVE-CAP-usage"));
+        // The same cap on the next tick is not. This is the whole difference
+        // between a push rail and the flood that made the old one unreadable.
+        assert!(!is_event_edge(&mut last, "s1", "LIVE-CAP-usage"));
+        assert!(!is_event_edge(&mut last, "s1", "LIVE-CAP-usage"));
+        // Recovery is a state change, so the edge fires and the record clears;
+        // `event_kind` is what decides SERVING is not worth emitting.
+        assert!(is_event_edge(&mut last, "s1", "SERVING"));
+        // Capped again after recovering: news again, with no cooldown wait.
+        assert!(is_event_edge(&mut last, "s1", "LIVE-CAP-usage"));
+        // Sessions do not share an edge.
+        assert!(is_event_edge(&mut last, "s2", "LIVE-CAP-usage"));
+        assert!(!is_event_edge(&mut last, "s1", "LIVE-CAP-usage"));
+        // A cap that escalates from placed to parked is a NEW state, and the
+        // one a subscriber most needs: it means nowhere left to move.
+        assert!(is_event_edge(&mut last, "s1", "PARKED"));
     }
 }

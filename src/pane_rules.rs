@@ -19,6 +19,8 @@
 //! Everything is fail-open: an invalid pattern logs and drops that rule at
 //! compile time; the rest keep working.
 
+use std::sync::LazyLock;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -108,9 +110,24 @@ pub struct WatchdogConfig {
     pub replace_default_rules: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<PaneRuleConfig>,
+    /// Percent of an account's 5-hour or weekly allowance at which the leading
+    /// meter raises an event. Default 80: high enough not to cry wolf, early
+    /// enough that a human can still move work before the account blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_threshold_pct: Option<u8>,
 }
 
+pub const DEFAULT_USAGE_THRESHOLD_PCT: u8 = 80;
+
 impl WatchdogConfig {
+    /// The configured usage threshold, or the default. A nonsensical value
+    /// (0 or above 100) falls back rather than disabling the alarm silently.
+    pub fn usage_threshold(&self) -> u8 {
+        self.usage_threshold_pct
+            .filter(|p| (1..=100).contains(p))
+            .unwrap_or(DEFAULT_USAGE_THRESHOLD_PCT)
+    }
+
     /// The rule set this config asks for: defaults extended by (or replaced
     /// with) the user's `[[watchdog.rules]]` entries.
     pub fn effective_rules(&self) -> Vec<PaneRuleConfig> {
@@ -537,7 +554,82 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             priority: 3,
             enabled: true,
         },
+        PaneRuleConfig {
+            name: "auth-loss".into(),
+            kind: "authloss".into(),
+            // Being logged out is worse than being capped: there is no reset
+            // time, no countdown, the session produces nothing, and the pane
+            // reads as merely idle. Anchored to the line start (after
+            // decoration) so prose that merely mentions /login cannot fire.
+            pattern: r"(?i)^(?:api )?(?:error\W{0,10})?(?:invalid api key|oauth token (?:has )?expired|authentication_error|401\D{0,20}authentication|credentials? (?:are |is )?no longer valid|please run /login|run /login to|you are (?:now )?logged out|session (?:has )?expired\b.{0,30}/login)".into(),
+            negative: vec![
+                // A quoted or backticked mention is documentation about the
+                // banner, not the banner. Same convention as the cap and
+                // action-required rules, checked on the RAW line because
+                // normalize strips the leading quote.
+                r#"^[^\p{L}\p{N}]*['"`\x{2018}\x{2019}\x{201C}\x{201D}]"#.into(),
+                // A session narrating what it WOULD do is not logged out.
+                r"(?i)\b(?:i(?:'ll| will)?|we(?:'ll| will)?|should|would|can|could|if you|docs?)\b".into(),
+            ],
+            // Same liveness test as the cap banner: an assistant bullet, a tool
+            // elbow, a running footer or a bare ready prompt below it means the
+            // session recovered and this is replayed scrollback.
+            stale_below: vec![
+                r"^\s*[\u{23fa}\u{25cf}]".into(),
+                r"^\s*\u{23bf}".into(),
+                r"(?i)\besc to interrupt\b".into(),
+                r"^\s*\u{2502}?\s*\u{276f}\s*\u{2502}?\s*$".into(),
+            ],
+            require_below: Vec::new(),
+            tail_lines: 20,
+            scope: RuleScope::Line,
+            strip_decoration: true,
+            // Above cap: an account that is logged out cannot serve at all, so
+            // when a pane somehow shows both, the auth loss is the live fact.
+            priority: 0,
+            enabled: true,
+        },
     ]
+}
+
+/// The account's own utilization, as Claude Code already prints it in every
+/// pane footer: `5h 87% \u{b7} wk 37%`.
+///
+/// This is the LEADING indicator. It climbs for hours while the session works
+/// normally, and it belongs to the ACCOUNT, not the pane: every session on a
+/// profile renders the same two numbers. A cap banner is the same fact arriving
+/// too late to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageMeter {
+    pub five_hour_pct: u8,
+    pub weekly_pct: u8,
+}
+
+static USAGE_METER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Both halves are required. A lone `5h 87%` is not this footer, and reading
+    // one would invent a weekly number nobody printed.
+    Regex::new(r"(?i)\b5h\s+(\d{1,3})%\s*[\u{b7}|/,-]?\s*wk\s+(\d{1,3})%")
+        .expect("usage meter regex")
+});
+
+/// Read the meter from a pane capture, or `None` when the footer is absent.
+///
+/// The LAST match wins. A pane holds scrollback, and an older footer higher up
+/// reports a number the account has already grown past; alerting on it would
+/// under-report exactly when the account is closest to its limit.
+pub fn parse_usage_meter(text: &str) -> Option<UsageMeter> {
+    let caps = USAGE_METER_RE.captures_iter(text).last()?;
+    let pct = |i: usize| {
+        caps.get(i)?
+            .as_str()
+            .parse::<u8>()
+            .ok()
+            .filter(|v| *v <= 100)
+    };
+    Some(UsageMeter {
+        five_hour_pct: pct(1)?,
+        weekly_pct: pct(2)?,
+    })
 }
 
 /// True when a session's `extra_args` pins it to the Fable model
@@ -1307,11 +1399,28 @@ mod tests {
     #[test]
     fn default_rules_all_compile() {
         let compiled = compile(&default_rules());
-        assert_eq!(compiled.len(), 4);
-        assert_eq!(compiled[0].kind, "cap");
-        assert_eq!(compiled[1].kind, "auth");
-        assert_eq!(compiled[2].kind, "overload");
-        assert_eq!(compiled[3].kind, "action");
+        // Every declared rule survives compilation: a bad pattern is dropped
+        // silently at compile time, so a rule that vanishes here is a detector
+        // that stops existing without saying so.
+        assert_eq!(compiled.len(), default_rules().len());
+        let kinds: Vec<&str> = compiled.iter().map(|r| r.kind.as_str()).collect();
+        // Compiled order is priority order, not declaration order: auth-loss
+        // shares priority 0 with the cap rule (a dead login produces nothing
+        // forever, so it must outrank the auth prompt at priority 1) and the
+        // stable sort keeps cap first within the tie.
+        assert_eq!(
+            kinds,
+            ["cap", "authloss", "auth", "overload", "action"],
+            "the default battery changed shape"
+        );
+        // Every kind must map to a signal the watchdog acts on; an unknown one
+        // is filtered out at spawn and the rule never fires.
+        for kind in kinds {
+            assert!(
+                matches!(kind, "cap" | "auth" | "overload" | "action" | "authloss"),
+                "{kind} has no signal"
+            );
+        }
     }
 
     #[test]
@@ -1572,5 +1681,75 @@ mod tests {
             fp1, fp2,
             "distinct id-less gates must stay distinct (full-line fallback)"
         );
+    }
+
+    #[test]
+    fn usage_meter_reads_the_number_that_arrives_before_the_banner() {
+        // The footer Claude Code already prints on every pane. This is the
+        // LEADING indicator: it climbs for hours before any cap banner exists,
+        // and until now nothing read it.
+        let m = parse_usage_meter("  accept edits on          5h 87% \u{b7} wk 37%").unwrap();
+        assert_eq!((m.five_hour_pct, m.weekly_pct), (87, 37));
+
+        // Real captures vary in spacing, separator and decoration.
+        let cases = [
+            ("5h 0% \u{b7} wk 38%", (0, 38)),
+            ("5h 100% \u{b7} wk 99%", (100, 99)),
+            ("... 5h 6%  \u{b7}  wk 4%", (6, 4)),
+            ("5h 45%\u{b7}wk 47%", (45, 47)),
+        ];
+        for (text, want) in cases {
+            let m = parse_usage_meter(text).unwrap_or_else(|| panic!("{text:?}"));
+            assert_eq!((m.five_hour_pct, m.weekly_pct), want, "{text:?}");
+        }
+
+        // The LAST meter in the capture wins: a pane holds scrollback, and an
+        // older footer higher up reports a number the account has grown past.
+        let scroll = "5h 12% \u{b7} wk 20%\nsome work\n5h 61% \u{b7} wk 30%";
+        assert_eq!(parse_usage_meter(scroll).unwrap().five_hour_pct, 61);
+
+        // Nothing that is not the meter may be read as the meter.
+        for text in [
+            "",
+            "no meter here",
+            "5h ago we hit 87% of something",
+            "wk 37%",
+            "5h 87%",
+            "5h 187% \u{b7} wk 37%",
+        ] {
+            assert!(parse_usage_meter(text).is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn auth_loss_is_its_own_signal_and_a_cap_is_not_one() {
+        let rules = compile(&default_rules());
+        let hit = |t: &str| classify(t, &rules).map(|r| r.kind.clone());
+
+        // Logged out: no reset time, no banner, produces nothing, and reads as
+        // merely idle. That is why it needs a kind of its own.
+        for text in [
+            "Invalid API key \u{b7} Please run /login",
+            "OAuth token expired \u{b7} Please run /login",
+            "Please run /login to authenticate",
+            "API Error: 401 authentication_error",
+            "Credentials are no longer valid. Run /login.",
+        ] {
+            assert_eq!(hit(text).as_deref(), Some("authloss"), "{text:?}");
+        }
+
+        // A cap is not an auth loss: it has a reset, and the account is fine.
+        assert_eq!(
+            hit("Claude usage limit reached. Your limit will reset at 3pm").as_deref(),
+            Some("cap")
+        );
+        // Prose mentioning login must not fire, nor a quoted template.
+        for text in [
+            "I will run /login if that fails",
+            "`Please run /login`",
+            "the docs say to run /login when this happens",
+        ] {
+            assert_ne!(hit(text).as_deref(), Some("authloss"), "{text:?}");
+        }
     }
 }

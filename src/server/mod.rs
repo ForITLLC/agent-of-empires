@@ -14,6 +14,7 @@ mod ben_gate_surface;
 pub mod callback;
 pub(crate) mod capacity;
 mod charter_drift;
+pub mod event_bus;
 pub mod live_ws;
 pub mod login;
 mod pane;
@@ -435,6 +436,10 @@ pub struct AppState {
     /// power switch answers whether a restart is allowed AT ALL; this answers
     /// whether THIS session has had too many, which a rate alone cannot.
     pub restart_budget: Arc<restart_budget::RestartBudget>,
+    /// Push surface for things nobody may miss (WO#1278 D5). A cap was
+    /// discoverable only by polling and every poller was off, so the first
+    /// detector was a human. Detection now EMITS here and subscribers catch.
+    pub events: Arc<event_bus::EventBus>,
     /// Cached per-profile cleanup defaults for the delete dialog, with a
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).
@@ -1256,6 +1261,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         power: Arc::new(power::PowerRegistry::load_from_app_dir()),
         restart_budget: Arc::new(restart_budget::RestartBudget::new()),
+        events: Arc::new(event_bus::EventBus::new()),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
             // forces a fresh resolve instead of handing out an empty map.
@@ -1798,6 +1804,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/ensure", post(api::ensure_session))
         .route("/api/sessions/{id}/send", post(api::send_message))
         .route("/api/power", get(power::get_power).post(power::set_power))
+        .route("/api/events", get(event_bus::stream_events))
+        .route(
+            "/api/webhooks",
+            get(event_bus::list_webhooks).post(event_bus::register_webhook),
+        )
+        .route("/api/webhooks/{id}", delete(event_bus::delete_webhook))
         .route(
             "/api/power/classes/{class}/cancel",
             post(power::cancel_activity_class),
@@ -2674,6 +2686,11 @@ const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // badge. Every one of these governs what the DAEMON does on its own, which
     // is exactly the authority this mode exists to withhold.
     ("POST", "/api/power"),
+    // Event subscription is a fleet control-plane concern: a locked-down
+    // viewer must not be able to register a webhook that exfiltrates every
+    // cap/auth event to an arbitrary URL, nor silence one by deleting it.
+    ("POST", "/api/webhooks"),
+    ("DELETE", "/api/webhooks/{id}"),
     ("POST", "/api/power/classes/{class}/cancel"),
     ("DELETE", "/api/wakes/{id}"),
     ("PATCH", "/api/capacity"),
@@ -6488,6 +6505,7 @@ pub mod test_support {
             restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             power: Arc::new(power::PowerRegistry::ephemeral()),
             restart_budget: Arc::new(restart_budget::RestartBudget::new()),
+            events: Arc::new(event_bus::EventBus::new()),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
                 refreshed_at: std::time::Instant::now(),
                 entries: HashMap::new(),
