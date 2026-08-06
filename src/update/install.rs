@@ -494,7 +494,70 @@ fn print_nix_refusal() {
     println!("{}", nix_refusal_message());
 }
 
-fn cargo_refusal_message() -> String {
+/// Where a cargo-installed `aoe` actually came from, per cargo's own
+/// install registry (`$CARGO_HOME/.crates.toml`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoAoeSource {
+    /// `cargo install --path <dir>`: a local clone, possibly carrying
+    /// local commits that a `--git` reinstall would silently discard.
+    LocalPath(PathBuf),
+    /// A `--git` or registry install; the upstream reinstall advice is
+    /// safe for these.
+    Remote,
+}
+
+/// Classify the source of the package providing the `aoe` binary from the
+/// contents of cargo's `.crates.toml` install registry. Keys look like
+/// `"agent-of-empires 1.10.1 (path+file:///home/u/clone)" = ["aoe"]`.
+/// Returns `None` when the file is malformed or no package installs an
+/// `aoe` binary.
+fn parse_crates_toml_aoe_source(content: &str) -> Option<CargoAoeSource> {
+    let table: toml::Table = content.parse().ok()?;
+    let v1 = table.get("v1")?.as_table()?;
+    for (key, bins) in v1 {
+        let installs_aoe = bins
+            .as_array()
+            .is_some_and(|a| a.iter().any(|b| b.as_str() == Some("aoe")));
+        if !installs_aoe {
+            continue;
+        }
+        let source = key.rsplit_once('(')?.1.strip_suffix(')')?;
+        return Some(match source.strip_prefix("path+file://") {
+            Some(path) => CargoAoeSource::LocalPath(PathBuf::from(path)),
+            None => CargoAoeSource::Remote,
+        });
+    }
+    None
+}
+
+/// Read `$CARGO_HOME/.crates.toml` (default `~/.cargo/.crates.toml`) and
+/// classify how the running `aoe` was installed by cargo. Any read or
+/// parse failure yields `None`; the caller then falls back to the generic
+/// advice rather than guessing.
+fn cargo_installed_aoe_source() -> Option<CargoAoeSource> {
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))?;
+    let content = std::fs::read_to_string(cargo_home.join(".crates.toml")).ok()?;
+    parse_crates_toml_aoe_source(&content)
+}
+
+fn cargo_refusal_message(source: Option<&CargoAoeSource>) -> String {
+    // A local-path install must never be pointed at the upstream `--git`
+    // form: obeying it would replace the local build, and any local
+    // commits it carries, with clean upstream in place.
+    if let Some(CargoAoeSource::LocalPath(path)) = source {
+        return format!(
+            "aoe was installed via cargo from a local path:\n\
+             \n    {p}\n\
+             \nUpdate by pulling that clone and reinstalling from it, with\n\
+             whatever feature flags your build normally uses:\n\
+             \n    cargo install --path {p}\n\
+             \nDo NOT run `cargo install --git ...`: that would replace this\n\
+             local build (and any local commits) with clean upstream.",
+            p = path.display()
+        );
+    }
     "aoe was installed via cargo. Update by running:\n\
      \n    cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe\n\
      \n(or `git pull && cargo install --path .` from a local clone)."
@@ -502,7 +565,10 @@ fn cargo_refusal_message() -> String {
 }
 
 fn print_cargo_refusal() {
-    println!("{}", cargo_refusal_message());
+    println!(
+        "{}",
+        cargo_refusal_message(cargo_installed_aoe_source().as_ref())
+    );
 }
 
 fn unknown_refusal_message(binary_path: &Path) -> String {
@@ -860,7 +926,71 @@ mod tests {
 
     #[test]
     fn cargo_refusal_message_contains_cargo_install() {
-        assert!(cargo_refusal_message().contains("cargo install"));
+        assert!(cargo_refusal_message(None).contains("cargo install"));
+    }
+
+    #[test]
+    fn crates_toml_path_install_is_detected() {
+        let content = r#"[v1]
+"agent-of-empires 1.10.1 (path+file:///home/u/clones/agent-of-empires)" = ["aoe"]
+"vtracer 0.6.5 (registry+https://github.com/rust-lang/crates.io-index)" = ["vtracer"]
+"#;
+        assert_eq!(
+            parse_crates_toml_aoe_source(content),
+            Some(CargoAoeSource::LocalPath(PathBuf::from(
+                "/home/u/clones/agent-of-empires"
+            )))
+        );
+    }
+
+    #[test]
+    fn crates_toml_git_and_registry_installs_are_remote() {
+        let git = r#"[v1]
+"agent-of-empires 1.14.0 (git+https://github.com/agent-of-empires/agent-of-empires#abcdef)" = ["aoe"]
+"#;
+        assert_eq!(
+            parse_crates_toml_aoe_source(git),
+            Some(CargoAoeSource::Remote)
+        );
+        let registry = r#"[v1]
+"agent-of-empires 1.14.0 (registry+https://github.com/rust-lang/crates.io-index)" = ["aoe"]
+"#;
+        assert_eq!(
+            parse_crates_toml_aoe_source(registry),
+            Some(CargoAoeSource::Remote)
+        );
+    }
+
+    #[test]
+    fn crates_toml_without_aoe_or_malformed_yields_none() {
+        let other = r#"[v1]
+"vtracer 0.6.5 (registry+https://github.com/rust-lang/crates.io-index)" = ["vtracer"]
+"#;
+        assert_eq!(parse_crates_toml_aoe_source(other), None);
+        assert_eq!(parse_crates_toml_aoe_source("not toml at all ["), None);
+        assert_eq!(parse_crates_toml_aoe_source(""), None);
+    }
+
+    #[test]
+    fn cargo_refusal_for_path_install_names_the_clone_and_never_git() {
+        let src = CargoAoeSource::LocalPath(PathBuf::from("/home/u/clones/agent-of-empires"));
+        let s = cargo_refusal_message(Some(&src));
+        assert!(s.contains("/home/u/clones/agent-of-empires"), "{s}");
+        assert!(s.contains("cargo install --path"), "{s}");
+        // The one command that must never be suggested for a local-path
+        // install: it replaces the local build (and any local commits)
+        // with clean upstream.
+        assert!(
+            !s.contains("--git https://github.com/agent-of-empires"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn cargo_refusal_for_remote_install_keeps_the_git_form() {
+        let s = cargo_refusal_message(Some(&CargoAoeSource::Remote));
+        assert!(s.contains("--git https://github.com/agent-of-empires"));
+        assert_eq!(s, cargo_refusal_message(None));
     }
 
     #[test]
