@@ -391,6 +391,33 @@ pub struct SessionResponse {
     /// badge tooltip. Only set when `monitor_active` is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor_description: Option<String>,
+    /// Authoritative context size, read from the session's own Claude Code
+    /// transcript by `session::context_size` and overlaid in `list_sessions`
+    /// for Claude rows with a captured agent sid. Omitted for other tools,
+    /// rows whose sid or transcript is not yet known, and single-session
+    /// responses. Exists so fleet callers stop hand-rolling transcript
+    /// scanners; the two bugs that motivated it were keying the transcript
+    /// dir off the session workdir instead of `project_path`, and picking
+    /// synthetic/sidechain records by recency. See per-dev WO#1280 D5.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextSizeInfo>,
+}
+
+/// Per-session context size, read from the session's own Claude Code
+/// transcript. `tokens` is the input-side total of the last real assistant
+/// turn (input plus cache read plus cache creation), the number an
+/// autocompact trigger compares against. See `session::context_size`.
+#[derive(Serialize, Clone, Debug)]
+pub struct ContextSizeInfo {
+    /// Input-side tokens of the last real assistant turn.
+    pub tokens: u64,
+    /// Transcript timestamp of the measured turn (RFC3339, verbatim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// Model that produced the measured turn.
+    pub model: String,
+    /// Absolute path of the transcript the size was read from.
+    pub transcript: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -713,6 +740,8 @@ impl SessionResponse {
             next_wakeup_reason,
             monitor_active,
             monitor_description,
+            // Overlaid in list_sessions; single-session responses omit it.
+            context: None,
         }
     }
 }
@@ -977,6 +1006,54 @@ pub async fn list_sessions(
             resp.status = projected.to_string();
         }
         resp.pane_alive = Some(alive);
+    }
+
+    // Overlay per-session context size for Claude rows with a captured agent
+    // sid. Inputs are collected up front and every transcript scan runs in one
+    // blocking task, so the sidebar poll's async loop never touches disk.
+    {
+        let ctx_inputs: Vec<(usize, Vec<String>, String, String)> = scoped_instances
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| inst.tool == "claude")
+            .filter_map(|(i, inst)| {
+                inst.agent_session_id.clone().map(|sid| {
+                    (
+                        i,
+                        inst.profile_host_environment(),
+                        inst.project_path.clone(),
+                        sid,
+                    )
+                })
+            })
+            .collect();
+        if !ctx_inputs.is_empty() {
+            let sizes = tokio::task::spawn_blocking(move || {
+                ctx_inputs
+                    .into_iter()
+                    .map(|(i, env, project_path, sid)| {
+                        let size = crate::session::context_size::context_size_for(
+                            &env,
+                            &project_path,
+                            &sid,
+                        );
+                        (i, size)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            for (i, size) in sizes {
+                if let (Some(resp), Some(cs)) = (sessions.get_mut(i), size) {
+                    resp.context = Some(ContextSizeInfo {
+                        tokens: cs.tokens,
+                        at: cs.at,
+                        model: cs.model,
+                        transcript: cs.transcript.to_string_lossy().to_string(),
+                    });
+                }
+            }
+        }
     }
 
     // Overlay each row's per-profile capacity entry from the shared state
@@ -13819,6 +13896,7 @@ mod workspace_ordering_tests {
             snoozed_until: None,
             unread: false,
             pane_alive: None,
+            context: None,
         }
     }
 

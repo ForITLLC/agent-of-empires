@@ -14,6 +14,8 @@ pub(crate) mod claim;
 pub mod claude_import;
 pub mod config;
 pub(crate) mod container_config;
+#[cfg(feature = "serve")]
+pub(crate) mod context_size;
 // Depends on `crate::acp` (Event / event store) and is only driven from the
 // serve daemon, both of which are serve-gated. See #2808.
 #[cfg(feature = "serve")]

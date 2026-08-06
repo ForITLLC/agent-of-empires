@@ -2899,7 +2899,7 @@ impl Instance {
 
     /// Resolve the effective `environment` list for this session's profile,
     /// falling back to the global list when the profile has no override.
-    fn profile_host_environment(&self) -> Vec<String> {
+    pub(crate) fn profile_host_environment(&self) -> Vec<String> {
         let profile = self.effective_profile();
         super::profile_config::resolve_config_or_warn(&profile).environment
     }
