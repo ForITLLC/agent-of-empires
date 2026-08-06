@@ -222,6 +222,45 @@ impl PowerRegistry {
         self.lock().wakes.iter().find(|w| w.id == id).cloned()
     }
 
+    /// Cancel every live wake governed by one activity class, returning their
+    /// ids.
+    ///
+    /// This is what makes a per-class OFF a fact about what is ALREADY armed
+    /// rather than a promise about future arms. The master `set(false)` does
+    /// the same thing for every class at once; this narrows it to one, so
+    /// switching off `cron` does not disturb a monitor the user still wants.
+    pub fn cancel_class(&self, class: &str) -> Vec<String> {
+        use crate::session::config::ActivityConfig;
+        let mut f = self.lock();
+        let mut cancelled = Vec::new();
+        for w in f.wakes.iter_mut().filter(|w| !w.cancelled) {
+            if ActivityConfig::class_for_wake_kind(&w.kind) != class {
+                continue;
+            }
+            w.cancelled = true;
+            w.cancelled_at_ms = Some(now_ms());
+            cancelled.push(w.id.clone());
+        }
+        self.save_locked(&mut f);
+        cancelled
+    }
+
+    /// Whether a wake of this `kind` may be armed right now: the master switch
+    /// AND the class that governs the kind must both be on.
+    ///
+    /// Reading config here rather than caching it is deliberate: a flip made
+    /// in the settings UI or by `aoe activity` must take effect on the next
+    /// arm, not at the next daemon restart.
+    pub fn arm_allowed(&self, kind: &str) -> bool {
+        if !self.is_on() {
+            return false;
+        }
+        let class = crate::session::config::ActivityConfig::class_for_wake_kind(kind);
+        crate::session::config::Config::load_or_warn()
+            .activity
+            .is_on(class)
+    }
+
     pub fn cancel(&self, id: &str) -> Option<WakeEntry> {
         let mut f = self.lock();
         let entry = f.wakes.iter_mut().find(|w| w.id == id)?;
@@ -343,13 +382,48 @@ pub async fn set_power(
     Json(body).into_response()
 }
 
+/// `POST /api/power/classes/{class}/cancel`: stop what one activity class has
+/// already armed. Flipping a class off in config governs FUTURE arms; this is
+/// how the flip reaches the ones that already exist.
+pub async fn cancel_activity_class(
+    State(state): State<Arc<AppState>>,
+    AxumPath(class): AxumPath<String>,
+) -> Response {
+    if !crate::session::config::ActivityConfig::CLASSES.contains(&class.as_str()) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "unknown_activity_class",
+                "class": class,
+                "known": crate::session::config::ActivityConfig::CLASSES,
+            })),
+        )
+            .into_response();
+    }
+    let cancelled = state.power.cancel_class(&class);
+    tracing::info!(
+        target: "server.power",
+        class = %class,
+        cancelled = cancelled.len(),
+        "activity class switched off; cancelled what it had armed"
+    );
+    Json(serde_json::json!({ "class": class, "cancelled": cancelled })).into_response()
+}
+
 pub async fn arm_wake(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ArmWakeRequest>,
 ) -> Response {
+    let kind = req.kind.as_deref().unwrap_or("schedule_wakeup");
+    // Both gates, in order: the master switch, then the class that governs
+    // this kind. Arming is the moment a wake becomes real, so it is the one
+    // place both have to be asked.
+    if !state.power.arm_allowed(kind) {
+        return power_off_response();
+    }
     match state.power.arm(
         &req.session_id,
-        req.kind.as_deref().unwrap_or("schedule_wakeup"),
+        kind,
         req.fire_at_ms,
         req.note.as_deref().unwrap_or(""),
     ) {
@@ -404,6 +478,64 @@ mod tests {
 
     fn reg(dir: &std::path::Path) -> PowerRegistry {
         PowerRegistry::load(dir)
+    }
+
+    /// D3: an OFF that only refuses future arms is the bug this replaced.
+    #[test]
+    fn switching_one_class_off_cancels_what_that_class_already_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = reg(dir.path());
+        let cron = r.arm("s1", "cron", Some(1), "nightly").unwrap();
+        let monitor = r.arm("s1", "monitor", Some(2), "watch").unwrap();
+        let harness = r.arm("s2", "schedule_wakeup", Some(3), "tick").unwrap();
+
+        let cancelled = r.cancel_class("cron");
+
+        assert_eq!(cancelled, vec![cron.id.clone()]);
+        assert!(
+            r.get(&cron.id).unwrap().cancelled,
+            "the armed cron survived"
+        );
+        assert!(
+            !r.get(&monitor.id).unwrap().cancelled,
+            "an unrelated class was collateral damage"
+        );
+        assert!(!r.get(&harness.id).unwrap().cancelled);
+    }
+
+    #[test]
+    fn a_class_cancel_persists_across_a_reload() {
+        // The daemon can restart between the flip and the fire time; a
+        // cancellation that lived only in memory would let the wake fire.
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let r = reg(dir.path());
+            let e = r.arm("s1", "monitor", Some(1), "watch").unwrap();
+            r.cancel_class("monitor");
+            e.id
+        };
+        let r = reg(dir.path());
+        assert!(r.get(&id).unwrap().cancelled);
+    }
+
+    #[test]
+    fn cancelling_a_class_with_nothing_armed_is_empty_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = reg(dir.path());
+        r.arm("s1", "cron", Some(1), "nightly").unwrap();
+        assert!(r.cancel_class("monitor").is_empty());
+    }
+
+    #[test]
+    fn a_master_off_still_cancels_every_class_at_once() {
+        // The per-class control narrows OFF; it must not weaken it.
+        let dir = tempfile::tempdir().unwrap();
+        let r = reg(dir.path());
+        let a = r.arm("s1", "cron", Some(1), "").unwrap();
+        let b = r.arm("s1", "monitor", Some(2), "").unwrap();
+        r.set(false, "test");
+        assert!(r.get(&a.id).unwrap().cancelled);
+        assert!(r.get(&b.id).unwrap().cancelled);
     }
 
     #[test]

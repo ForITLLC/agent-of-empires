@@ -67,6 +67,10 @@ pub struct Config {
     #[serde(default)]
     pub acp: AcpConfig,
 
+    /// Per-class kill switches for everything the daemon can start on its own.
+    #[serde(default)]
+    pub activity: ActivityConfig,
+
     #[serde(default)]
     pub logging: LoggingConfig,
 
@@ -645,6 +649,192 @@ impl Default for AcpConfig {
             rate_limit_auto_resume: false,
             allow_agent_install: false,
             acp_defaults: HashMap::new(),
+        }
+    }
+}
+
+/// One toggle per class of activity the daemon can START ON ITS OWN.
+///
+/// The master switch (`aoe on` / `aoe off`) answers "is aoe allowed to act at
+/// all". It could not answer the question actually asked, which was "stop
+/// waking me up, EXCEPT to move me off a capped account": OFF killed the one
+/// exception and ON restored everything else. A two-position switch has no
+/// position that means that, so each class gets its own.
+///
+/// EVERY CLASS DEFAULTS OFF. `rate_limit_account_switch` is the sole
+/// default-on, because a capped session that cannot relocate is stuck and the
+/// relocation is the thing worth waking for.
+///
+/// The classes are derived from what can actually initiate activity in the
+/// daemon, not from a wish list: the wake registry's arm kinds
+/// (`schedule_wakeup` / `cron` / `monitor`), the pane watchdog's own actions
+/// (page the Commander, inject a message, relocate a capped session), and the
+/// session lifecycle the API exposes (create, auto-restart). A class that
+/// exists in the code but not here is a hole in the kill switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "activity", category = "Activity")]
+pub struct ActivityConfig {
+    /// Harness-scheduled wakeups (`ScheduleWakeup`): a session arranging to be
+    /// re-invoked later without a human asking.
+    #[serde(default)]
+    #[setting(label = "Harness scheduled wakeups", widget = "toggle")]
+    pub harness_wakeup: bool,
+
+    /// Cron and other OS-timer re-invocations registered against the daemon.
+    #[serde(default)]
+    #[setting(label = "Cron / timer wakeups", widget = "toggle")]
+    pub cron: bool,
+
+    /// Monitor watches that re-invoke a session when a condition trips.
+    #[serde(default)]
+    #[setting(label = "Monitor watches", widget = "toggle")]
+    pub monitor: bool,
+
+    /// The pane watchdog paging the Commander about a pane it read (cap
+    /// banner, ACTION REQUIRED, device code).
+    #[serde(default)]
+    #[setting(label = "Pane-watchdog paging", widget = "toggle")]
+    pub pane_watchdog_page: bool,
+
+    /// The daemon injecting a message into a session: a Commander dispatch to
+    /// a worker, or the watchdog's own nudge.
+    #[serde(default)]
+    #[setting(label = "Daemon message dispatch to a session", widget = "toggle")]
+    pub session_message_dispatch: bool,
+
+    /// A worker's report reaching the Commander through the daemon. Separate
+    /// from dispatch: the two directions are worth silencing independently,
+    /// and the target's title is what distinguishes them.
+    #[serde(default)]
+    #[setting(label = "Worker reports to the Commander", widget = "toggle")]
+    pub worker_report_to_commander: bool,
+
+    /// Automatic session restart (a probe or watchdog deciding a session must
+    /// come back). This is the class that ran 371 times on one session.
+    #[serde(default)]
+    #[setting(label = "Automatic session restart", widget = "toggle")]
+    pub session_auto_restart: bool,
+
+    /// Session creation driven by something other than a human at the TUI.
+    #[serde(default)]
+    #[setting(label = "Automated session creation", widget = "toggle")]
+    pub session_create: bool,
+
+    /// Web-push notifications to a registered device.
+    #[serde(default)]
+    #[setting(label = "Push notifications to devices", widget = "toggle")]
+    pub push_notify: bool,
+
+    /// Plugin-initiated automation (a plugin creating sessions or driving
+    /// turns on its own schedule).
+    #[serde(default)]
+    #[setting(label = "Plugin automation", widget = "toggle")]
+    pub plugin_automation: bool,
+
+    /// Relocating a rate-limited session to a profile with verified headroom.
+    /// THE ONE DEFAULT-ON CLASS: without it a capped session simply stops.
+    #[serde(default = "default_account_switch_on")]
+    #[setting(label = "Rate-limit account switching", widget = "toggle")]
+    pub rate_limit_account_switch: bool,
+}
+
+/// The one class whose absence from an older config must still read ON.
+fn default_account_switch_on() -> bool {
+    true
+}
+
+impl Default for ActivityConfig {
+    fn default() -> Self {
+        Self {
+            harness_wakeup: false,
+            cron: false,
+            monitor: false,
+            pane_watchdog_page: false,
+            session_message_dispatch: false,
+            worker_report_to_commander: false,
+            session_auto_restart: false,
+            session_create: false,
+            push_notify: false,
+            plugin_automation: false,
+            rate_limit_account_switch: true,
+        }
+    }
+}
+
+impl ActivityConfig {
+    /// Every class name, in declaration order. The CLI lists these and the
+    /// daemon reconciles armed wakes against them, so both stay in step with
+    /// the struct rather than a hand-kept copy.
+    pub const CLASSES: &'static [&'static str] = &[
+        "harness_wakeup",
+        "cron",
+        "monitor",
+        "pane_watchdog_page",
+        "session_message_dispatch",
+        "worker_report_to_commander",
+        "session_auto_restart",
+        "session_create",
+        "push_notify",
+        "plugin_automation",
+        "rate_limit_account_switch",
+    ];
+
+    /// Read one class by name. An unknown name reads FALSE, never true: a
+    /// typo in a gate must not open one.
+    pub fn is_on(&self, class: &str) -> bool {
+        match class {
+            "harness_wakeup" => self.harness_wakeup,
+            "cron" => self.cron,
+            "monitor" => self.monitor,
+            "pane_watchdog_page" => self.pane_watchdog_page,
+            "session_message_dispatch" => self.session_message_dispatch,
+            "worker_report_to_commander" => self.worker_report_to_commander,
+            "session_auto_restart" => self.session_auto_restart,
+            "session_create" => self.session_create,
+            "push_notify" => self.push_notify,
+            "plugin_automation" => self.plugin_automation,
+            "rate_limit_account_switch" => self.rate_limit_account_switch,
+            _ => false,
+        }
+    }
+
+    /// Set one class by name. `false` when the name is not a class, so a
+    /// caller can report a typo instead of silently doing nothing.
+    pub fn set(&mut self, class: &str, on: bool) -> bool {
+        match class {
+            "harness_wakeup" => self.harness_wakeup = on,
+            "cron" => self.cron = on,
+            "monitor" => self.monitor = on,
+            "pane_watchdog_page" => self.pane_watchdog_page = on,
+            "session_message_dispatch" => self.session_message_dispatch = on,
+            "worker_report_to_commander" => self.worker_report_to_commander = on,
+            "session_auto_restart" => self.session_auto_restart = on,
+            "session_create" => self.session_create = on,
+            "push_notify" => self.push_notify = on,
+            "plugin_automation" => self.plugin_automation = on,
+            "rate_limit_account_switch" => self.rate_limit_account_switch = on,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Every class set to `on`. `aoe off` and `aoe on` use this so the master
+    /// verbs keep meaning exactly what they say.
+    pub fn all(on: bool) -> Self {
+        let mut cfg = Self::default();
+        for class in Self::CLASSES {
+            cfg.set(class, on);
+        }
+        cfg
+    }
+
+    /// The wake-registry `kind` a class governs, for cancelling what is
+    /// already armed when the class is switched off.
+    pub fn class_for_wake_kind(kind: &str) -> &'static str {
+        match kind {
+            "cron" => "cron",
+            "monitor" => "monitor",
+            _ => "harness_wakeup",
         }
     }
 }
@@ -1599,18 +1789,17 @@ pub fn launch_model_flag_injection(extra_args: &str, profile_pin: Option<&str>) 
     })
 }
 
-/// Wrap a value so the shell passes it through literally.
+/// A binary must be able to SAY whether it carries the model-pin quoting
+/// fix. Grepping for the function name answers zero on a fixed binary AND a
+/// broken one (release builds emit no Rust symbol names), which a reviewer
+/// correctly refused to act on. A string literal survives the build, so the
+/// capability is declared as one and referenced at runtime to keep it.
+/// See per-dev WO#1177 D1.
+pub const MODEL_PIN_QUOTING_CAPABILITY: &str = "aoe-cap:model-pin-quoting/1";
+/// Wrap a value so the launching shell passes it through literally.
 ///
-/// This flag is spliced into a `zsh -lc '…'` launch line, so anything the shell
-/// reads as syntax has to be neutralized. `[1m]` is the live case: every claude
-/// profile pins `claude-fable-5[1m]`, zsh reads the brackets as a glob, matches
-/// no file, and aborts the ENTIRE line — `zsh:1: no matches found:
-/// claude-fable-5[1m]`, status 1, pane dead at launch, so an unpinned session
-/// could not start at all.
-///
-/// Quoting rather than stripping is deliberate: the value is legitimate
-/// 1M-context configuration, and removing the suffix would silently run the
-/// session on a different model than its profile asked for.
+/// Only quotes when the value contains something a shell would interpret, so
+/// ordinary model ids keep their current, unquoted command line.
 fn shell_quote_value(value: &str) -> String {
     const SAFE: &str = "-_./:=@,+";
     let plain = !value.is_empty()
@@ -1620,68 +1809,68 @@ fn shell_quote_value(value: &str) -> String {
     if plain {
         return value.to_string();
     }
-    // Already quoted by whoever wrote it: re-quoting would nest and the agent
-    // would receive a model id with literal quote characters in it.
-    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+    // Already quoted by whoever wrote it: re-quoting would nest, and the agent
+    // would receive a model id with literal quote characters in it. Both
+    // quote styles are shell-valid ways to protect a value, so either wrapper
+    // is left alone.
+    let already_quoted = value.len() >= 2
+        && ((value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"')));
+    if already_quoted {
         return value.to_string();
     }
-    // Single quotes protect everything except a single quote, which has to be
-    // closed, escaped, and reopened.
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Marker proving this binary quotes glob-active model values at launch.
+/// Quote a shell-active `--model` / `-m` VALUE inside a free-form extra-args
+/// string, leaving every other token exactly as the user wrote it.
 ///
-/// Greppable with `strings`, so an auditor can tell a fixed binary from a
-/// pre-fix one without spawning a pane. Pair it with a control probe: a check
-/// that cannot find its own control is broken, and a broken check must never
-/// read as "safe".
-pub const MODEL_PIN_QUOTING_CAPABILITY: &str = "aoe-cap:model-pin-quoting/1";
-
-/// Quote a glob-active `--model` / `-m` VALUE inside a free-form extra-args
-/// string, leaving every other token alone.
+/// `extra_args` is spliced into the launch command verbatim, so a model id
+/// carrying shell metacharacters aborts the whole line before the agent
+/// starts. A context-window suffix does exactly that: `--model claude-x[1m]`
+/// dies under zsh with `no matches found: claude-x[1m]`, status 1, and the
+/// pane is dead at launch with nothing to show for it.
 ///
-/// The session's own `extra_args` is spliced into the launch line verbatim and
-/// may legitimately carry several flags, so it cannot be quoted wholesale —
-/// but the model value inside it is exactly the token the fleet generates a
-/// glob for. `aoe add` seeds `extra_args` FROM the profile pin, so this is the
-/// path a freshly created session actually takes; the injection path below
-/// only fires when `extra_args` carries no model at all. Fixing one and not
-/// the other leaves the common case broken, which is how the first attempt at
-/// WO#1174 D1 still died on a live pane.
+/// Quoting only the model value keeps the rest of `extra_args` usable as the
+/// caller's own argv, where shell syntax may well be intended. Untouched
+/// regions (including their original whitespace) are copied byte-for-byte
+/// rather than round-tripped through a tokenize/rejoin, which would collapse
+/// runs of whitespace elsewhere in the string.
 pub fn quote_model_value_in_args(args: &str) -> String {
-    // A binary must be able to SAY whether it carries this fix.
-    //
-    // The obvious probe — grepping the binary for this function's name —
-    // answers zero on a fixed binary AND on a broken one, because an optimized
-    // release build never emits Rust symbol names. A reviewer read that zero,
-    // could not tell it from absence, and correctly refused to act on it. A
-    // string LITERAL does survive (`"pane died at launch"` greps 1 on the
-    // fixed binary and 0 on the pre-fix one), so the capability is declared as
-    // one and referenced at runtime to keep it. See per-dev WO#1177 D1.
     tracing::trace!(target: "session.launch", capability = MODEL_PIN_QUOTING_CAPABILITY);
-    let toks: Vec<&str> = args.split_whitespace().collect();
-    let mut out: Vec<String> = Vec::with_capacity(toks.len());
-    let mut i = 0;
-    while i < toks.len() {
-        let tok = toks[i];
-        if let Some((lhs, value)) = tok.split_once('=') {
+    let mut out = String::with_capacity(args.len());
+    let mut rest = args;
+    let mut expect_model_value = false;
+    loop {
+        let ws_len = rest.len() - rest.trim_start().len();
+        out.push_str(&rest[..ws_len]);
+        rest = &rest[ws_len..];
+        if rest.is_empty() {
+            break;
+        }
+        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..tok_len];
+        let assigned_model_value = tok.split_once('=').and_then(|(lhs, value)| {
             if (lhs == "--model" || lhs == "-m") && !value.is_empty() {
-                out.push(format!("{lhs}={}", shell_quote_value(value)));
-                i += 1;
-                continue;
+                Some((lhs, value))
+            } else {
+                None
             }
+        });
+        if expect_model_value {
+            out.push_str(&shell_quote_value(tok));
+            expect_model_value = false;
+        } else if let Some((lhs, value)) = assigned_model_value {
+            out.push_str(lhs);
+            out.push('=');
+            out.push_str(&shell_quote_value(value));
+        } else {
+            out.push_str(tok);
+            expect_model_value = tok == "--model" || tok == "-m";
         }
-        if (tok == "--model" || tok == "-m") && i + 1 < toks.len() {
-            out.push(tok.to_string());
-            out.push(shell_quote_value(toks[i + 1]));
-            i += 2;
-            continue;
-        }
-        out.push(tok.to_string());
-        i += 1;
+        rest = &rest[tok_len..];
     }
-    out.join(" ")
+    out
 }
 
 /// What a single mouse click on a session row does in the Agent view.
@@ -3367,6 +3556,115 @@ pub fn get_update_settings() -> UpdatesConfig {
 
 pub fn get_telemetry_settings() -> TelemetryConfig {
     Config::load_or_warn().telemetry
+}
+
+#[cfg(test)]
+mod activity_class_tests {
+    use super::*;
+
+    #[test]
+    fn every_class_is_off_by_default_except_account_switching() {
+        let cfg = ActivityConfig::default();
+        for class in ActivityConfig::CLASSES {
+            let expected = *class == "rate_limit_account_switch";
+            assert_eq!(
+                cfg.is_on(class),
+                expected,
+                "{class} default is wrong; only rate_limit_account_switch may default on"
+            );
+        }
+    }
+
+    #[test]
+    fn the_name_table_and_the_struct_cannot_drift() {
+        // A class declared on the struct but missing from CLASSES would never
+        // be listed, never be settable by name, and never be reconciled: a
+        // hole in the kill switch that nothing announces. Round-tripping the
+        // serialized shape is what makes the two provably the same set.
+        let json = serde_json::to_value(ActivityConfig::default()).expect("serialize");
+        let fields: Vec<String> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut declared: Vec<String> = ActivityConfig::CLASSES
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let mut serialized = fields;
+        declared.sort();
+        serialized.sort();
+        assert_eq!(declared, serialized);
+    }
+
+    #[test]
+    fn an_unknown_class_reads_off_and_refuses_to_be_set() {
+        let mut cfg = ActivityConfig::all(true);
+        assert!(!cfg.is_on("no_such_class"), "a typo must not read as ON");
+        assert!(
+            !cfg.set("no_such_class", true),
+            "a typo must report failure"
+        );
+    }
+
+    #[test]
+    fn all_true_and_all_false_move_every_class_including_the_default_on_one() {
+        let on = ActivityConfig::all(true);
+        let off = ActivityConfig::all(false);
+        for class in ActivityConfig::CLASSES {
+            assert!(on.is_on(class), "{class} not on under all(true)");
+            assert!(!off.is_on(class), "{class} still on under all(false)");
+        }
+    }
+
+    #[test]
+    fn setting_one_class_leaves_the_others_alone() {
+        // Ben's actual ask: turn one thing off without disturbing the rest.
+        let mut cfg = ActivityConfig::default();
+        assert!(cfg.set("session_auto_restart", true));
+        assert!(cfg.is_on("session_auto_restart"));
+        assert!(
+            cfg.is_on("rate_limit_account_switch"),
+            "the exception moved"
+        );
+        assert!(!cfg.is_on("cron"), "an unrelated class moved");
+    }
+
+    #[test]
+    fn a_wake_kind_maps_to_the_class_that_governs_it() {
+        assert_eq!(ActivityConfig::class_for_wake_kind("cron"), "cron");
+        assert_eq!(ActivityConfig::class_for_wake_kind("monitor"), "monitor");
+        assert_eq!(
+            ActivityConfig::class_for_wake_kind("schedule_wakeup"),
+            "harness_wakeup"
+        );
+        // An unrecognized kind is still SOMETHING that armed a wake, so it
+        // must fall under a real class rather than escaping into no class.
+        assert_eq!(
+            ActivityConfig::class_for_wake_kind("something_new"),
+            "harness_wakeup"
+        );
+    }
+
+    #[test]
+    fn the_config_round_trips_through_toml_so_a_flip_survives_a_restart() {
+        let mut cfg = ActivityConfig::default();
+        cfg.set("pane_watchdog_page", true);
+        cfg.set("rate_limit_account_switch", false);
+        let text = toml::to_string(&cfg).expect("serialize");
+        let back: ActivityConfig = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn an_absent_section_yields_the_safe_defaults_not_everything_on() {
+        // An older config.toml has no [activity] table at all. Reading it must
+        // land on the default-off posture, never on a permissive one.
+        let cfg: Config = toml::from_str("default_profile = \"x\"").expect("parse");
+        assert!(!cfg.activity.harness_wakeup);
+        assert!(cfg.activity.rate_limit_account_switch);
+    }
 }
 
 #[cfg(test)]

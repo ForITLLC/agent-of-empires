@@ -503,6 +503,8 @@ async fn run(
         Some(Commands::Off) => cli::power::set(false).await,
         #[cfg(feature = "serve")]
         Some(Commands::Power) => cli::power::status().await,
+        #[cfg(feature = "serve")]
+        Some(Commands::Activity(args)) => cli::power::activity(args).await,
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
         Some(Commands::Plugin { command }) => cli::plugin::run(command).await,

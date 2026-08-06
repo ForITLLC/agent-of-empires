@@ -10,10 +10,21 @@
 //! reachable the state file is written directly (the daemon adopts it at next
 //! boot), and status reporting treats "unreachable" as OFF, never ON.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use clap::Args;
 
 use crate::acp::client::{discovery, http::HttpClient};
 use crate::server::power::{power_file_path, PowerRegistry};
+use crate::session::config::ActivityConfig;
+
+#[derive(Args)]
+pub struct ActivityArgs {
+    /// Class to read or set. Omit to list every class and its state.
+    pub class: Option<String>,
+
+    /// `on` or `off`. Omit to read the named class without changing it.
+    pub state: Option<String>,
+}
 
 fn daemon_client() -> Option<HttpClient> {
     let endpoint = discovery::discover_local().ok()?;
@@ -66,6 +77,80 @@ pub async fn set(on: bool) -> Result<()> {
         println!("cancelled wakes ({}):", cancelled.len());
         for id in &cancelled {
             println!("  - {id}");
+        }
+    }
+    Ok(())
+}
+
+/// `aoe activity [<class> [on|off]]` — the per-class half of the kill switch.
+///
+/// Reading and setting go through the same config the settings UI writes, so a
+/// flip here and a flip in the settings view are the same fact, and it
+/// survives a daemon restart because it lives in config.toml rather than in
+/// daemon memory. Setting a class OFF also asks the daemon to cancel what is
+/// already armed in it; an unreachable daemon still persists the flip, and
+/// every consumer already reads an unreachable daemon as OFF.
+pub async fn activity(args: ActivityArgs) -> Result<()> {
+    let config = crate::session::config::Config::load_or_warn();
+    let Some(class) = args.class else {
+        let width = ActivityConfig::CLASSES
+            .iter()
+            .map(|c| c.len())
+            .max()
+            .unwrap_or(0);
+        for name in ActivityConfig::CLASSES {
+            let state = if config.activity.is_on(name) {
+                "on"
+            } else {
+                "off"
+            };
+            println!("{name:<width$}  {state}");
+        }
+        return Ok(());
+    };
+    if !ActivityConfig::CLASSES.contains(&class.as_str()) {
+        bail!(
+            "unknown activity class {class:?}\nknown classes: {}",
+            ActivityConfig::CLASSES.join(", ")
+        );
+    }
+    let Some(state) = args.state else {
+        let state = if config.activity.is_on(&class) {
+            "on"
+        } else {
+            "off"
+        };
+        println!("{class}: {state}");
+        return Ok(());
+    };
+    let on = match state.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => true,
+        "off" | "false" | "no" | "0" => false,
+        other => bail!("state must be `on` or `off`, got {other:?}"),
+    };
+    crate::session::config::update_config(|c| {
+        c.activity.set(&class, on);
+    })?;
+    println!("{class}: {}", if on { "on" } else { "off" });
+
+    if !on {
+        // An OFF that only refuses future arms is the bug this replaced. Ask
+        // the daemon to cancel what this class already has armed; with no
+        // daemon, do it against the state file directly.
+        let cancelled = match daemon_client() {
+            Some(client) => client
+                .cancel_activity_class(&class)
+                .await
+                .unwrap_or_default(),
+            None => PowerRegistry::load_from_app_dir().cancel_class(&class),
+        };
+        if cancelled.is_empty() {
+            println!("nothing was armed in this class");
+        } else {
+            println!("cancelled {} armed item(s):", cancelled.len());
+            for id in &cancelled {
+                println!("  - {id}");
+            }
         }
     }
     Ok(())

@@ -505,6 +505,29 @@ impl HttpClient {
         Ok(res.json().await?)
     }
 
+    /// `POST /api/power/classes/{class}/cancel`: cancel everything already
+    /// armed in one activity class. Returns the cancelled ids so the caller
+    /// can show what a flip actually stopped, rather than claiming it stopped
+    /// something.
+    pub async fn cancel_activity_class(&self, class: &str) -> Result<Vec<String>, HttpError> {
+        let url = format!(
+            "{}/api/power/classes/{class}/cancel",
+            self.endpoint.base_url
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        let res = check_status(res, "power").await?;
+        let body: serde_json::Value = res.json().await?;
+        Ok(body
+            .get("cancelled")
+            .and_then(|c| c.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// `POST /api/sessions/{id}/acp/mode`: set the active session
     /// permission mode (an ACP `session/set_mode` round-trip). The new
     /// mode echoes back over the WebSocket as `CurrentModeChanged`;

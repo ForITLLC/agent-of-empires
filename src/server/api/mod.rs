@@ -70,14 +70,14 @@ pub use sessions::{
     session_diff_files, session_file, set_mcp_surface, set_session_goal, set_worktree_name,
     start_session, stop_session, summarize_session, trash_session, update_session_archive,
     update_session_color, update_session_diff_base, update_session_group,
-    update_session_notifications, update_session_pin, update_session_snooze,
-    update_session_unread, update_workspace_ordering, CleanupDefaults, McpSurfaceBadge,
-    OutputQuery, SendMessageRequest, SessionResponse,
+    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
+    update_workspace_ordering, CleanupDefaults, McpSurfaceBadge, OutputQuery, SendMessageRequest,
+    SessionResponse,
 };
+pub(crate) use sessions::{power_restore_sessions, power_stop_sessions, power_stop_targets};
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
-pub(crate) use sessions::{power_restore_sessions, power_stop_sessions, power_stop_targets};
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
 // Trash retention sweep, driven by the daemon's hourly loop; not a route handler.

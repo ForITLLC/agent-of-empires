@@ -20,6 +20,8 @@ use super::log_level::LogLevelArgs;
 use super::logs::LogsArgs;
 use super::mcp::McpCommands;
 use super::plugin::PluginCommands;
+#[cfg(feature = "serve")]
+use super::power::ActivityArgs;
 use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
 use super::ps::PsArgs;
@@ -131,6 +133,13 @@ pub enum Commands {
     /// Show the master power state (see `aoe on` / `aoe off`)
     #[cfg(feature = "serve")]
     Power,
+
+    /// Turn ONE class of self-started activity on or off (wakeups, cron,
+    /// paging, auto-restart, account switching, ...). With no arguments,
+    /// lists every class and its current state. Everything defaults off
+    /// except rate-limit account switching
+    #[cfg(feature = "serve")]
+    Activity(ActivityArgs),
 
     /// Internal: trap for `aoe stop`, which is not a command in aoe (stopping
     /// is always scoped to a noun). Redirects users to `session stop`,
@@ -297,6 +306,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "on",
     "off",
     "power",
+    "activity",
     "killall",
     "session",
     "group",
@@ -351,6 +361,8 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Off => "off",
         #[cfg(feature = "serve")]
         Commands::Power => "power",
+        #[cfg(feature = "serve")]
+        Commands::Activity(_) => "activity",
         // Hidden trap; never a user action, never counted.
         Commands::Stop { .. } => return None,
         Commands::Session { .. } => "session",

@@ -940,8 +940,10 @@ impl Watchdog {
     async fn tick(&mut self, state: &Arc<super::AppState>) {
         let file_watch = state.file_watch.clone();
         let rules = self.rules.clone();
-        let (scans, serving) =
-            match tokio::task::spawn_blocking(move || scan_panes(&file_watch, &rules)).await
+        let (scans, serving) = match tokio::task::spawn_blocking(move || {
+            scan_panes(&file_watch, &rules)
+        })
+        .await
         {
             Ok(s) => s,
             Err(e) => {
@@ -1889,9 +1891,7 @@ fn mirror_urgent(scan: &PaneScan, signal: PaneSignal) {
         PaneSignal::ActionRequired => return,
     };
     let reason = format!("pane-watchdog: {} on '{}'", what, scan.title);
-    if let Err(e) =
-        crate::hooks::merge_watchdog_urgent(&scan.id, &reason, kind, ttl)
-    {
+    if let Err(e) = crate::hooks::merge_watchdog_urgent(&scan.id, &reason, kind, ttl) {
         tracing::warn!(
             target: "server.pane_watchdog",
             session = %scan.id,
@@ -2462,8 +2462,9 @@ and enter the code H7Q2K9F4P to authenticate.
     #[test]
     fn overload_deep_in_scrollback_is_none() {
         // A recovered 529 buried under later output is a finished retry flow.
-        let mut pane =
-            String::from("API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n");
+        let mut pane = String::from(
+            "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n",
+        );
         for i in 0..20 {
             pane.push_str(&format!("subsequent output line {i}\n"));
         }

@@ -9698,7 +9698,11 @@ mod tests {
             )
             .await
             .into_response();
-            let Json(envelope) = list_sessions(State(state.clone()), axum::extract::Query(ListSessionsQuery { state: None })).await;
+            let Json(envelope) = list_sessions(
+                State(state.clone()),
+                axum::extract::Query(ListSessionsQuery { state: None }),
+            )
+            .await;
             let badge = envelope.mcp_surface.expect("badge set on envelope");
             assert_eq!(badge.status, "truncated");
             assert_eq!(badge.missing, vec!["productivity".to_string()]);

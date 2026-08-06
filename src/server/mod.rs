@@ -1792,6 +1792,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/ensure", post(api::ensure_session))
         .route("/api/sessions/{id}/send", post(api::send_message))
         .route("/api/power", get(power::get_power).post(power::set_power))
+        .route(
+            "/api/power/classes/{class}/cancel",
+            post(power::cancel_activity_class),
+        )
         .route("/api/wakes", get(power::list_wakes).post(power::arm_wake))
         .route(
             "/api/wakes/{id}",
@@ -2658,6 +2662,20 @@ const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
 /// #7.
 #[cfg(test)]
 const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
+    // Fleet control plane. A CityHall client is a locked-down viewer; it must
+    // not be able to flip the kill switch, silence an activity class, cancel a
+    // wake, edit capacity, rewrite a session's goal, or forge the MCP-surface
+    // badge. Every one of these governs what the DAEMON does on its own, which
+    // is exactly the authority this mode exists to withhold.
+    ("POST", "/api/power"),
+    ("POST", "/api/power/classes/{class}/cancel"),
+    ("DELETE", "/api/wakes/{id}"),
+    ("PATCH", "/api/capacity"),
+    ("PATCH", "/api/capacity/{profile}"),
+    ("PATCH", "/api/sessions/{id}/goal"),
+    ("POST", "/api/mcp-surface"),
+    ("POST", "/api/wakes"),
+    ("POST", "/api/sessions/{id}/restart"),
     // Terminal surface.
     ("POST", "/api/sessions/{id}/ensure"),
     ("POST", "/api/sessions/{id}/send"),

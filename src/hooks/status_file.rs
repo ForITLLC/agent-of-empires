@@ -474,7 +474,10 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         let exp = v["urgent_expires_at"].as_i64().unwrap();
-        assert!(exp > now + 3000 && exp <= now + 3601, "expiry {exp} vs now {now}");
+        assert!(
+            exp > now + 3000 && exp <= now + 3601,
+            "expiry {exp} vs now {now}"
+        );
         assert!(read_hook_urgent("wd_urgent_merge"));
     }
 
@@ -483,8 +486,13 @@ mod tests {
     fn test_merge_watchdog_urgent_recovers_from_corrupt_json() {
         let (_g, _, _tmp) = BaseGuard::ready();
         write_attention_json("wd_urgent_corrupt", "{ this is not json");
-        merge_watchdog_urgent("wd_urgent_corrupt", "capped", "cap", Duration::from_secs(60))
-            .unwrap();
+        merge_watchdog_urgent(
+            "wd_urgent_corrupt",
+            "capped",
+            "cap",
+            Duration::from_secs(60),
+        )
+        .unwrap();
         assert!(read_hook_urgent("wd_urgent_corrupt"));
     }
 

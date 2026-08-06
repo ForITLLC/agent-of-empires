@@ -31,7 +31,14 @@ use regex::Regex;
 /// Tenant prefixes that define a charter. A title outside these namespaces
 /// is unchartered and never checked.
 const TENANT_PREFIXES: [&str; 8] = [
-    "personal-", "per-", "forit-", "for-", "gna-", "wma-", "xce-", "ras-",
+    "personal-",
+    "per-",
+    "forit-",
+    "for-",
+    "gna-",
+    "wma-",
+    "xce-",
+    "ras-",
 ];
 
 /// Appliance/remote hosts with a known owning charter repo. Only hosts in
@@ -129,11 +136,7 @@ pub(crate) fn detect(title: &str, project_path: &str, pane: &str) -> Option<Drif
     let tail = &lines[lines.len().saturating_sub(TAIL_LINES)..];
 
     for (host, owner) in HOST_OWNERS {
-        if !in_charter(owner)
-            && tail
-                .iter()
-                .any(|l| l.to_lowercase().contains(host))
-        {
+        if !in_charter(owner) && tail.iter().any(|l| l.to_lowercase().contains(host)) {
             return Some(DriftHit {
                 charter,
                 observed: format!("host {host} (owned by {owner})"),
@@ -217,8 +220,7 @@ mod tests {
 ⏺ Edit(/Users/ben/GitProjects/for-Directory/src/api/people.ts)
 ⏺ Bash(cd /Users/ben/GitProjects/for-Directory && npm test)
 ";
-        let hit = detect("for-Forms", "/Users/ben/GitProjects/for-Forms", pane)
-            .expect("must fire");
+        let hit = detect("for-Forms", "/Users/ben/GitProjects/for-Forms", pane).expect("must fire");
         assert!(hit.observed.contains("repo for-Directory"));
     }
 
@@ -229,8 +231,12 @@ mod tests {
 ⏺ Edit(~/GitProjects/for-Support/src/tickets.ts)
 ⏺ Bash(git -C ~/GitProjects/for-Support status)
 ";
-        let hit = detect("gna-Assistant", "/Users/ben/GitProjects/gna-Assistant", pane)
-            .expect("must fire");
+        let hit = detect(
+            "gna-Assistant",
+            "/Users/ben/GitProjects/gna-Assistant",
+            pane,
+        )
+        .expect("must fire");
         assert!(hit.observed.contains("repo for-Support"));
     }
 
@@ -433,8 +439,18 @@ diff ~/GitProjects/for-Directory/a.ts ~/GitProjects/for-Directory/b.ts ~/GitProj
 ⏺ Bash(curl http://homeassistant.local:8123/api/)
 ⏺ Bash(cd ~/GitProjects/for-Support && npm test)
 ";
-        assert_eq!(detect("AoE-Commander", "/Users/ben/GitProjects/aoe-commander", pane), None);
-        assert_eq!(detect("Byzantines", "/Users/ben/GitProjects/scratch", pane), None);
+        assert_eq!(
+            detect(
+                "AoE-Commander",
+                "/Users/ben/GitProjects/aoe-commander",
+                pane
+            ),
+            None
+        );
+        assert_eq!(
+            detect("Byzantines", "/Users/ben/GitProjects/scratch", pane),
+            None
+        );
     }
 
     #[test]
