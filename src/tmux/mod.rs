@@ -122,9 +122,17 @@ fn build_isolation_socket() -> Option<PathBuf> {
         // prior run) that would otherwise share one tmux server and interfere.
         // The collision bites hardest as root, where `/tmp` is shared across
         // every same-uid run.
-        return Some(
-            std::env::temp_dir().join(format!("aoe-unit-test-tmux-{}.sock", std::process::id())),
-        );
+        let path =
+            std::env::temp_dir().join(format!("aoe-unit-test-tmux-{}.sock", std::process::id()));
+        // A per-process socket stops tests colliding, but nothing was killing
+        // the server the tests start, so each `cargo test` that touched tmux
+        // left a server running forever, holding whatever sessions the tests
+        // spawned. 25 of them had accumulated over six days on one machine,
+        // invisible to `tmux ls` (private socket) and to the daemon alike.
+        // The harness gives us no after-all hook, so register the teardown with
+        // the C runtime: it fires once, after the last test, on normal exit.
+        register_unit_test_server_teardown(&path);
+        return Some(path);
     }
     #[cfg(all(not(test), debug_assertions))]
     {
@@ -140,6 +148,69 @@ fn build_isolation_socket() -> Option<PathBuf> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// Kill this test process's tmux server when the process exits, so a run that
+/// started a server never leaves one behind.
+///
+/// `atexit` runs on normal exit only; a test binary killed by a signal still
+/// leaks, which is why `orphaned_unit_test_sockets` exists to catch what got
+/// away. Together they are the socket equivalent of a fixture-scoped store: a
+/// test may not leave state outside its own run, and if it does, the next run
+/// says so instead of inheriting it silently.
+#[cfg(test)]
+fn register_unit_test_server_teardown(path: &std::path::Path) {
+    use std::process::Stdio;
+    static SOCKET: OnceLock<PathBuf> = OnceLock::new();
+    if SOCKET.set(path.to_path_buf()).is_err() {
+        return; // already registered for this process
+    }
+    extern "C" fn teardown() {
+        if let Some(sock) = SOCKET.get() {
+            let _ = Command::new("tmux")
+                .args(["-S", &sock.to_string_lossy(), "kill-server"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = std::fs::remove_file(sock);
+        }
+    }
+    unsafe {
+        libc::atexit(teardown);
+    }
+}
+
+/// Unit-test tmux sockets in the temp dir whose owning test process is gone.
+///
+/// The socket name carries the pid that created it, so a dead owner means the
+/// server outlived its run: a leak, not a concurrent test. Returns the socket
+/// paths so a test can name them rather than merely counting them.
+#[cfg(test)]
+fn orphaned_unit_test_sockets() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = name
+            .strip_prefix("aoe-unit-test-tmux-")
+            .and_then(|rest| rest.strip_suffix(".sock"))
+            .and_then(|pid| pid.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() as i32 {
+            continue; // this run's own socket
+        }
+        // Signal 0 probes for existence without delivering anything.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            out.push(entry.path());
+        }
+    }
+    out
 }
 
 /// The user-configured tmux socket name (`tmux.socket_name`), if any.
@@ -1415,6 +1486,30 @@ mod tests {
     // (`aoe_`) and debug (`aoe_dev_`) builds. Use the constant so the same
     // test bodies cover both.
     const P: &str = SESSION_PREFIX;
+
+    /// A test may not leave a tmux server running past its own process.
+    ///
+    /// This is the socket counterpart of a fixture-scoped store: the run cleans
+    /// up after itself via `atexit`, and anything that still got away shows up
+    /// here on the NEXT run as a named failure rather than living on invisibly.
+    /// It reports paths, not a count, because the remedy needs the paths.
+    #[test]
+    fn no_unit_test_tmux_server_outlives_its_run() {
+        let orphans = orphaned_unit_test_sockets();
+        assert!(
+            orphans.is_empty(),
+            "{} tmux server(s) outlived the test run that started them. \
+             Each holds whatever sessions those tests spawned, on a private \
+             socket no `tmux ls` will show. Remove with: {}\nOrphans: {:?}",
+            orphans.len(),
+            orphans
+                .iter()
+                .map(|p| format!("tmux -S {} kill-server", p.display()))
+                .collect::<Vec<_>>()
+                .join("; "),
+            orphans,
+        );
+    }
 
     #[test]
     fn test_tmux_command_carries_socket_flag() {
