@@ -5125,6 +5125,45 @@ pub async fn restart_session(
     if !state.power.is_on() {
         return crate::server::power::power_off_response();
     }
+    // Three questions, in widening order: may aoe act at all, may it restart
+    // sessions on its own, and has THIS session had too many. The last one is
+    // the only one a rate cannot answer, which is how 371 accumulated.
+    if !crate::session::config::Config::load_or_warn()
+        .activity
+        .is_on("session_auto_restart")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "activity_class_off",
+                "class": "session_auto_restart",
+                "message": "Automatic session restart is switched off. \
+                            Turn it on with `aoe activity session_auto_restart on`.",
+            })),
+        )
+            .into_response();
+    }
+    if let Err(exhausted) = state.restart_budget.admit(&id) {
+        tracing::warn!(
+            target: "server.restart_budget",
+            session = %id,
+            restarts_in_window = exhausted.restarts_in_window,
+            restarts_total = exhausted.restarts_total,
+            "automatic restart refused: budget exhausted"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "restart_budget_exhausted",
+                "session_id": exhausted.session_id,
+                "restarts_in_window": exhausted.restarts_in_window,
+                "restarts_total": exhausted.restarts_total,
+                "window_minutes": exhausted.window_minutes,
+                "message": exhausted.reason,
+            })),
+        )
+            .into_response();
+    }
 
     {
         let instances = state.instances.read().await;

@@ -4,8 +4,9 @@
 
 use super::FieldDescriptor;
 use crate::session::config::{
-    AcpConfig, AuthConfig, DiffConfig, LoggingConfig, SandboxConfig, SessionConfig, SkillsConfig,
-    TelemetryConfig, ThemeConfig, TmuxConfig, UpdatesConfig, WebConfig, WorktreeConfig,
+    AcpConfig, ActivityConfig, AuthConfig, DiffConfig, LoggingConfig, SandboxConfig, SessionConfig,
+    SkillsConfig, TelemetryConfig, ThemeConfig, TmuxConfig, UpdatesConfig, WebConfig,
+    WorktreeConfig,
 };
 use crate::sound::SoundConfig;
 use crate::status_hooks::StatusHookConfig;
@@ -28,6 +29,7 @@ pub fn schema() -> Vec<FieldDescriptor> {
     out.extend(DiffConfig::settings_descriptors());
     out.extend(SkillsConfig::settings_descriptors());
     out.extend(LoggingConfig::settings_descriptors());
+    out.extend(ActivityConfig::settings_descriptors());
     out
 }
 

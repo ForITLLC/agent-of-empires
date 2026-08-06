@@ -23,6 +23,7 @@ pub mod power;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
+pub(crate) mod restart_budget;
 pub(crate) mod session_service;
 pub(crate) mod session_spawn;
 pub mod tunnel;
@@ -430,6 +431,10 @@ pub struct AppState {
     /// persisted in the app dir; OFF refuses session create, send, ensure,
     /// restart and wake arming, and cancels already-registered wakes.
     pub power: Arc<power::PowerRegistry>,
+    /// Ceiling on daemon-initiated restarts per session (WO#1273 D4). The
+    /// power switch answers whether a restart is allowed AT ALL; this answers
+    /// whether THIS session has had too many, which a rate alone cannot.
+    pub restart_budget: Arc<restart_budget::RestartBudget>,
     /// Cached per-profile cleanup defaults for the delete dialog, with a
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).
@@ -1250,6 +1255,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         power: Arc::new(power::PowerRegistry::load_from_app_dir()),
+        restart_budget: Arc::new(restart_budget::RestartBudget::new()),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
             // forces a fresh resolve instead of handing out an empty map.
@@ -6481,6 +6487,7 @@ pub mod test_support {
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             power: Arc::new(power::PowerRegistry::ephemeral()),
+            restart_budget: Arc::new(restart_budget::RestartBudget::new()),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
                 refreshed_at: std::time::Instant::now(),
                 entries: HashMap::new(),
