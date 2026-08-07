@@ -67,6 +67,20 @@ pub struct PaneRuleConfig {
     /// current blocking state. Empty keeps every match, the prior behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_below: Vec<String>,
+    /// SOFT liveness guards (Line scope only): like `stale_below`, but a
+    /// match voided ONLY by one of these is not proof of replay, because the
+    /// pane layout they describe (an idle composer) is byte-identical for
+    /// replayed scrollback and a REAL standing block; the CLI returns to the
+    /// composer after rendering a cap or auth banner. [`classify`] and
+    /// [`classify_fp`] still treat a soft void as a void, so text-only
+    /// callers keep the conservative answer; the watchdog reads the hit via
+    /// [`classify_fp_admitting`] and decides on temporal evidence (pane pid
+    /// stability, banner edges) instead. WO#1283 D1: the bare-composer guard
+    /// as a HARD void made every idle standing block invisible, which is how
+    /// three monthly-spend blocks in one day reached Ben by manual sweep
+    /// instead of by page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_below_soft: Vec<String>,
     /// Required-liveness guards (Line scope only): the mirror of
     /// `stale_below`. A matched line is voided UNLESS at least one of these
     /// matches a line BELOW it. Use for banners that are only actionable
@@ -149,11 +163,26 @@ pub struct CompiledRule {
     pattern: Regex,
     negative: Vec<Regex>,
     stale_below: Vec<Regex>,
+    stale_below_soft: Vec<Regex>,
     require_below: Vec<Regex>,
     tail_lines: usize,
     scope: RuleScope,
     strip_decoration: bool,
     pub priority: u32,
+}
+
+/// How current a Line-scope match is, given the lines rendered below it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchCurrency {
+    /// Nothing below voids it: authoritative live evidence.
+    Current,
+    /// Voided ONLY by a soft guard (the idle composer). The text alone
+    /// cannot decide replay vs a real standing block here; the watchdog's
+    /// temporal-edge admission can. WO#1283 D1.
+    SoftStale,
+    /// Voided by a hard activity guard, or missing required liveness:
+    /// replayed scrollback, never admissible.
+    Stale,
 }
 
 impl CompiledRule {
@@ -165,17 +194,30 @@ impl CompiledRule {
     /// one line below satisfies one — proof the pane is still in the state
     /// that makes the banner actionable. A match on the very last line has
     /// nothing below it, so it cannot satisfy a `require_below` guard and is
-    /// voided; the next scan sees the settled pane.
-    fn match_is_current(&self, below: &[&str]) -> bool {
-        let not_stale = self.stale_below.is_empty()
-            || !below
-                .iter()
-                .any(|l| self.stale_below.iter().any(|g| g.is_match(l)));
+    /// voided; the next scan sees the settled pane. Soft guards yield
+    /// [`MatchCurrency::SoftStale`]: not current, but not proof of replay.
+    fn match_currency(&self, below: &[&str]) -> MatchCurrency {
+        let hard_stale = below
+            .iter()
+            .any(|l| self.stale_below.iter().any(|g| g.is_match(l)));
         let required_alive = self.require_below.is_empty()
             || below
                 .iter()
                 .any(|l| self.require_below.iter().any(|g| g.is_match(l)));
-        not_stale && required_alive
+        if hard_stale || !required_alive {
+            return MatchCurrency::Stale;
+        }
+        if below
+            .iter()
+            .any(|l| self.stale_below_soft.iter().any(|g| g.is_match(l)))
+        {
+            return MatchCurrency::SoftStale;
+        }
+        MatchCurrency::Current
+    }
+
+    fn match_is_current(&self, below: &[&str]) -> bool {
+        self.match_currency(below) == MatchCurrency::Current
     }
 }
 
@@ -229,6 +271,21 @@ pub fn compile(rules: &[PaneRuleConfig]) -> Vec<CompiledRule> {
                     }
                 }
             }
+            let mut stale_below_soft = Vec::with_capacity(r.stale_below_soft.len());
+            for s in &r.stale_below_soft {
+                match Regex::new(s) {
+                    Ok(g) => stale_below_soft.push(g),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "pane_rules",
+                            rule = %r.name,
+                            error = %e,
+                            "invalid stale_below_soft guard; rule dropped"
+                        );
+                        return None;
+                    }
+                }
+            }
             let mut require_below = Vec::with_capacity(r.require_below.len());
             for s in &r.require_below {
                 match Regex::new(s) {
@@ -250,6 +307,7 @@ pub fn compile(rules: &[PaneRuleConfig]) -> Vec<CompiledRule> {
                 pattern,
                 negative,
                 stale_below,
+                stale_below_soft,
                 require_below,
                 tail_lines: r.tail_lines.max(1),
                 scope: r.scope,
@@ -352,6 +410,49 @@ pub fn classify_fp<'a>(raw: &str, rules: &'a [CompiledRule]) -> Option<(&'a Comp
                     .then(|| (rule, gate_fingerprint(rule, candidate)))
             }),
         }
+    })
+}
+
+/// Like [`classify_fp`], but a Line-scope match voided ONLY by a soft stale
+/// guard (see `stale_below_soft`) is still returned, flagged `true` in the
+/// third slot, instead of silently dropped. Current matches keep absolute
+/// priority: a soft hit is reported only when NO rule in the set has a
+/// current match, so callers that ignore the flag see exactly the
+/// [`classify_fp`] answer. Window-scope rules have no below-lines semantics
+/// and never produce a soft hit. WO#1283 D1: the watchdog admits or holds a
+/// soft hit on temporal evidence, because the idle-composer layout is
+/// identical for replayed scrollback and a real standing block.
+pub fn classify_fp_admitting<'a>(
+    raw: &str,
+    rules: &'a [CompiledRule],
+) -> Option<(&'a CompiledRule, String, bool)> {
+    if let Some((rule, fp)) = classify_fp(raw, rules) {
+        return Some((rule, fp, false));
+    }
+    let stripped = crate::tmux::utils::strip_ansi(raw);
+    let lines: Vec<&str> = stripped
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    rules.iter().find_map(|rule| {
+        if rule.scope != RuleScope::Line {
+            return None;
+        }
+        let window = &lines[lines.len().saturating_sub(rule.tail_lines)..];
+        window.iter().enumerate().find_map(|(idx, line)| {
+            if rule.negative.iter().any(|g| g.is_match(line)) {
+                return None;
+            }
+            let candidate = if rule.strip_decoration {
+                normalize_line(line)
+            } else {
+                line
+            };
+            (rule.pattern.is_match(candidate)
+                && rule.match_currency(&window[idx + 1..]) == MatchCurrency::SoftStale)
+                .then(|| (rule, gate_fingerprint(rule, candidate), true))
+        })
     })
 }
 
@@ -460,14 +561,18 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
                 r"^\s*[⏺●]".into(),
                 r"^\s*⎿".into(),
                 r"(?i)\besc to interrupt\b".into(),
-                // A bare ready prompt (optionally box-bordered) below the
-                // banner means the CLI is idle at its input line, so the
-                // banner is replayed scrollback carried across an
-                // `aoe session move` (the WO#449 bounce loop). The live cap
-                // options modal renders `❯ 1. <option>` with text after the
-                // chevron and never matches this.
-                r"^\s*│?\s*❯\s*│?\s*$".into(),
             ],
+            // A bare ready prompt (optionally box-bordered) below the banner
+            // means the CLI is idle at its input line. That layout is
+            // AMBIGUOUS, not stale: a replayed banner carried across an
+            // `aoe session move` looks like this (the WO#449 bounce loop),
+            // and so does a REAL standing block, because the CLI returns to
+            // the composer after rendering the banner (the three unmissed
+            // monthly-spend blocks of WO#1283). Soft guard: the watchdog
+            // decides on temporal evidence. The live cap options modal
+            // renders `❯ 1. <option>` with text after the chevron and never
+            // matches this.
+            stale_below_soft: vec![r"^\s*│?\s*❯\s*│?\s*$".into()],
             require_below: Vec::new(),
             tail_lines: 30,
             scope: RuleScope::Line,
@@ -485,6 +590,7 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             pattern: r"(?i)microsoft\.com/devicelogin|/login/device|first copy your one-time code|to sign in, use a web browser|enter the code[\s\S]*to authenticate|to authenticate[\s\S]*enter the code".into(),
             negative: Vec::new(),
             stale_below: Vec::new(),
+            stale_below_soft: Vec::new(),
             require_below: Vec::new(),
             tail_lines: 8,
             scope: RuleScope::Window,
@@ -513,6 +619,7 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
             // has a `⎿ Tip:` elbow and the running footer BELOW the banner,
             // so cap-style stale guards would void exactly the live case.
             stale_below: vec![r"^\s*[⏺●]".into()],
+            stale_below_soft: Vec::new(),
             require_below: vec![r"(?i)\besc to interrupt\b".into()],
             tail_lines: 8,
             scope: RuleScope::Line,
@@ -547,6 +654,7 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
                 r#"^\s*[`'"\x{2018}\x{2019}\x{201C}\x{201D}]\s*ACTION REQUIRED"#.into(),
             ],
             stale_below: Vec::new(),
+            stale_below_soft: Vec::new(),
             require_below: Vec::new(),
             tail_lines: 15,
             scope: RuleScope::Line,
@@ -571,15 +679,18 @@ pub fn default_rules() -> Vec<PaneRuleConfig> {
                 // A session narrating what it WOULD do is not logged out.
                 r"(?i)\b(?:i(?:'ll| will)?|we(?:'ll| will)?|should|would|can|could|if you|docs?)\b".into(),
             ],
-            // Same liveness test as the cap banner: an assistant bullet, a tool
-            // elbow, a running footer or a bare ready prompt below it means the
-            // session recovered and this is replayed scrollback.
+            // Same liveness test as the cap banner: an assistant bullet, a
+            // tool elbow or a running footer below it means the session
+            // recovered and this is replayed scrollback. The bare ready
+            // prompt is a SOFT guard for the same reason as the cap rule's:
+            // a logged-out CLI also idles at its composer, so that layout
+            // cannot prove replay by itself (WO#1283 D1).
             stale_below: vec![
                 r"^\s*[\u{23fa}\u{25cf}]".into(),
                 r"^\s*\u{23bf}".into(),
                 r"(?i)\besc to interrupt\b".into(),
-                r"^\s*\u{2502}?\s*\u{276f}\s*\u{2502}?\s*$".into(),
             ],
+            stale_below_soft: vec![r"^\s*\u{2502}?\s*\u{276f}\s*\u{2502}?\s*$".into()],
             require_below: Vec::new(),
             tail_lines: 20,
             scope: RuleScope::Line,
@@ -742,6 +853,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
                 r"(?i)try claude fable".into(),
             ],
             stale_below: Vec::new(),
+            stale_below_soft: Vec::new(),
             require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Window,
@@ -765,6 +877,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
                 r#"(?i)["'`][^"'`\n]{0,30}out of (?:usage )?credits"#.into(),
             ],
             stale_below: Vec::new(),
+            stale_below_soft: Vec::new(),
             require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Window,
@@ -787,6 +900,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
                 COMMANDER_SIGNED_LINE.into(),
             ],
             stale_below: vec![COMMANDER_SIGNED_LINE.into()],
+            stale_below_soft: Vec::new(),
             require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Line,
@@ -805,6 +919,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
             pattern: r"(?i)\b(?:re-?launch(?:ed|ing)?|restart(?:ed|ing)?|fell back|fall(?:ing)? back|fallback|drop(?:ped|ping)? (?:down |back )?to|switch(?:ed|ing)? (?:to|onto)|revert(?:ed|ing)? to|downgrad(?:ed|e|ing)? to|bumped? down to|kicked (?:it )?(?:down|over) to|moved? (?:down |back )?to)\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus)\b".into(),
             negative: vec![FABLE_NEGATED_CONTEXT.into(), COMMANDER_SIGNED_LINE.into()],
             stale_below: vec![COMMANDER_SIGNED_LINE.into()],
+            stale_below_soft: Vec::new(),
             require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Line,
@@ -821,6 +936,7 @@ pub fn fable_drift_rules() -> Vec<PaneRuleConfig> {
             pattern: r"(?i)(?:\b(?:claude-)?(?:sonnet|opus)\b[^\n]{0,20}\bsub-?agents?\b|\bsub-?agents?\b[^\n]{0,25}\b(?:claude-)?(?:sonnet|opus)\b|task\([^\n]{0,60}\b(?:claude-)?(?:sonnet|opus)\b)".into(),
             negative: vec![FABLE_NEGATED_CONTEXT.into(), COMMANDER_SIGNED_LINE.into()],
             stale_below: vec![COMMANDER_SIGNED_LINE.into()],
+            stale_below_soft: Vec::new(),
             require_below: Vec::new(),
             tail_lines: 25,
             scope: RuleScope::Line,
@@ -842,12 +958,96 @@ mod tests {
             pattern: pattern.into(),
             negative: Vec::new(),
             stale_below: Vec::new(),
+            stale_below_soft: Vec::new(),
             require_below: Vec::new(),
             tail_lines: default_tail_lines(),
             scope: RuleScope::Line,
             strip_decoration: true,
             priority: 0,
             enabled: true,
+        }
+    }
+
+    // ---- Soft-void admission (WO#1283 D1) ------------------------------------
+
+    /// Real pane tail captured 2026-08-06 from a monthly-spend-blocked
+    /// session (flp-Platform): the class-3 banner renders as a result elbow
+    /// under the submitted command, then the CLI idles at its composer.
+    const SPEND_BLOCK_TAIL: &str = "\
+\u{276f} /compact
+  ⎿  Error during compaction: You've hit your monthly spend limit. Run /usage-credits to manage your limit and keep using Fable 5 or switch
+     models to continue this chat.
+\u{2500}\u{2500}\u{2500}\u{2500}
+\u{276f}
+\u{2500}\u{2500}\u{2500}\u{2500}
+  5h 0% \u{b7} wk 58%
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)
+";
+
+    /// Real pane tail captured 2026-08-06 from a credit-out session
+    /// (for-AVP): the class-2 banner elbow after a resume line, a zero-work
+    /// turn marker, the task list, then the idle composer.
+    const CREDIT_OUT_TAIL: &str = "\
+\u{2733} Claude resuming /loop wakeup (Aug 6 4:59pm)
+  ⎿  You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.
+\u{2733} Worked for 0s
+  2 tasks (1 done, 1 open)
+\u{2500}\u{2500}\u{2500}\u{2500}
+\u{276f}
+\u{2500}\u{2500}\u{2500}\u{2500}
+  5h 77% \u{b7} wk 54%
+";
+
+    #[test]
+    fn composer_idle_banner_is_soft_hit_not_void() {
+        // Both real standing blocks were invisible to classify/classify_fp
+        // (the bare-composer guard voided them, the WO#1283 D1 silence);
+        // classify_fp_admitting must surface each as a SOFT usage-cap hit.
+        let rules = compile(&default_rules());
+        for (label, tail) in [("spend", SPEND_BLOCK_TAIL), ("credit", CREDIT_OUT_TAIL)] {
+            assert!(classify(tail, &rules).is_none(), "{label}: hard classify");
+            assert!(classify_fp(tail, &rules).is_none(), "{label}: classify_fp");
+            let (rule, fp, soft) =
+                classify_fp_admitting(tail, &rules).unwrap_or_else(|| panic!("{label}: no hit"));
+            assert_eq!(rule.name, "usage-cap", "{label}");
+            assert!(soft, "{label}: must be flagged soft");
+            assert!(!fp.is_empty(), "{label}: fingerprint");
+        }
+    }
+
+    #[test]
+    fn admitting_agrees_with_classify_fp_on_current_and_hard_stale() {
+        let rules = compile(&default_rules());
+        // A live banner with nothing below it: current hit, soft=false.
+        let live = "  ⎿  You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.";
+        let (rule, _, soft) = classify_fp_admitting(live, &rules).expect("live hit");
+        assert_eq!(rule.name, "usage-cap");
+        assert!(!soft, "current match must not be flagged soft");
+        // Hard-voided: an assistant bullet below the banner proves the
+        // session resumed; both surfaces stay silent.
+        let resumed = "You've hit your monthly spend limit. Run /usage-credits to continue.\n\u{23fa} Reading files...\n";
+        assert!(classify_fp(resumed, &rules).is_none());
+        assert!(classify_fp_admitting(resumed, &rules).is_none());
+    }
+
+    #[test]
+    fn discussion_of_a_banner_is_not_a_banner() {
+        // A pane DISCUSSING the spend-limit string (a WO analysis, a report)
+        // must not fire even via the admitting surface: mid-line mentions
+        // fail the line anchor, and a quoted line fails the quoted-template
+        // negative guard. The Commander's sweep false-flagged this session's
+        // own analysis prose; the rule engine must not repeat that.
+        let rules = compile(&default_rules());
+        let cases = [
+            "each answered by /usage-credits to adjust your monthly spend limit and nothing else\n\u{276f} \n",
+            "  \"You've hit your monthly spend limit\" appeared twice today\n\u{276f} \n",
+            "  `run /usage-credits to manage your limit` is the class-3 string\n\u{276f} \n",
+        ];
+        for tail in cases {
+            assert!(
+                classify_fp_admitting(tail, &rules).is_none(),
+                "prose fired: {tail:?}"
+            );
         }
     }
 

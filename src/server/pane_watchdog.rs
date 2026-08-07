@@ -434,8 +434,14 @@ pub(crate) enum Disposition {
     /// serving evidence: ignored, headroom kept, never a page.
     ReplayedBanner { why: &'static str },
     /// A Fable-pinned session showing off-Fable drift (silent limit,
-    /// downgrade announcement, or non-Fable subagent).
-    FableDrift { rule: String, paged: bool },
+    /// downgrade announcement, or non-Fable subagent). `why` names the
+    /// specific no-page path when `paged` is false, so the classification log
+    /// distinguishes a voided page from a dampened one.
+    FableDrift {
+        rule: String,
+        paged: bool,
+        why: &'static str,
+    },
     /// Capped with no verified-headroom relocation target: parked.
     Parked {
         kind: &'static str,
@@ -539,11 +545,11 @@ impl Disposition {
             Disposition::ReplayedBanner { why } => {
                 format!("replayed scrollback banner ({why}), headroom kept, no page")
             }
-            Disposition::FableDrift { rule, paged } => {
+            Disposition::FableDrift { rule, paged, why } => {
                 if *paged {
                     format!("off-Fable drift [{rule}], Commander paged")
                 } else {
-                    format!("off-Fable drift [{rule}], already surfaced, holding")
+                    format!("off-Fable drift [{rule}], no page: {why}")
                 }
             }
             Disposition::Parked { all_probed, .. } => {
@@ -813,6 +819,18 @@ pub(crate) fn spawn_pane_watchdog(state: Arc<super::AppState>) {
     );
 }
 
+/// A soft-stale rule hit at the pane edge: real banner text sitting above an
+/// idle composer, a layout IDENTICAL for replayed scrollback and a live
+/// standing block. The watchdog admits or holds it on temporal evidence
+/// across ticks (pane pid, fingerprint, working history), never on the text
+/// alone. WO#1283 D1.
+struct StaleHit {
+    signal: PaneSignal,
+    fp: String,
+    /// Cap family named by the banner when `signal` is `Capped`, else `None`.
+    cap_kind: Option<capacity::CapKind>,
+}
+
 struct PaneScan {
     id: String,
     title: String,
@@ -855,6 +873,17 @@ struct PaneScan {
     /// `None` when the footer has scrolled out of the captured tail. Belongs
     /// to the ACCOUNT; the pane is only where it happened to be visible.
     usage: Option<crate::pane_rules::UsageMeter>,
+    /// Soft-stale rule hit pending the watchdog's temporal admission pass,
+    /// else `None`. Mutually exclusive with `signal` (a current hit always
+    /// wins inside `classify_fp_admitting`). WO#1283 D1.
+    stale_hit: Option<StaleHit>,
+    /// The tmux pane's shell PID at capture time. A changed pid between
+    /// ticks voids stale-banner admission: a respawned pane replays its
+    /// predecessor's scrollback.
+    pane_pid: Option<u32>,
+    /// Why a soft-stale hit was HELD rather than admitted this tick, else
+    /// `None`. Set by the admission pass; classification-log column.
+    stale_held: Option<&'static str>,
 }
 
 /// Capture and classify every registered non-structured session's pane tail.
@@ -874,77 +903,179 @@ fn scan_panes(
         }
     };
     let mut serving: HashSet<String> = HashSet::new();
-    let scans = instances
-        .iter()
-        .filter(|inst| !inst.is_structured())
-        .filter_map(|inst| {
-            let sess = inst.tmux_session().ok()?;
-            if !sess.exists() {
-                return None;
+    // Profile model pins are resolved from profile config once per
+    // (profile, tool) pair per tick, not once per session.
+    let mut pin_memo: HashMap<(String, String), Option<String>> = HashMap::new();
+    let mut scans = Vec::new();
+    for inst in instances.iter().filter(|inst| !inst.is_structured()) {
+        let Ok(sess) = inst.tmux_session() else {
+            continue;
+        };
+        if !sess.exists() {
+            continue;
+        }
+        let Ok(content) = sess.capture_pane(60) else {
+            continue;
+        };
+        // Serving evidence is collected for EVERY captured pane, before
+        // any signal handling: a working pane with no signal at all is
+        // exactly the proof that its profile serves (WO#445).
+        let working = pane_is_actively_working(&content);
+        if working {
+            serving.insert(inst.source_profile.clone());
+        }
+        // classify_fp_admitting yields the winning rule AND its churn-stable
+        // content fingerprint in one pass; keep the fp only for the
+        // ActionRequired signal (the sole content-gated path, WO #139) and
+        // the Capped signal (the replayed-banner discriminator, WO#445). A
+        // soft hit (banner above an idle composer) is split off for the
+        // temporal admission pass instead of being treated as live.
+        let (hit, stale_hit) = match pane_rules::classify_fp_admitting(&content, rules) {
+            Some((rule, fp, true)) => {
+                let soft = kind_to_signal(&rule.kind).map(|signal| StaleHit {
+                    signal,
+                    fp,
+                    cap_kind: (signal == PaneSignal::Capped)
+                        .then(|| capacity::classify_cap_kind(&content)),
+                });
+                (None, soft)
             }
-            let content = sess.capture_pane(60).ok()?;
-            // Serving evidence is collected for EVERY captured pane, before
-            // any signal handling: a working pane with no signal at all is
-            // exactly the proof that its profile serves (WO#445).
-            let working = pane_is_actively_working(&content);
-            if working {
-                serving.insert(inst.source_profile.clone());
-            }
-            // classify_fp yields the winning rule AND its churn-stable content
-            // fingerprint in one pass; keep the fp only for the ActionRequired
-            // signal (the sole content-gated path, WO #139) and the Capped
-            // signal (the replayed-banner discriminator, WO#445).
-            let hit = pane_rules::classify_fp(&content, rules);
-            let signal = hit.as_ref().and_then(|(r, _)| kind_to_signal(&r.kind));
-            let cap_kind = match signal {
-                Some(PaneSignal::Capped) => Some(capacity::classify_cap_kind(&content)),
-                _ => None,
-            };
-            let cap_fp = match (signal, &hit) {
-                (Some(PaneSignal::Capped), Some((_, fp))) => Some(fp.clone()),
-                _ => None,
-            };
-            let action_fp = match (signal, &hit) {
-                (Some(PaneSignal::ActionRequired), Some((_, fp))) => Some(fp.clone()),
-                _ => None,
-            };
-            // Cross-surfacer claim key (MIT-1): prefer the labelled gate id from
-            // the pane (shared across all four notifiers for an outward-comms
-            // gate), else the watchdog's own session+fingerprint fallback.
-            let surface_key = action_fp
+            Some((rule, fp, false)) => (Some((rule, fp)), None),
+            None => (None, None),
+        };
+        let signal = hit.as_ref().and_then(|(r, _)| kind_to_signal(&r.kind));
+        let cap_kind = match signal {
+            Some(PaneSignal::Capped) => Some(capacity::classify_cap_kind(&content)),
+            _ => None,
+        };
+        let cap_fp = match (signal, &hit) {
+            (Some(PaneSignal::Capped), Some((_, fp))) => Some(fp.clone()),
+            _ => None,
+        };
+        let action_fp = match (signal, &hit) {
+            (Some(PaneSignal::ActionRequired), Some((_, fp))) => Some(fp.clone()),
+            _ => None,
+        };
+        // Cross-surfacer claim key (MIT-1): prefer the labelled gate id from
+        // the pane (shared across all four notifiers for an outward-comms
+        // gate), else the watchdog's own session+fingerprint fallback.
+        let surface_key =
+            action_fp
                 .as_ref()
                 .map(|fp| match ben_gate_surface::extract_gate_id(&content) {
                     Some(g) => format!("gate:{g}"),
                     None => format!("sess:{}|fp:{}", inst.id, fp),
                 });
-            // The leading indicator, read from the same capture as the rules.
-            // Present on every healthy pane, long before any banner exists.
-            let usage = pane_rules::parse_usage_meter(&content);
-            let drift = charter_drift::detect(&inst.title, &inst.project_path, &content);
-            // Fable model-drift is gated on the session's own model pin, so a
-            // non-Fable session's Sonnet/Opus subagent never fires here.
-            let fable_hit = fable_scan_hit(&inst.extra_args, &content);
-            // EVERY captured live session yields a scan row, healthy or not:
-            // the per-tick classification log must show a line per session so
-            // silent misses are visible, not inferred from absence (WO#450).
-            Some(PaneScan {
-                id: inst.id.clone(),
-                title: inst.title.clone(),
-                profile: inst.source_profile.clone(),
-                signal,
-                cap_kind,
-                cap_fp,
-                action_fp,
-                surface_key,
-                drift,
-                fable_hit,
-                model: pane_rules::model_pin(&inst.extra_args).unwrap_or_else(|| "-".into()),
-                working,
-                usage,
+        // The leading indicator, read from the same capture as the rules.
+        // Present on every healthy pane, long before any banner exists.
+        let usage = pane_rules::parse_usage_meter(&content);
+        let drift = charter_drift::detect(&inst.title, &inst.project_path, &content);
+        // Fable model-drift and the model column are gated on the session's
+        // EFFECTIVE pin, not raw extra_args: an unpinned session on a
+        // Fable-pinned profile launches on Fable, so its drift matters just
+        // as much (WO#1283 D1: for-AVP sat session-unpinned on a pinned
+        // profile and every drift scan stayed silent).
+        let profile_pin = pin_memo
+            .entry((inst.effective_profile(), inst.tool.clone()))
+            .or_insert_with_key(|(profile, tool)| {
+                crate::session::profile_config::resolve_config_or_warn(profile)
+                    .session
+                    .agent_extra_args
+                    .get(tool)
+                    .cloned()
             })
-        })
-        .collect();
+            .clone();
+        let pin_args = effective_pin_args(&inst.extra_args, profile_pin.as_deref());
+        let fable_hit = fable_scan_hit(&pin_args, &content);
+        // EVERY captured live session yields a scan row, healthy or not:
+        // the per-tick classification log must show a line per session so
+        // silent misses are visible, not inferred from absence (WO#450).
+        scans.push(PaneScan {
+            id: inst.id.clone(),
+            title: inst.title.clone(),
+            profile: inst.source_profile.clone(),
+            signal,
+            cap_kind,
+            cap_fp,
+            action_fp,
+            surface_key,
+            drift,
+            fable_hit,
+            model: pane_rules::model_pin(&pin_args).unwrap_or_else(|| "-".into()),
+            working,
+            usage,
+            stale_hit,
+            pane_pid: crate::process::get_pane_pid(sess.name()),
+            stale_held: None,
+        });
+    }
     (scans, serving)
+}
+
+/// The extra_args string that carries a session's EFFECTIVE model pin: the
+/// session's own args when they hold an explicit `--model` / `-m` flag (a
+/// set-model escalation or user-typed pin), else the profile's
+/// `session.agent_extra_args` pin for the tool (what a terminal launch would
+/// inject), else empty. Mirrors `launch_model_flag_injection` precedence.
+fn effective_pin_args(session_extra_args: &str, profile_pin: Option<&str>) -> String {
+    if crate::session::config::has_model_flag(session_extra_args) {
+        return session_extra_args.to_string();
+    }
+    profile_pin.map(str::to_string).unwrap_or_default()
+}
+
+/// What one pane looked like on the PREVIOUS watchdog tick, for stale-banner
+/// admission (WO#1283 D1). In-memory only, deliberately not persisted: after
+/// a daemon bounce the map is empty, so a standing banner waits one tick to
+/// re-establish pane continuity instead of being trusted off replayed
+/// scrollback.
+struct PaneTickMemory {
+    pane_pid: Option<u32>,
+    /// The banner fingerprint this pane showed last tick, live or
+    /// soft-stale, else `None`.
+    cap_fp: Option<String>,
+    working: bool,
+    profile: String,
+}
+
+/// Decide whether a soft-stale banner (real banner text above an idle
+/// composer) is a live standing block or replayed scrollback. The TEXT
+/// cannot discriminate: a substring match cannot separate a banner from a
+/// discussion of a banner, and the idle-composer layout is identical for
+/// both. Continuity across ticks can. `Ok` admits and names the admitting
+/// edge; `Err` holds and names the missing evidence.
+///
+/// Admission requires the same pane pid and profile as last tick, and then
+/// one of: the banner just appeared (fresh edge), the banner text changed,
+/// or the same banner stood while the pane was idle on BOTH sightings. A
+/// pane that served during the window disproves the block it claims.
+fn admit_stale_banner(
+    prev: Option<&PaneTickMemory>,
+    pid: Option<u32>,
+    fp: &str,
+    profile: &str,
+    working: bool,
+) -> Result<&'static str, &'static str> {
+    let Some(prev) = prev else {
+        return Err("idle-composer-first-sighting");
+    };
+    if pid.is_none() || prev.pane_pid != pid {
+        return Err("idle-composer-pane-changed");
+    }
+    if prev.profile != profile {
+        return Err("idle-composer-pre-move");
+    }
+    match prev.cap_fp.as_deref() {
+        None => Ok("fresh-edge"),
+        Some(prev_fp) if prev_fp == fp => {
+            if !working && !prev.working {
+                Ok("standing-idle")
+            } else {
+                Err("idle-composer-serving-during-window")
+            }
+        }
+        Some(_) => Ok("banner-changed"),
+    }
 }
 
 struct Watchdog {
@@ -995,6 +1126,9 @@ struct Watchdog {
     /// Keyed by ACCOUNT, never by session: one account has one meter however
     /// many panes render it.
     last_usage_above: HashMap<(String, &'static str), bool>,
+    /// Per-pane snapshot of the previous tick, feeding [`admit_stale_banner`].
+    /// In-memory only (see [`PaneTickMemory`]).
+    pane_memory: HashMap<String, PaneTickMemory>,
 }
 
 impl Watchdog {
@@ -1011,13 +1145,14 @@ impl Watchdog {
             last_non_pool_page: load_non_pool_page(),
             last_event_state: HashMap::new(),
             last_usage_above: HashMap::new(),
+            pane_memory: HashMap::new(),
         }
     }
 
     async fn tick(&mut self, state: &Arc<super::AppState>) {
         let file_watch = state.file_watch.clone();
         let rules = self.rules.clone();
-        let (scans, serving) = match tokio::task::spawn_blocking(move || {
+        let (mut scans, serving) = match tokio::task::spawn_blocking(move || {
             scan_panes(&file_watch, &rules)
         })
         .await
@@ -1047,6 +1182,61 @@ impl Watchdog {
         // banner's first-seen doesn't linger to misdate a future one. WO#445.
         self.last_cap_fp
             .retain(|_, c| now.duration_since(c.seen) < ACTION_FP_TTL);
+
+        // WO#1283 D1: temporal admission of soft-stale hits, BEFORE the
+        // WO#445 discriminator so an admitted banner faces the same
+        // serving/pre-grant gates as a hard live one. An admitted hit is
+        // promoted to this scan's live signal; a held one only annotates
+        // the classification row.
+        for scan in &mut scans {
+            let Some(hit) = &scan.stale_hit else {
+                continue;
+            };
+            let verdict = admit_stale_banner(
+                self.pane_memory.get(&scan.id),
+                scan.pane_pid,
+                &hit.fp,
+                &scan.profile,
+                scan.working,
+            );
+            let (signal, fp, cap_kind) = (hit.signal, hit.fp.clone(), hit.cap_kind);
+            match verdict {
+                Ok(edge) => {
+                    tracing::info!(
+                        target: "server.pane_watchdog",
+                        id = %scan.id,
+                        profile = %scan.profile,
+                        edge,
+                        "soft-stale banner admitted as live on temporal evidence (WO#1283 D1)"
+                    );
+                    scan.signal = Some(signal);
+                    if signal == PaneSignal::Capped {
+                        scan.cap_kind = cap_kind;
+                        scan.cap_fp = Some(fp);
+                    }
+                }
+                Err(why) => scan.stale_held = Some(why),
+            }
+        }
+        // Rebuild the per-pane memory from what THIS tick actually saw,
+        // admitted or held: next tick's admission compares against it.
+        self.pane_memory = scans
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    PaneTickMemory {
+                        pane_pid: s.pane_pid,
+                        cap_fp: s
+                            .cap_fp
+                            .clone()
+                            .or_else(|| s.stale_hit.as_ref().map(|h| h.fp.clone())),
+                        working: s.working,
+                        profile: s.profile.clone(),
+                    },
+                )
+            })
+            .collect();
 
         // WO#445: discriminate LIVE cap banners from replayed scrollback
         // BEFORE any revocation. The capacity state is loaded once here so
@@ -1187,19 +1377,24 @@ impl Watchdog {
                 ),
                 None => None,
             };
-            let disp = match scan.signal {
+            let disp = match (scan.signal, scan.stale_held) {
+                // A soft-stale hit held by the admission pass (WO#1283 D1):
+                // banner text above an idle composer with no temporal proof
+                // of a live block. Logged with the specific missing
+                // evidence, never paged.
+                (None, Some(why)) => Disposition::ReplayedBanner { why },
                 // A signal-bearing pane's disposition wins the row; a pure
                 // Fable drift (no cap/auth/gate signal) reports as drift.
-                None => fable_disp.unwrap_or(Disposition::Serving),
+                (None, None) => fable_disp.unwrap_or(Disposition::Serving),
                 // A suppressed cap banner is stale scrollback or contradicted
                 // by live serving evidence (WO#445): no red row, no relocation.
-                Some(PaneSignal::Capped) if banner_suppressed => Disposition::ReplayedBanner {
+                (Some(PaneSignal::Capped), _) if banner_suppressed => Disposition::ReplayedBanner {
                     why: suppressed_caps
                         .get(&scan.id)
                         .copied()
                         .unwrap_or("suppressed"),
                 },
-                Some(signal) => self.handle_signal(&scan, signal, now).await,
+                (Some(signal), _) => self.handle_signal(&scan, signal, now).await,
             };
             // Push, at the moment of detection. The classification row below
             // is the record; this is the notification, and it goes out whether
@@ -1465,6 +1660,7 @@ impl Watchdog {
             return Disposition::FableDrift {
                 rule: rule.to_string(),
                 paged: false,
+                why: "contradicted by live serving or suppressed-banner evidence",
             };
         }
         // WO#535 defect 2: cap-class hits belong to the capacity sentinel,
@@ -1487,6 +1683,7 @@ impl Watchdog {
                 return Disposition::FableDrift {
                     rule: rule.to_string(),
                     paged: false,
+                    why: "deferred to capacity sentinel, pool not proven dry",
                 };
             }
         }
@@ -1514,6 +1711,11 @@ impl Watchdog {
         Disposition::FableDrift {
             rule: rule.to_string(),
             paged: should,
+            why: if should {
+                "new drift fingerprint"
+            } else {
+                "already surfaced, unchanged fingerprint"
+            },
         }
     }
 
@@ -2029,6 +2231,15 @@ const URGENT_TTL_OVERLOAD: Duration = Duration::from_secs(5 * 60);
 
 /// Mirror a pane signal into the instance's hook attention.json (red row in
 /// the TUI). Fail-open: an unwritable status dir logs and skips.
+///
+/// Deliberately tmpfs-only; the durable record marker (`Instance::urgent_at`,
+/// WO#1283A) is NOT stamped here. Watchdog urgents are TTL-scoped transients
+/// (cap/auth/overload) that self-clear after recovery and are cleared by a
+/// genuine Ben prompt, while the record marker is cleared only via
+/// `PATCH /api/sessions/{id}/urgent`; stamping it per tick would pin rows
+/// red past recovery and break the Ben-clears flow. Nothing is lost across
+/// a restart or move: the watchdog re-detects a still-live condition from
+/// pane text and re-stamps within one tick.
 fn mirror_urgent(scan: &PaneScan, signal: PaneSignal) {
     let (kind, ttl, what) = match signal {
         PaneSignal::Capped => ("cap", URGENT_TTL_BLOCKED, "usage/session cap banner"),
@@ -3413,6 +3624,7 @@ and enter the code H7Q2K9F4P to authenticate.
         let disp = Disposition::FableDrift {
             rule: "fable-subagent-model".into(),
             paged: true,
+            why: "new drift fingerprint",
         };
         assert_eq!(disp.state(), "SUBAGENT-model-drift");
         assert_eq!(disp.decision(), "page-commander");
@@ -3421,13 +3633,179 @@ and enter the code H7Q2K9F4P to authenticate.
             "{}",
             disp.reason()
         );
-        // A standing, already-paged drift keeps the state but holds the page.
-        let held = Disposition::FableDrift {
-            rule: "fable-subagent-model".into(),
-            paged: false,
-        };
-        assert_eq!(held.state(), "SUBAGENT-model-drift");
-        assert_eq!(held.decision(), "none");
+        // Each no-page path names itself in the reason so the classification
+        // log distinguishes voided, deferred, and dampened holds.
+        for why in [
+            "contradicted by live serving or suppressed-banner evidence",
+            "deferred to capacity sentinel, pool not proven dry",
+            "already surfaced, unchanged fingerprint",
+        ] {
+            let held = Disposition::FableDrift {
+                rule: "fable-subagent-model".into(),
+                paged: false,
+                why,
+            };
+            assert_eq!(held.state(), "SUBAGENT-model-drift");
+            assert_eq!(held.decision(), "none");
+            assert!(held.reason().contains(why), "{}", held.reason());
+        }
+    }
+
+    #[test]
+    fn admit_stale_banner_requires_pane_continuity() {
+        // WO#1283 D1: the idle-composer layout is identical for replayed
+        // scrollback and a live standing block, so admission runs on
+        // temporal evidence alone. One row per evidence shape.
+        let mem =
+            |pid: Option<u32>, fp: Option<&str>, working: bool, profile: &str| PaneTickMemory {
+                pane_pid: pid,
+                cap_fp: fp.map(str::to_string),
+                working,
+                profile: profile.into(),
+            };
+        let cases: [(
+            Option<PaneTickMemory>,
+            Option<u32>,
+            &str,
+            &str,
+            bool,
+            Result<&str, &str>,
+        ); 9] = [
+            // Never seen this pane (fresh daemon): replayed scrollback is
+            // indistinguishable, hold a tick.
+            (
+                None,
+                Some(7),
+                "fp-a",
+                "p",
+                false,
+                Err("idle-composer-first-sighting"),
+            ),
+            // Pane pid changed: a respawned pane replays its predecessor's
+            // scrollback.
+            (
+                Some(mem(Some(6), Some("fp-a"), false, "p")),
+                Some(7),
+                "fp-a",
+                "p",
+                false,
+                Err("idle-composer-pane-changed"),
+            ),
+            // Pid unresolvable this tick: continuity unproven.
+            (
+                Some(mem(Some(7), Some("fp-a"), false, "p")),
+                None,
+                "fp-a",
+                "p",
+                false,
+                Err("idle-composer-pane-changed"),
+            ),
+            // Session moved profiles between ticks: the banner belongs to
+            // the account it was captured under, not the new one.
+            (
+                Some(mem(Some(7), Some("fp-a"), false, "old")),
+                Some(7),
+                "fp-a",
+                "p",
+                false,
+                Err("idle-composer-pre-move"),
+            ),
+            // Same pane, no banner last tick: the banner just APPEARED at
+            // an idle edge, which is exactly how a live block arrives.
+            (
+                Some(mem(Some(7), None, false, "p")),
+                Some(7),
+                "fp-a",
+                "p",
+                false,
+                Ok("fresh-edge"),
+            ),
+            // Same banner stood across the window with the pane idle on
+            // both sightings: a standing block, admit.
+            (
+                Some(mem(Some(7), Some("fp-a"), false, "p")),
+                Some(7),
+                "fp-a",
+                "p",
+                false,
+                Ok("standing-idle"),
+            ),
+            // The pane SERVED during the window: the block it claims is
+            // disproven, hold.
+            (
+                Some(mem(Some(7), Some("fp-a"), true, "p")),
+                Some(7),
+                "fp-a",
+                "p",
+                false,
+                Err("idle-composer-serving-during-window"),
+            ),
+            (
+                Some(mem(Some(7), Some("fp-a"), false, "p")),
+                Some(7),
+                "fp-a",
+                "p",
+                true,
+                Err("idle-composer-serving-during-window"),
+            ),
+            // The banner text CHANGED under a stable pane: fresh content is
+            // fresh evidence.
+            (
+                Some(mem(Some(7), Some("fp-old"), false, "p")),
+                Some(7),
+                "fp-a",
+                "p",
+                false,
+                Ok("banner-changed"),
+            ),
+        ];
+        for (prev, pid, fp, profile, working, expected) in &cases {
+            assert_eq!(
+                admit_stale_banner(prev.as_ref(), *pid, fp, profile, *working),
+                *expected,
+                "prev={:?} pid={pid:?} fp={fp} profile={profile} working={working}",
+                prev.as_ref().map(|m| (
+                    m.pane_pid,
+                    m.cap_fp.as_deref(),
+                    m.working,
+                    m.profile.as_str()
+                )),
+            );
+        }
+    }
+
+    #[test]
+    fn effective_pin_args_prefers_session_model_flag() {
+        // WO#1283 D1 (for-AVP silence): an unpinned session on a pinned
+        // profile launches on the profile's model, so the profile pin is
+        // the effective pin whenever the session's own args carry no
+        // --model / -m flag.
+        let cases = [
+            (
+                "--model claude-fable-5[1m]",
+                Some("--model opus"),
+                "--model claude-fable-5[1m]",
+            ),
+            (
+                "--continue",
+                Some("--model claude-fable-5[1m]"),
+                "--model claude-fable-5[1m]",
+            ),
+            (
+                "",
+                Some("--model claude-fable-5[1m]"),
+                "--model claude-fable-5[1m]",
+            ),
+            ("--continue", None, ""),
+            ("", None, ""),
+        ];
+        for (session, profile, expected) in cases {
+            assert_eq!(
+                effective_pin_args(session, profile),
+                expected,
+                "{session:?} / {profile:?}"
+            );
+        }
     }
 
     #[test]
@@ -3897,6 +4275,7 @@ ACTION REQUIRED (Ben): approve the Ramp device login for gna-finance
                 Disposition::FableDrift {
                     rule: "fable-credit-out".into(),
                     paged: false,
+                    why: "already surfaced, unchanged fingerprint",
                 },
                 Some("model_drift"),
             ),

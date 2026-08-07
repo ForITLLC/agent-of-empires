@@ -52,23 +52,27 @@ impl CapKind {
     }
 }
 
-/// Classify which cap family a pane tail's banner belongs to. Fable is
-/// checked first because its banners can also name a week ("hit your Fable
-/// usage limit for the week"): the model credit pool is the operative
-/// constraint there, not the account week.
+/// Classify which cap family a pane tail's banner belongs to. The explicit
+/// clock names win over the Fable heuristic: the real class-3 banner reads
+/// "hit your monthly spend limit ... keep using Fable 5", so a Fable-first
+/// check classified every spend ceiling as a model credit pool and the
+/// spend arm was unreachable on live banner text (WO#1283A, three missed
+/// spend blocks on 2026-08-06). Fable still wins over a bare week mention
+/// inside its own banner ("hit your Fable usage limit for the week"): that
+/// phrasing names no "weekly limit", so the weekly arm does not fire.
 pub fn classify_cap_kind(content: &str) -> CapKind {
     let lower = content.to_ascii_lowercase();
     let fable_capped = (lower.contains("fable")
         && (lower.contains("limit") || lower.contains("credit")))
         || lower.contains("out of usage credits");
-    if fable_capped {
-        CapKind::Fable
+    if lower.contains("monthly spend") {
+        CapKind::MonthlySpend
     } else if lower.contains("weekly limit") {
         CapKind::Weekly
-    } else if lower.contains("monthly spend") {
-        CapKind::MonthlySpend
     } else if lower.contains("session limit") || lower.contains("5-hour limit") {
         CapKind::Session
+    } else if fable_capped {
+        CapKind::Fable
     } else {
         CapKind::Unknown
     }
@@ -409,6 +413,18 @@ mod tests {
     fn classify_monthly_spend() {
         assert_eq!(
             classify_cap_kind("Your account reached its monthly spend limit."),
+            CapKind::MonthlySpend
+        );
+        // The real class-3 banner names Fable in its remediation sentence
+        // ("keep using Fable 5"), so the spend check must outrank the Fable
+        // check or this arm is unreachable (WO#1283 D1, live exemplar from
+        // session 8ceba7aa8b234910).
+        assert_eq!(
+            classify_cap_kind(
+                "You've hit your monthly spend limit. Run /usage-credits to \
+                 manage your limit and keep using Fable 5 or switch models to \
+                 continue this chat."
+            ),
             CapKind::MonthlySpend
         );
     }
