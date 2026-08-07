@@ -1848,6 +1848,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(api::attach_session_project),
         )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
+        .route(
+            "/api/sessions/{id}/urgent",
+            patch(api::update_session_urgent),
+        )
         .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",
@@ -2696,6 +2700,10 @@ const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("PATCH", "/api/capacity"),
     ("PATCH", "/api/capacity/{profile}"),
     ("PATCH", "/api/sessions/{id}/goal"),
+    // Urgent is fleet-attention control-plane state (drives the Commander /
+    // operator wake surfaces), not per-session viewer metadata; withheld for
+    // the same reason goal is.
+    ("PATCH", "/api/sessions/{id}/urgent"),
     ("POST", "/api/mcp-surface"),
     ("POST", "/api/wakes"),
     ("POST", "/api/sessions/{id}/restart"),

@@ -135,13 +135,16 @@ pub struct SessionResponse {
     /// sidebar context menu or `aoe session color`. See #2383.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
-    /// True when the agent has flagged this session as urgent via the
-    /// `attention-urgent` hook (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`
-    /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
-    /// urgent rows above all non-urgent ones within their triage tier,
-    /// matching the TUI's `attention_session_key` urgent-bias. `is_urgent()`
-    /// returns false for archived/snoozed sessions, so a sunk row never
-    /// claws back to the top. See #1640.
+    /// True when the session is urgent from either source that feeds
+    /// `Instance::is_urgent()`: the durable record marker (`urgent_at`, set
+    /// and cleared only via `PATCH /api/sessions/{id}/urgent`; survives
+    /// restart/rebind/move) or the transient `attention-urgent` hook flag
+    /// (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`; TTL-scoped
+    /// tmpfs). The web sidebar's Attention sort floats urgent rows above
+    /// all non-urgent ones within their triage tier, matching the TUI's
+    /// `attention_session_key` urgent-bias. `is_urgent()` returns false for
+    /// archived/snoozed sessions, so a sunk row never claws back to the
+    /// top. See #1640.
     pub urgent: bool,
     /// RFC3339 timestamp at which the session was web-pinned, or omitted
     /// when not pinned. Distinct from `favorited`: favorite is the TUI
@@ -3899,6 +3902,17 @@ pub struct UpdateSnoozeBody {
 }
 
 #[derive(Deserialize)]
+pub struct UpdateUrgentBody {
+    /// `true` stamps the durable record urgent marker (`urgent_at = now`);
+    /// `false` clears it. Only this endpoint mutates the record marker. The
+    /// transient tmpfs hook flag is a separate source owned by agent hooks
+    /// and the pane watchdog and is untouched either way, so a live hook
+    /// urgent keeps the row urgent after a `false` here until it expires or
+    /// is cleared agent-side.
+    pub urgent: bool,
+}
+
+#[derive(Deserialize)]
 pub struct UpdateUnreadBody {
     /// `true` flags the session manually unread (a deliberate "flag for
     /// later"); `false` marks it read, clearing both auto and manual markers.
@@ -3976,6 +3990,80 @@ pub async fn update_session_pin(
         inst.pin();
     } else {
         inst.unpin();
+    }
+
+    let response =
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+pub async fn update_session_urgent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateUrgentBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return super::session_not_found();
+        };
+        inst.source_profile.clone()
+    };
+
+    let urgent = body.urgent;
+
+    // Persist first; only mutate memory once disk is durable. See #1589.
+    let persist_id = id.clone();
+    if persist_session_update(
+        profile,
+        "urgent update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                if urgent {
+                    inst.mark_urgent();
+                } else {
+                    inst.clear_urgent();
+                }
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "urgent update: instance vanished after persist"
+        );
+        return super::session_gone_after_persist();
+    };
+    if urgent {
+        inst.mark_urgent();
+    } else {
+        inst.clear_urgent();
     }
 
     let response =
@@ -11266,6 +11354,25 @@ mod tests {
         assert!(body.pinned);
         let body: UpdatePinBody = serde_json::from_str(r#"{"pinned": false}"#).unwrap();
         assert!(!body.pinned);
+    }
+
+    #[test]
+    fn update_urgent_body_parses() {
+        let body: UpdateUrgentBody = serde_json::from_str(r#"{"urgent": true}"#).unwrap();
+        assert!(body.urgent);
+        let body: UpdateUrgentBody = serde_json::from_str(r#"{"urgent": false}"#).unwrap();
+        assert!(!body.urgent);
+    }
+
+    #[test]
+    fn session_response_surfaces_record_urgent() {
+        // Record-level urgent (urgent_at, API-managed) must reach the wire
+        // with no tmpfs hook file present; archived suppression still wins.
+        let mut inst = make_test_instance();
+        inst.mark_urgent();
+        assert!(SessionResponse::from_instance(&inst, false).urgent);
+        inst.archive();
+        assert!(!SessionResponse::from_instance(&inst, false).urgent);
     }
 
     #[test]

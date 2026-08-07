@@ -71,8 +71,8 @@ pub use sessions::{
     start_session, stop_session, summarize_session, trash_session, update_session_archive,
     update_session_color, update_session_diff_base, update_session_group,
     update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
-    update_workspace_ordering, CleanupDefaults, McpSurfaceBadge, OutputQuery, SendMessageRequest,
-    SessionResponse,
+    update_session_urgent, update_workspace_ordering, CleanupDefaults, McpSurfaceBadge,
+    OutputQuery, SendMessageRequest, SessionResponse,
 };
 pub(crate) use sessions::{power_restore_sessions, power_stop_sessions, power_stop_targets};
 pub use skills::{
@@ -341,6 +341,7 @@ mod tests {
                     "trash_session",
                     "restore_session",
                     "update_session_unread",
+                    "update_session_urgent",
                     "stop_session",
                     "force_smart_rename",
                     "start_session",
@@ -545,6 +546,7 @@ mod tests {
                     "update_session_snooze",
                     "trash_session",
                     "update_session_unread",
+                    "update_session_urgent",
                     "stop_session",
                     "start_session",
                     "update_workspace_ordering",

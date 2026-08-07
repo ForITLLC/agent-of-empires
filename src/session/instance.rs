@@ -743,6 +743,20 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub favorited_at: Option<DateTime<Utc>>,
 
+    /// Durable urgent marker, the record-level sibling of the transient hook
+    /// urgent flag. Two sources feed `is_urgent()`: this field, set and
+    /// cleared ONLY via the daemon API (`PATCH /api/sessions/{id}/urgent`),
+    /// which survives restart, rebind, and cross-profile moves like every
+    /// other record field; and the tmpfs flag in
+    /// `/tmp/aoe-hooks-<euid>/{id}/attention.json`, written by agent hooks
+    /// and the pane watchdog, TTL-scoped, wiped by reboot, and cleared by a
+    /// genuine Ben prompt. The read path ORs the two, so a hook-set urgent
+    /// shows without a record write and a record urgent survives a tmpfs
+    /// wipe. Additive: absent in older `sessions.json` rows, so no
+    /// migration is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urgent_at: Option<DateTime<Utc>>,
+
     /// Snooze marker, a "temporary archive." When `snoozed_until` is in the
     /// future, the session sorts to tier 99 alongside archived rows and
     /// renders italic+dim with a `z ` prefix plus a remaining-time readout
@@ -1830,6 +1844,7 @@ impl Instance {
             idle_entered_at: None,
             archived_at: None,
             favorited_at: None,
+            urgent_at: None,
             snoozed_until: None,
             unread: false,
             idle_dormant_since: None,
@@ -2416,6 +2431,9 @@ impl Instance {
         if pre.favorited_at != post.favorited_at {
             self.favorited_at = post.favorited_at;
         }
+        if pre.urgent_at != post.urgent_at {
+            self.urgent_at = post.urgent_at;
+        }
         if pre.snoozed_until != post.snoozed_until {
             self.snoozed_until = post.snoozed_until;
         }
@@ -2744,16 +2762,39 @@ impl Instance {
         self.title == "AoE-Commander"
     }
 
-    /// Read the agent-raised urgent flag from `attention.json`. Sourced
-    /// on-demand from `/tmp/aoe-hooks-<euid>/{id}/attention.json` so it picks up
-    /// changes the running agent makes (via the `attention-urgent` script)
-    /// without an Instance state mutation. Suppressed for archived/snoozed
-    /// rows so a sunk session can't claw its way back to the top.
+    /// True when either urgent source is live: the durable record marker
+    /// (`urgent_at`, API-managed, survives restart/rebind/move) or the
+    /// agent-raised flag in `attention.json`, sourced on-demand from
+    /// `/tmp/aoe-hooks-<euid>/{id}/attention.json` so it picks up changes
+    /// the running agent makes (via the `attention-urgent` script) without
+    /// an Instance state mutation. Hook urgent is transient (tmpfs,
+    /// TTL-scoped, cleared by a genuine Ben prompt); record urgent is
+    /// durable and cleared only via `PATCH /api/sessions/{id}/urgent`.
+    /// Suppressed for archived/snoozed rows so a sunk session can't claw
+    /// its way back to the top.
     pub fn is_urgent(&self) -> bool {
         if self.is_archived() || self.is_snoozed() {
             return false;
         }
-        crate::hooks::read_hook_urgent(&self.id)
+        self.urgent_at.is_some() || crate::hooks::read_hook_urgent(&self.id)
+    }
+
+    /// Stamp the durable record urgent marker. Reached only through the
+    /// `PATCH /api/sessions/{id}/urgent` handler; the transient tmpfs hook
+    /// flag is a separate source owned by agent hooks and the pane
+    /// watchdog. Deliberately does NOT touch the sink states: `is_urgent()`
+    /// keeps its archived/snoozed suppression, so marking a sunk row urgent
+    /// leaves it sunk until the row wakes. Idempotent aside from the
+    /// timestamp refresh.
+    pub fn mark_urgent(&mut self) {
+        self.urgent_at = Some(Utc::now());
+    }
+
+    /// Clear the durable record urgent marker. Leaves the transient hook
+    /// flag alone; a live hook urgent keeps `is_urgent()` true until it
+    /// expires or the agent side clears it.
+    pub fn clear_urgent(&mut self) {
+        self.urgent_at = None;
     }
 
     /// Temporarily defer this session for `minutes`; sets `snoozed_until`
@@ -9827,6 +9868,73 @@ mod tests {
             reloaded.last_error.as_deref(),
             Some(TMUX_SESSION_GONE_ERROR)
         );
+    }
+
+    #[test]
+    fn test_record_urgent_flag_lifecycle() {
+        // A fresh random id has no tmpfs hook file, so the hook source
+        // contributes false throughout and the record marker is what's
+        // under test.
+        let mut inst = Instance::new("test", "/tmp/test");
+        assert!(!inst.is_urgent(), "no record marker, no hook flag");
+        inst.mark_urgent();
+        assert!(inst.urgent_at.is_some());
+        assert!(inst.is_urgent(), "record marker alone must read urgent");
+        inst.archive();
+        assert!(
+            !inst.is_urgent(),
+            "archived suppression wins over record urgent"
+        );
+        inst.unarchive();
+        inst.snooze(15);
+        assert!(
+            !inst.is_urgent(),
+            "snoozed suppression wins over record urgent"
+        );
+        inst.unsnooze();
+        assert!(inst.is_urgent(), "waking restores record urgent");
+        inst.clear_urgent();
+        assert!(inst.urgent_at.is_none());
+        assert!(!inst.is_urgent(), "clear removes the record marker");
+    }
+
+    #[test]
+    fn test_merge_post_restart_preserves_record_urgent() {
+        // The restart merge copies only status/sandbox/resume markers, so
+        // the durable urgent marker must ride through untouched, same as
+        // favorited_at and the other record-level triage fields.
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.mark_urgent();
+        let stamped = stored.urgent_at;
+
+        let mut working = Instance::new("session", "/tmp/test");
+        working.id = stored.id.clone();
+        working.status = Status::Idle;
+
+        stored.merge_post_restart(&working);
+
+        assert_eq!(
+            stored.urgent_at, stamped,
+            "restart merge must not clobber record urgent"
+        );
+    }
+
+    #[test]
+    fn test_merge_user_action_diff_propagates_urgent_at() {
+        let pre = Instance::new("t", "/tmp");
+        let mut post = pre.clone();
+        post.mark_urgent();
+        let mut disk = pre.clone();
+        disk.merge_user_action_diff(&pre, &post);
+        assert_eq!(disk.urgent_at, post.urgent_at);
+
+        // Clearing also propagates.
+        let pre2 = post.clone();
+        let mut post2 = pre2.clone();
+        post2.clear_urgent();
+        let mut disk2 = pre2.clone();
+        disk2.merge_user_action_diff(&pre2, &post2);
+        assert!(disk2.urgent_at.is_none());
     }
 
     #[test]
