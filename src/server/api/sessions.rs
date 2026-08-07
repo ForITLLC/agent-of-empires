@@ -7338,6 +7338,18 @@ pub async fn create_session(
     if !state.power.is_on() {
         return crate::server::power::power_off_response();
     }
+    // WO#1286 D2: session creation is its own activity class, checked before
+    // the body is even parsed so the refusal is deterministic regardless of
+    // payload shape. Read at request time (never cached) so a flip governs
+    // the very next call.
+    if !crate::session::config::Config::load_or_warn()
+        .activity
+        .is_on(crate::server::power::CREATE_CLASS)
+    {
+        return crate::server::power::activity_class_off_response(
+            crate::server::power::CREATE_CLASS,
+        );
+    }
     let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
@@ -13222,6 +13234,20 @@ pub async fn send_message(
             .into_response();
     };
     drop(instances);
+
+    // WO#1286 D2: fleet dispatch is class-gated. A send whose TARGET is the
+    // Commander is exempt: that is a worker reporting up, the path a refused
+    // fleet uses to ask for help, and severing it would make every other
+    // refusal silent.
+    if instance.title != crate::server::pane_watchdog::COMMANDER_TITLE
+        && !crate::session::config::Config::load_or_warn()
+            .activity
+            .is_on(crate::server::power::DISPATCH_CLASS)
+    {
+        return crate::server::power::activity_class_off_response(
+            crate::server::power::DISPATCH_CLASS,
+        );
+    }
 
     let sync_base = instance.clone();
     let tool = instance.tool.clone();

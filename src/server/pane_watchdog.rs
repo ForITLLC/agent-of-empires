@@ -105,24 +105,36 @@ pub(crate) fn fable_scan_hit(extra_args: &str, content: &str) -> Option<(String,
     classify_fable_drift(content)
 }
 
-/// The hard account draw order for cap relocation. Sessions on profiles
-/// outside this pool are never auto-moved (escalate only).
-pub(crate) const DRAW_ORDER: [&str; 7] = [
+/// The account draw tiers for cap relocation, in strict priority order:
+/// drain forit-main first, then forit-backup, then the three co-equal
+/// tier-3 accounts (WO#1286 D1). Personal accounts (RAS-Main, bp-main) are
+/// NOT in the pool: a capped session there parks and escalates, and they
+/// are never draw targets.
+pub(crate) const DRAW_TIERS: [&[&str]; 3] = [
+    &["forit-main"],
+    &["forit-backup"],
+    &["gna-main", "xce-main", "RAS-Work"],
+];
+
+/// The flattened relocation pool. Sessions on profiles outside this list
+/// are never auto-moved (escalate only). Must stay the exact flatten of
+/// [`DRAW_TIERS`]; a relationship test pins that.
+pub(crate) const DRAW_ORDER: [&str; 5] = [
     "forit-main",
     "forit-backup",
     "gna-main",
     "xce-main",
-    "RAS-Main",
     "RAS-Work",
-    "bp-main",
 ];
 
-/// Pick the relocation target for a capped session: the first profile in
-/// [`DRAW_ORDER`] that is not the session's current profile and holds a
-/// FRESH POSITIVE headroom claim in the shared capacity state. `None` when
-/// the session is not on a pool profile (gated / personal accounts are never
-/// touched) or when no other pool profile has verified headroom (park and
-/// escalate instead of moving).
+/// Pick the relocation target for a capped session: scan [`DRAW_TIERS`]
+/// from the top, always in fixed tier order (never rotation from the
+/// current profile), and take the first tier holding a FRESH POSITIVE
+/// headroom claim that is not the session's own profile. Within a tier the
+/// freshest claim wins, so co-equal tier-3 accounts drain by most recently
+/// verified evidence. `None` when the session is not on a pool profile
+/// (gated / personal accounts are never touched) or when no other pool
+/// profile has verified headroom (park and escalate instead of moving).
 ///
 /// WO#414 thrash fix: the old selector treated "no cap observed" as a
 /// target, but absence of an observation is not headroom, and it bounced
@@ -134,11 +146,15 @@ pub(crate) fn next_verified_headroom(
     state: &capacity::CapacityState,
     now_secs: u64,
 ) -> Option<String> {
-    let pos = DRAW_ORDER.iter().position(|p| *p == current)?;
-    (1..DRAW_ORDER.len())
-        .map(|i| DRAW_ORDER[(pos + i) % DRAW_ORDER.len()])
-        .find(|cand| state.verified_headroom(cand, now_secs))
-        .map(str::to_string)
+    if !DRAW_ORDER.contains(&current) {
+        return None;
+    }
+    DRAW_TIERS.iter().find_map(|tier| {
+        tier.iter()
+            .filter(|cand| **cand != current && state.verified_headroom(cand, now_secs))
+            .max_by_key(|cand| state.profiles.get(**cand).map_or(0, |e| e.updated))
+            .map(|p| (*p).to_string())
+    })
 }
 
 /// Whether EVERY pool profile holds a FRESH probed NEGATIVE headroom claim.
@@ -199,13 +215,21 @@ pub(crate) fn capped_move_reason(
 ) -> String {
     if moved {
         format!(
-            "capped [{kind}] session '{title}' ({id}) on '{from}' auto-moved to '{target}'. Verify it resumed and is serving"
+            "capped [{kind}] session '{title}' ({id}) on '{from}': record moved to '{target}'; the pane and any draft in it are untouched, the new account binds on its next start"
         )
     } else {
         format!(
-            "capped [{kind}] session '{title}' ({id}) on '{from}' auto-move to '{target}' FAILED; needs a manual profile move"
+            "capped [{kind}] session '{title}' ({id}) on '{from}' record move to '{target}' FAILED; needs a manual profile move"
         )
     }
+}
+
+/// The staged `session move` invocation for a cap relocation. `--no-restart`
+/// is load-bearing (Ben, 2026-08-05): the record moves and the account
+/// re-binds on the session's NEXT start; the live pane, and any unsubmitted
+/// draft sitting in it, is never touched.
+pub(crate) fn relocation_move_args<'a>(id: &'a str, target: &'a str) -> [&'a str; 5] {
+    ["session", "move", id, target, "--no-restart"]
 }
 
 /// How long an observed cap on a profile is trusted before it is assumed to
@@ -278,6 +302,85 @@ struct CapFp {
 struct NonPoolPage {
     profile: String,
     paged_at_secs: u64,
+}
+
+/// Re-announce cadence for a STANDING cap on the event bus. Edge-only
+/// emission told subscribers about a cap exactly once; gna-finance then sat
+/// parked for 8h47m in silence while the daemon logged hourly parked wakes
+/// nobody was subscribed to (WO#1286 D4). A cap that persists re-emits on
+/// this cadence carrying its standing duration, so the downstream Ben rail
+/// re-escalates instead of assuming the first push landed.
+const STANDING_CAP_REEMIT_SECS: u64 = 60 * 60;
+
+/// A session's standing-cap announcement window: when the cap was first
+/// seen and when the bus last heard about it.
+struct CapStanding {
+    since_secs: u64,
+    last_emit_secs: u64,
+}
+
+/// Track a session's standing-cap window and decide whether this tick owes
+/// a re-announcement. Returns `Some(standing_secs)` once the cap has stood
+/// a full [`STANDING_CAP_REEMIT_SECS`] past the last announcement; the
+/// first announcement itself is the state edge, [`is_event_edge`]'s job. A
+/// non-cap tick clears the window.
+fn standing_cap_reemit(
+    map: &mut HashMap<String, CapStanding>,
+    id: &str,
+    is_cap: bool,
+    now_secs: u64,
+) -> Option<u64> {
+    if !is_cap {
+        map.remove(id);
+        return None;
+    }
+    match map.get_mut(id) {
+        None => {
+            map.insert(
+                id.to_string(),
+                CapStanding {
+                    since_secs: now_secs,
+                    last_emit_secs: now_secs,
+                },
+            );
+            None
+        }
+        Some(s) if now_secs.saturating_sub(s.last_emit_secs) >= STANDING_CAP_REEMIT_SECS => {
+            s.last_emit_secs = now_secs;
+            Some(now_secs.saturating_sub(s.since_secs))
+        }
+        Some(_) => None,
+    }
+}
+
+/// A cap relocation staged with `--no-restart`: the record now says `target`
+/// but the pane (pid `pane_pid` at stage time) still runs `from_profile`
+/// until its next start. Persisted so a daemon bounce keeps attributing the
+/// still-visible banner to the old account.
+#[derive(Debug, Clone, PartialEq)]
+struct StagedRebind {
+    from_profile: String,
+    target: String,
+    pane_pid: Option<u32>,
+}
+
+/// The profile a capped scan's banner actually belongs to. After a
+/// `--no-restart` record move the record names the target, but the unchanged
+/// pane still runs the old account; attributing its banner to the record
+/// profile would falsely revoke the fresh target claim, one tier per action
+/// cooldown, until the whole pool read as capped. A changed (or unknowable)
+/// pane pid means the divergence can no longer be proven, so the record
+/// profile is trusted again.
+fn cap_attribution<'a>(
+    staged: &'a HashMap<String, StagedRebind>,
+    id: &str,
+    record_profile: &'a str,
+    pane_pid: Option<u32>,
+) -> &'a str {
+    match staged.get(id) {
+        Some(s) if s.pane_pid.is_some() && s.pane_pid == pane_pid => s.from_profile.as_str(),
+        _ => record_profile,
+    }
 }
 
 /// Whether a live cap on a NON-POOL profile warrants a *fresh* Commander page.
@@ -416,6 +519,16 @@ pub(crate) enum CapAction {
     /// this tick actually woke the Commander, false when the WO#605 re-page
     /// dampener suppressed a standing, unchanged cap within its cooldown.
     NonPool { paged: bool },
+    /// Relocation was on the table but `rate_limit_account_switch` is off:
+    /// Ben's kill switch stills the mover's hand, the session holds in
+    /// place (WO#1286 D1). Detection, the classification row and the
+    /// /api/events push all still run.
+    SwitchOff,
+    /// The record was already staged to `target` with `--no-restart` and the
+    /// pane has not restarted since: the banner it still shows belongs to
+    /// the OLD account, so there is nothing further to move and nothing to
+    /// revoke against the record's new profile.
+    AwaitingRebind { target: String },
 }
 
 /// Per-session per-tick classification: what state the pane is in, what the
@@ -499,7 +612,9 @@ impl Disposition {
                         "none"
                     }
                 }
-                CapAction::Cooldown => "none",
+                CapAction::Cooldown | CapAction::SwitchOff | CapAction::AwaitingRebind { .. } => {
+                    "none"
+                }
             },
             Disposition::FableDrift { paged, .. }
             | Disposition::ActionGate {
@@ -528,12 +643,27 @@ impl Disposition {
             Disposition::Serving => "healthy pane, no signal".into(),
             Disposition::LiveCap { action, .. } => match action {
                 CapAction::Moved { target, ok: true } => {
-                    format!("live cap, auto-moved to '{target}', verify it resumed")
+                    // --no-restart semantics (WO#1286 D1): the record moved,
+                    // the pane and drafts were not touched, and nothing
+                    // "resumes" until the session next starts.
+                    format!(
+                        "live cap, record moved to '{target}'; pane and drafts \
+                         untouched, the new account binds on next start"
+                    )
                 }
                 CapAction::Moved { target, ok: false } => {
                     format!("live cap, auto-move to '{target}' FAILED, needs manual move")
                 }
                 CapAction::Cooldown => "still capped, holding within action cooldown".into(),
+                CapAction::SwitchOff => {
+                    "live cap, relocation withheld: rate_limit_account_switch is off; \
+                     turn on with `aoe activity rate_limit_account_switch on`"
+                        .into()
+                }
+                CapAction::AwaitingRebind { target } => format!(
+                    "live cap on the old account, record already staged to '{target}'; \
+                     it binds on the session's next start"
+                ),
                 CapAction::NonPool { paged: true } => {
                     "capped on a non-pool profile, never auto-moved, paged".into()
                 }
@@ -1122,6 +1252,18 @@ struct Watchdog {
     /// state, and re-stating a condition costs a subscriber one deduplication
     /// while missing one costs a human their afternoon.
     last_event_state: HashMap<String, String>,
+    /// Standing-cap announcement windows per session, driving the WO#1286 D4
+    /// re-emit cadence: a cap that persists re-announces on the event bus
+    /// every [`STANDING_CAP_REEMIT_SECS`] with its standing duration, instead
+    /// of once at the edge and then silence (the gna-finance 8h47m gap).
+    /// In-memory like `last_event_state`: a bounce re-announces the edge,
+    /// which restarts the window.
+    cap_standing: HashMap<String, CapStanding>,
+    /// Cap relocations staged with `--no-restart` whose pane has not
+    /// restarted yet, so cap banners keep being attributed to the account
+    /// the pane actually still runs. Persisted: losing this across a bounce
+    /// would let one diverged pane poison the pool's headroom claims.
+    staged_rebind: HashMap<String, StagedRebind>,
     /// Whether each (account, window) was last seen above the usage threshold.
     /// Keyed by ACCOUNT, never by session: one account has one meter however
     /// many panes render it.
@@ -1144,6 +1286,8 @@ impl Watchdog {
             last_cap_fp: load_cap_fp(),
             last_non_pool_page: load_non_pool_page(),
             last_event_state: HashMap::new(),
+            cap_standing: HashMap::new(),
+            staged_rebind: load_staged_rebind(),
             last_usage_above: HashMap::new(),
             pane_memory: HashMap::new(),
         }
@@ -1288,9 +1432,29 @@ impl Watchdog {
         }
         self.persist_cap_fp();
 
+        // Retire staged-rebind entries whose pane restarted: a changed pid
+        // means the session rebound to its record profile, which is truthful
+        // again from this tick on (WO#1286 D1).
+        let restarted: Vec<String> = scans
+            .iter()
+            .filter(|s| {
+                self.staged_rebind
+                    .get(&s.id)
+                    .is_some_and(|st| st.pane_pid != s.pane_pid)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        if !restarted.is_empty() {
+            for id in &restarted {
+                self.staged_rebind.remove(id);
+            }
+            self.persist_staged_rebind();
+        }
         for scan in &scans {
             if scan.signal == Some(PaneSignal::Capped) && !suppressed_caps.contains_key(&scan.id) {
-                self.capped_profiles.insert(scan.profile.clone(), now);
+                let profile =
+                    cap_attribution(&self.staged_rebind, &scan.id, &scan.profile, scan.pane_pid);
+                self.capped_profiles.insert(profile.to_string(), now);
             }
         }
         self.persist_cap_state();
@@ -1306,7 +1470,7 @@ impl Watchdog {
             })
             .map(|s| {
                 (
-                    s.profile.clone(),
+                    cap_attribution(&self.staged_rebind, &s.id, &s.profile, s.pane_pid).to_string(),
                     s.cap_kind.unwrap_or(capacity::CapKind::Unknown),
                 )
             })
@@ -1399,15 +1563,30 @@ impl Watchdog {
             // Push, at the moment of detection. The classification row below
             // is the record; this is the notification, and it goes out whether
             // or not anyone happens to be reading the record.
-            if is_event_edge(&mut self.last_event_state, &scan.id, &disp.state()) {
-                if let Some(kind) = event_kind(&disp) {
+            let kind = event_kind(&disp);
+            let edge = is_event_edge(&mut self.last_event_state, &scan.id, &disp.state());
+            // A standing cap re-announces on a cadence (WO#1286 D4). The
+            // window is keyed on the cap FAMILY, so a PARKED -> LIVE-CAP
+            // flip keeps its original standing clock.
+            let standing = standing_cap_reemit(
+                &mut self.cap_standing,
+                &scan.id,
+                kind == Some("cap"),
+                unix_secs(),
+            );
+            if edge || standing.is_some() {
+                if let Some(kind) = kind {
+                    let mut detail = disp.reason();
+                    if let Some(secs) = standing {
+                        detail.push_str(&format!(" [standing {}h]", secs / 3600));
+                    }
                     super::event_bus::emit_and_fan_out(
                         state,
                         kind,
                         &scan.id,
                         &scan.title,
                         &scan.profile,
-                        &disp.reason(),
+                        &detail,
                     );
                 }
             }
@@ -1765,6 +1944,38 @@ impl Watchdog {
                 action: CapAction::NonPool { paged },
             };
         }
+        // WO#1286 D1: the kill switch gates the MOVER, not detection. Read
+        // at decision time (the `wake()` precedent) so a flip takes effect
+        // on the next tick, never the next daemon restart.
+        let activity = crate::session::config::Config::load_or_warn().activity;
+        if !relocation_allowed(&activity) {
+            tracing::info!(
+                target: "server.pane_watchdog",
+                session = %scan.id,
+                profile = %scan.profile,
+                class = RELOCATE_CLASS,
+                "relocation withheld: activity class is off. Detection, the \
+                 classification row and the /api/events push are unaffected; \
+                 turn it on with `aoe activity rate_limit_account_switch on`"
+            );
+            return Disposition::LiveCap {
+                kind: cap_kind.as_str(),
+                action: CapAction::SwitchOff,
+            };
+        }
+        // A record already staged with --no-restart keeps showing the OLD
+        // account's banner until the pane restarts; while the pane pid is
+        // unchanged there is nothing further to move.
+        if let Some(staged) = self.staged_rebind.get(&scan.id) {
+            if staged.pane_pid.is_some() && staged.pane_pid == scan.pane_pid {
+                return Disposition::LiveCap {
+                    kind: cap_kind.as_str(),
+                    action: CapAction::AwaitingRebind {
+                        target: staged.target.clone(),
+                    },
+                };
+            }
+        }
         // The relocation gate reads the SHARED capacity state, not the
         // in-memory cap map: only a fresh positive claim (written by a
         // Commander probe via PATCH /api/capacity) makes a profile a target.
@@ -1787,13 +1998,29 @@ impl Watchdog {
                 );
                 // `session move` carries the instance record whole, including
                 // extra_args, so a --model pin survives the relocation.
-                let moved = match aoe_command(&["session", "move", &scan.id, &target]).await {
+                let moved = match aoe_command(&relocation_move_args(&scan.id, &target)).await {
                     Ok(()) => true,
                     Err(e) => {
                         tracing::warn!(target: "server.pane_watchdog", session = %scan.id, error = %e, "session move failed");
                         false
                     }
                 };
+                if moved {
+                    // Remember the staged rebind: until this pane restarts,
+                    // its cap banner belongs to the OLD account, and
+                    // attributing it to the record's new profile would
+                    // falsely revoke the fresh target claim, one tier per
+                    // cooldown, until the whole pool read as capped.
+                    self.staged_rebind.insert(
+                        scan.id.clone(),
+                        StagedRebind {
+                            from_profile: scan.profile.clone(),
+                            target: target.clone(),
+                            pane_pid: scan.pane_pid,
+                        },
+                    );
+                    self.persist_staged_rebind();
+                }
                 let kind = if moved {
                     "capped-moved"
                 } else {
@@ -1964,6 +2191,35 @@ impl Watchdog {
         let json = serde_json::json!({ "updated": unix_secs(), "pages": pages });
         if let Err(e) = std::fs::write(&path, json.to_string()) {
             tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "non-pool-page state write failed");
+        }
+    }
+
+    /// Persist the staged-rebind map
+    /// (`{"staged": {id: {from_profile, target, pane_pid}}}`) so a daemon
+    /// bounce keeps attributing a diverged pane's cap banner to the account
+    /// it still runs (WO#1286 D1); without it, one `--no-restart` move
+    /// followed by a bounce would poison the pool's headroom claims.
+    fn persist_staged_rebind(&self) {
+        let Some(path) = staged_rebind_path() else {
+            return;
+        };
+        let staged: HashMap<&str, serde_json::Value> = self
+            .staged_rebind
+            .iter()
+            .map(|(id, s)| {
+                (
+                    id.as_str(),
+                    serde_json::json!({
+                        "from_profile": s.from_profile,
+                        "target": s.target,
+                        "pane_pid": s.pane_pid,
+                    }),
+                )
+            })
+            .collect();
+        let json = serde_json::json!({ "updated": unix_secs(), "staged": staged });
+        if let Err(e) = std::fs::write(&path, json.to_string()) {
+            tracing::warn!(target: "server.pane_watchdog", path = %path.display(), error = %e, "staged-rebind state write failed");
         }
     }
 
@@ -2198,6 +2454,65 @@ fn load_non_pool_page() -> HashMap<String, NonPoolPage> {
     parse_non_pool_page(&raw)
 }
 
+/// Resolve the staged-rebind state file: `AOE_STAGED_REBIND_FILE` override,
+/// else `<app_dir>/staged-rebind-state.json`. `None` -> in-memory only.
+/// WO#1286 D1.
+fn staged_rebind_path() -> Option<PathBuf> {
+    match std::env::var("AOE_STAGED_REBIND_FILE") {
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => match crate::session::get_app_dir() {
+            Ok(dir) => Some(dir.join("staged-rebind-state.json")),
+            Err(e) => {
+                tracing::warn!(target: "server.pane_watchdog", error = %e, "no app dir; staged-rebind state not persisted");
+                None
+            }
+        },
+    }
+}
+
+/// Parse the persisted `{"staged": {id: {from_profile, target, pane_pid}}}`
+/// document. Pure, so the restart-survival round-trip is unit-tested without
+/// the filesystem. Malformed yields an empty map. WO#1286 D1.
+fn parse_staged_rebind(raw: &str) -> HashMap<String, StagedRebind> {
+    let mut map = HashMap::new();
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return map;
+    };
+    if let Some(staged) = val.get("staged").and_then(|s| s.as_object()) {
+        for (id, entry) in staged {
+            let (Some(from_profile), Some(target)) = (
+                entry.get("from_profile").and_then(|v| v.as_str()),
+                entry.get("target").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            map.insert(
+                id.clone(),
+                StagedRebind {
+                    from_profile: from_profile.to_string(),
+                    target: target.to_string(),
+                    pane_pid: entry
+                        .get("pane_pid")
+                        .and_then(|v| v.as_u64())
+                        .map(|p| p as u32),
+                },
+            );
+        }
+    }
+    map
+}
+
+/// Load the persisted staged-rebind map on daemon start. WO#1286 D1.
+fn load_staged_rebind() -> HashMap<String, StagedRebind> {
+    let Some(path) = staged_rebind_path() else {
+        return HashMap::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    parse_staged_rebind(&raw)
+}
+
 /// Parse the persisted `{"gates": {id: fp}}` document into the in-memory map,
 /// stamping every entry with `now` as its `seen`. Pure, so the restart-survival
 /// round-trip is unit-tested without touching the filesystem. A malformed doc
@@ -2402,7 +2717,7 @@ async fn aoe_output(args: &[&str]) -> anyhow::Result<String> {
 /// (aoe-wmw / aoe-fiw), never the daemon's default profile, so a plain
 /// `aoe send AoE-Commander` resolves in the wrong profile and 404s. Every
 /// escalation must resolve it cross-profile first.
-const COMMANDER_TITLE: &str = "AoE-Commander";
+pub(crate) const COMMANDER_TITLE: &str = "AoE-Commander";
 
 /// The AoE-Commander's session id and the profile that owns it, needed to
 /// target a cross-profile `aoe send -p <profile> <id>`.
@@ -2453,6 +2768,17 @@ const PAGE_CLASS: &str = "pane_watchdog_page";
 
 fn paging_allowed(activity: &crate::session::config::ActivityConfig) -> bool {
     activity.is_on(PAGE_CLASS)
+}
+
+/// The activity class governing cap relocation, Ben's usage-limit kill
+/// switch (WO#1286 D1). It governs the MOVE and nothing else: detection
+/// still runs, the classification row still lands, and the cap still
+/// reaches /api/events, so switching it off stills the mover's hand
+/// without blinding the fleet.
+const RELOCATE_CLASS: &str = "rate_limit_account_switch";
+
+fn relocation_allowed(activity: &crate::session::config::ActivityConfig) -> bool {
+    activity.is_on(RELOCATE_CLASS)
 }
 
 /// Escalate through the operator's urgent-wake channel: the first
@@ -3044,22 +3370,252 @@ and enter the code H7Q2K9F4P to authenticate.
 
     #[test]
     fn non_pool_profile_never_moves() {
+        // RAS-Main and bp-main are PERSONAL accounts, out of the pool as of
+        // WO#1286 D1: a cap there parks and escalates, never auto-moves.
         let state = claims(&[("forit-main", true), ("forit-backup", true)]);
-        assert_eq!(next_verified_headroom("aoe-wmw", &state, TEST_NOW), None);
+        for current in ["aoe-wmw", "per-macbook", "RAS-Main", "bp-main"] {
+            assert_eq!(
+                next_verified_headroom(current, &state, TEST_NOW),
+                None,
+                "{current}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier3_profile_draws_back_to_tier1() {
+        // A session stranded on a tier-3 profile relocates back up to
+        // forit-main once tier 1 holds a fresh verified claim: the scan is
+        // always top-down from tier 1, never rotation from the current spot.
+        let state = claims(&[("forit-main", true)]);
         assert_eq!(
-            next_verified_headroom("per-macbook", &state, TEST_NOW),
-            None
+            next_verified_headroom("RAS-Work", &state, TEST_NOW),
+            Some("forit-main".to_string())
+        );
+    }
+
+    // ── WO#1286 D1: tiered draw order, kill switch, --no-restart moves ──
+
+    #[test]
+    fn draw_tiers_flatten_to_draw_order() {
+        // The two constants must describe the same pool; a profile added to
+        // one and not the other would be draw-eligible but escape the
+        // all-capped arithmetic (or vice versa).
+        let flat: Vec<&str> = DRAW_TIERS.iter().flat_map(|t| t.iter().copied()).collect();
+        assert_eq!(flat, DRAW_ORDER);
+        // Personal accounts stay out, whatever future edits do to the tiers.
+        assert!(!DRAW_ORDER.contains(&"RAS-Main"));
+        assert!(!DRAW_ORDER.contains(&"bp-main"));
+    }
+
+    #[test]
+    fn tier_order_beats_claim_freshness() {
+        // forit-backup's claim is older (but fresh); RAS-Work's is newer.
+        // Tier 2 still wins: freshness only breaks ties WITHIN a tier.
+        let mut state = claims_at(&[("forit-backup", true)], TEST_NOW - 3600);
+        state.profiles.insert(
+            "RAS-Work".into(),
+            capacity::ProfileCapacity {
+                headroom: true,
+                cap_kind: None,
+                note: None,
+                reset_at: None,
+                updated: TEST_NOW,
+            },
+        );
+        assert_eq!(
+            next_verified_headroom("forit-main", &state, TEST_NOW),
+            Some("forit-backup".to_string())
         );
     }
 
     #[test]
-    fn tail_profile_wraps_to_claimed_head() {
-        // A session stranded on RAS-Main relocates back up to the head
-        // profile once the head holds a fresh verified claim.
-        let state = claims(&[("forit-main", true)]);
+    fn tier3_freshest_claim_wins() {
+        // Tiers 1 and 2 hold nothing; within co-equal tier 3 the most
+        // recently verified claim is the draw.
+        let mut state = claims_at(&[("gna-main", true)], TEST_NOW - 3600);
+        state.profiles.insert(
+            "xce-main".into(),
+            capacity::ProfileCapacity {
+                headroom: true,
+                cap_kind: None,
+                note: None,
+                reset_at: None,
+                updated: TEST_NOW - 60,
+            },
+        );
         assert_eq!(
-            next_verified_headroom("RAS-Main", &state, TEST_NOW),
-            Some("forit-main".to_string())
+            next_verified_headroom("forit-main", &state, TEST_NOW),
+            Some("xce-main".to_string())
+        );
+    }
+
+    #[test]
+    fn wo1286_seq16_replay_selects_tiered_target_and_stages_no_restart_move() {
+        // The REAL payload behind notifier ledger seq 16 (2026-08-06
+        // 23:10:21-07:00): session 851c3a91aaf64876 'gna-finance' capped
+        // [fable-credit] on 'forit-main', announced once, then 8h47m of
+        // silence (D4's exhibit). Replayed here through the WIRED selector.
+        let capped = "851c3a91aaf64876";
+        let now = 1_786_116_139; // the live snapshot's own `updated` stamp
+                                 // (a) The capacity state as it stood that night, pool rows verbatim
+                                 // from ~/.agent-of-empires/capacity.json: every claim negative
+                                 // except RAS-Work, whose positive claim was ~22.7h past
+                                 // HEADROOM_TTL_SECS. Parking was CORRECT selection; the defects
+                                 // were the unwired switch, the restart move and the one-shot
+                                 // announcement, all fixed under this WO.
+        let mut state = capacity::CapacityState::default();
+        for (profile, headroom, updated) in [
+            ("forit-main", false, 1_786_114_159_u64),
+            ("forit-backup", false, 1_786_065_919),
+            ("gna-main", false, 1_786_116_139),
+            ("xce-main", false, 1_785_403_931),
+            ("RAS-Work", true, 1_786_034_478),
+        ] {
+            state.profiles.insert(
+                profile.to_string(),
+                capacity::ProfileCapacity {
+                    headroom,
+                    cap_kind: None,
+                    note: None,
+                    reset_at: None,
+                    updated,
+                },
+            );
+        }
+        assert_eq!(next_verified_headroom("forit-main", &state, now), None);
+        // (b) Same cap after a fresh verified probe on forit-backup: tier 2
+        // is selected and the staged command moves the RECORD only; the
+        // pane, and Ben's draft if one is sitting in it, is never touched.
+        {
+            let e = state.profiles.get_mut("forit-backup").unwrap();
+            e.headroom = true;
+            e.updated = now;
+        }
+        assert_eq!(
+            next_verified_headroom("forit-main", &state, now),
+            Some("forit-backup".to_string())
+        );
+        assert_eq!(
+            relocation_move_args(capped, "forit-backup"),
+            ["session", "move", capped, "forit-backup", "--no-restart"]
+        );
+    }
+
+    #[test]
+    fn switch_off_and_awaiting_rebind_hold_without_paging() {
+        // The kill-switch hold and the staged-rebind hold are both
+        // decision "none" (no page, no park) and both name their why.
+        let off = Disposition::LiveCap {
+            kind: "fable-credit",
+            action: CapAction::SwitchOff,
+        };
+        assert_eq!(off.decision(), "none");
+        assert!(
+            off.reason().contains("relocation withheld"),
+            "{}",
+            off.reason()
+        );
+        assert!(
+            off.reason()
+                .contains("aoe activity rate_limit_account_switch on"),
+            "{}",
+            off.reason()
+        );
+        let staged = Disposition::LiveCap {
+            kind: "fable-credit",
+            action: CapAction::AwaitingRebind {
+                target: "forit-backup".into(),
+            },
+        };
+        assert_eq!(staged.decision(), "none");
+        assert!(
+            staged.reason().contains("staged to 'forit-backup'"),
+            "{}",
+            staged.reason()
+        );
+    }
+
+    #[test]
+    fn cap_attribution_follows_pane_not_record() {
+        let mut staged = HashMap::new();
+        staged.insert(
+            "s1".to_string(),
+            StagedRebind {
+                from_profile: "forit-main".into(),
+                target: "forit-backup".into(),
+                pane_pid: Some(4242),
+            },
+        );
+        // (id, record_profile, scan_pid, expected): the banner belongs to
+        // the OLD account while the staged pane pid still matches; any
+        // other shape trusts the record.
+        let cases = [
+            ("s1", "forit-backup", Some(4242_u32), "forit-main"),
+            ("s1", "forit-backup", Some(9999), "forit-backup"), // restarted
+            ("s1", "forit-backup", None, "forit-backup"),       // unknowable
+            ("s2", "gna-main", Some(4242), "gna-main"),         // never staged
+        ];
+        for (id, record, pid, expected) in cases {
+            assert_eq!(cap_attribution(&staged, id, record, pid), expected, "{id}");
+        }
+        // A stage recorded with an UNKNOWN pid can never prove divergence.
+        staged.get_mut("s1").unwrap().pane_pid = None;
+        assert_eq!(
+            cap_attribution(&staged, "s1", "forit-backup", None),
+            "forit-backup"
+        );
+    }
+
+    #[test]
+    fn staged_rebind_round_trips_and_rejects_malformed() {
+        let raw = r#"{"updated": 1786116139, "staged": {
+            "851c3a91aaf64876": {"from_profile": "forit-main", "target": "forit-backup", "pane_pid": 4242},
+            "deadbeef00000000": {"from_profile": "gna-main", "target": "xce-main", "pane_pid": null},
+            "malformed": {"target": "xce-main"}
+        }}"#;
+        let map = parse_staged_rebind(raw);
+        assert_eq!(map.len(), 2, "the entry missing from_profile is dropped");
+        assert_eq!(
+            map.get("851c3a91aaf64876"),
+            Some(&StagedRebind {
+                from_profile: "forit-main".into(),
+                target: "forit-backup".into(),
+                pane_pid: Some(4242),
+            })
+        );
+        assert_eq!(map.get("deadbeef00000000").unwrap().pane_pid, None);
+        assert!(parse_staged_rebind("not json").is_empty());
+        assert!(parse_staged_rebind("{}").is_empty());
+    }
+
+    #[test]
+    fn standing_cap_reemit_fires_hourly_and_clears_on_recovery() {
+        let mut map = HashMap::new();
+        let t0 = TEST_NOW;
+        // First cap tick opens the window silently (the edge announces).
+        assert_eq!(standing_cap_reemit(&mut map, "s1", true, t0), None);
+        // Within the hour: quiet.
+        assert_eq!(standing_cap_reemit(&mut map, "s1", true, t0 + 1800), None);
+        // Past the hour: re-announce, carrying the FULL standing duration.
+        assert_eq!(
+            standing_cap_reemit(&mut map, "s1", true, t0 + 3700),
+            Some(3700)
+        );
+        // The next hour restarts from the re-announcement, standing keeps
+        // growing from the ORIGINAL sighting.
+        assert_eq!(standing_cap_reemit(&mut map, "s1", true, t0 + 3800), None);
+        assert_eq!(
+            standing_cap_reemit(&mut map, "s1", true, t0 + 7400),
+            Some(7400)
+        );
+        // Recovery clears the window; the next cap starts a fresh clock.
+        assert_eq!(standing_cap_reemit(&mut map, "s1", false, t0 + 8000), None);
+        assert!(map.is_empty());
+        assert_eq!(standing_cap_reemit(&mut map, "s1", true, t0 + 9000), None);
+        assert_eq!(
+            standing_cap_reemit(&mut map, "s1", true, t0 + 9000 + 3600),
+            Some(3600)
         );
     }
 
@@ -3087,8 +3643,12 @@ and enter the code H7Q2K9F4P to authenticate.
         assert!(moved.contains("abc123"));
         assert!(moved.contains("gna-main"));
         assert!(moved.contains("[fable-credit]"));
-        assert!(moved.contains("auto-moved to 'forit-main'"));
-        assert!(moved.to_lowercase().contains("verify"));
+        assert!(moved.contains("record moved to 'forit-main'"));
+        // Ben's --no-restart order (2026-08-05): the wake must say the pane
+        // and its draft were left alone, not ask anyone to verify a resume
+        // that never happened.
+        assert!(moved.contains("untouched"), "{moved}");
+        assert!(moved.contains("next start"), "{moved}");
 
         let failed = capped_move_reason(
             "for-Support",
@@ -3494,7 +4054,7 @@ and enter the code H7Q2K9F4P to authenticate.
         // relay to Ben (the WO#449 phantom top-up pages).
         let (kind, reason) = parked_wake(true, "credit", "for-tasks", "381b98ed", "xce-main");
         assert_eq!(kind, "capped-all-accounts");
-        assert!(reason.contains("ALL 7 pool accounts"), "{reason}");
+        assert!(reason.contains("ALL 5 pool accounts"), "{reason}");
         assert!(reason.to_lowercase().contains("probed"), "{reason}");
 
         let (kind, reason) = parked_wake(false, "credit", "for-tasks", "381b98ed", "xce-main");
@@ -4234,7 +4794,26 @@ ACTION REQUIRED (Ben): approve the Ramp device login for gna-finance
 
     #[test]
     fn test_event_kind_covers_every_disposition() {
-        let cases: [(Disposition, Option<&str>); 11] = [
+        let cases: [(Disposition, Option<&str>); 13] = [
+            // A cap withheld by the kill switch, and one awaiting its staged
+            // rebind, are still caps: the switch stills the mover, never the
+            // rail (WO#1286 D1).
+            (
+                Disposition::LiveCap {
+                    kind: "usage",
+                    action: CapAction::SwitchOff,
+                },
+                Some("cap"),
+            ),
+            (
+                Disposition::LiveCap {
+                    kind: "usage",
+                    action: CapAction::AwaitingRebind {
+                        target: "forit-backup".into(),
+                    },
+                },
+                Some("cap"),
+            ),
             // A cap is a cap whether the daemon could place the session or
             // not: parking is the WORSE outcome, so it must not be the quiet
             // one.

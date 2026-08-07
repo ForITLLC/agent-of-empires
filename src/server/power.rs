@@ -245,22 +245,6 @@ impl PowerRegistry {
         cancelled
     }
 
-    /// Whether a wake of this `kind` may be armed right now: the master switch
-    /// AND the class that governs the kind must both be on.
-    ///
-    /// Reading config here rather than caching it is deliberate: a flip made
-    /// in the settings UI or by `aoe activity` must take effect on the next
-    /// arm, not at the next daemon restart.
-    pub fn arm_allowed(&self, kind: &str) -> bool {
-        if !self.is_on() {
-            return false;
-        }
-        let class = crate::session::config::ActivityConfig::class_for_wake_kind(kind);
-        crate::session::config::Config::load_or_warn()
-            .activity
-            .is_on(class)
-    }
-
     pub fn cancel(&self, id: &str) -> Option<WakeEntry> {
         let mut f = self.lock();
         let entry = f.wakes.iter_mut().find(|w| w.id == id)?;
@@ -282,6 +266,32 @@ pub fn power_off_response() -> Response {
         Json(serde_json::json!({
             "error": "power_off",
             "note": "AOE is OFF (master kill switch). Flip with `aoe on` or POST /api/power {\"state\":\"on\"}",
+        })),
+    )
+        .into_response()
+}
+
+/// The activity class gating fleet message dispatch (WO#1286 D2). A report
+/// TO the Commander is exempt: the class exists to still outbound dispatch,
+/// not to sever the path a refused fleet uses to ask for help.
+pub const DISPATCH_CLASS: &str = "session_message_dispatch";
+
+/// The activity class gating session creation (WO#1286 D2).
+pub const CREATE_CLASS: &str = "session_create";
+
+/// 403 body for an action refused by its ACTIVITY CLASS while the master
+/// switch is on (WO#1286 D2). Names the class, because sending a refused
+/// caller to `aoe on` when the master is already on teaches them the gates
+/// are broken.
+pub fn activity_class_off_response(class: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "activity_class_off",
+            "class": class,
+            "note": format!(
+                "activity class '{class}' is off (master power is on). Flip with `aoe activity {class} on`"
+            ),
         })),
     )
         .into_response()
@@ -313,11 +323,23 @@ pub struct WakeListQuery {
 
 fn power_json(reg: &PowerRegistry) -> serde_json::Value {
     let (on, since_ms, changed_by, live_wakes) = reg.snapshot();
+    // The harness-side power gate (claude-aoe-power-gate-hook.py) already
+    // pays this GET on every gated prompt/arm; carrying the per-class states
+    // in the same body is what lets it refuse a Monitor/ScheduleWakeup arm at
+    // the tool boundary instead of discovering the 403 after the timer is
+    // already armed harness-side.
+    let activity = crate::session::config::Config::load_or_warn().activity;
+    let classes: serde_json::Map<String, serde_json::Value> =
+        crate::session::config::ActivityConfig::CLASSES
+            .iter()
+            .map(|c| (c.to_string(), serde_json::json!(activity.is_on(c))))
+            .collect();
     serde_json::json!({
         "state": if on { "on" } else { "off" },
         "since_ms": since_ms,
         "changed_by": changed_by,
         "live_wakes": live_wakes,
+        "activity": classes,
     })
 }
 
@@ -417,9 +439,18 @@ pub async fn arm_wake(
     let kind = req.kind.as_deref().unwrap_or("schedule_wakeup");
     // Both gates, in order: the master switch, then the class that governs
     // this kind. Arming is the moment a wake becomes real, so it is the one
-    // place both have to be asked.
-    if !state.power.arm_allowed(kind) {
+    // place both have to be asked, and the refusal names WHICH gate said no
+    // (WO#1286 D2): a master-off body sends the caller to `aoe on`, the
+    // wrong lever when only the class is off.
+    if !state.power.is_on() {
         return power_off_response();
+    }
+    let class = crate::session::config::ActivityConfig::class_for_wake_kind(kind);
+    if !crate::session::config::Config::load_or_warn()
+        .activity
+        .is_on(class)
+    {
+        return activity_class_off_response(class);
     }
     match state.power.arm(
         &req.session_id,
