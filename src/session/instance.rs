@@ -452,12 +452,6 @@ pub struct WorkspaceRepo {
     pub base_branch_override: Option<String>,
 }
 
-/// Keeps a never-incremented counter out of the stored record, so an existing
-/// session file is untouched until the thing being counted actually happens.
-fn is_zero_u64(v: &u64) -> bool {
-    *v == 0
-}
-
 fn default_true() -> bool {
     true
 }
@@ -6583,8 +6577,13 @@ impl Instance {
                 self.kill_clean_locked()?;
             }
             let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
-            let outcome =
-                self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
+            let outcome = self.finish_resume_launch(
+                launch_outcome,
+                skipped_failed_resume_sid,
+                &profile,
+                size,
+                skip_on_launch,
+            )?;
             self.commit_lifecycle_launch(&storage, restart)?;
             Ok(outcome)
         })();
@@ -6678,6 +6677,8 @@ impl Instance {
         launch_outcome: LaunchSidOutcome,
         skipped_failed_resume_sid: Option<String>,
         profile: &str,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
     ) -> Result<StartOutcome> {
         let (attempted_sid, pinned_prior_sid) = match launch_outcome {
             LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(&sid), &self.tool) => {
@@ -13023,8 +13024,8 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "claude".to_string();
         inst.source_profile = "globprof".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("claude"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("claude"))
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -13062,8 +13063,8 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "claude".to_string();
         inst.source_profile = "plainprof".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("claude"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("claude"))
             .unwrap();
         assert!(cmd.unwrap().contains("--model claude-opus-4-8"));
     }
@@ -13091,8 +13092,8 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "claude".to_string();
         inst.source_profile = "pinprof".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("claude"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("claude"))
             .unwrap();
         assert!(
             cmd.as_ref().unwrap().contains("--model claude-opus-4-8"),
@@ -13122,8 +13123,8 @@ mod tests {
         inst.tool = "claude".to_string();
         inst.source_profile = "pinprof".to_string();
         inst.extra_args = "--model fable".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("claude"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("claude"))
             .unwrap();
         let cmd_str = cmd.unwrap();
         assert!(

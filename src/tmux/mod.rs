@@ -2046,9 +2046,8 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_filters_non_zero_panes() {
-        let output = format!(
-            "{P}proj_abc12345|0|0|||claude|claude\n{P}proj_abc12345|1|0|||bash|bash\n"
-        );
+        let output =
+            format!("{P}proj_abc12345|0|0|||claude|claude\n{P}proj_abc12345|1|0|||bash|bash\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -2058,9 +2057,8 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_first_window_wins() {
         // Two windows both have pane 0, first window's data should be kept
-        let output = format!(
-            "{P}proj_abc12345|0|0|||claude|claude\n{P}proj_abc12345|0|1|0||bash|bash\n"
-        );
+        let output =
+            format!("{P}proj_abc12345|0|0|||claude|claude\n{P}proj_abc12345|0|1|0||bash|bash\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();

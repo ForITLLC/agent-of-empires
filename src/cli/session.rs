@@ -2133,32 +2133,6 @@ async fn try_daemon_restart(session_id: &str, title: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Poll the tmux pane until capture-pane content stops changing for two
-/// consecutive samples (the agent has finished printing its startup banner
-/// and is sitting at a prompt) or `max_wait` elapses. Failsafe: always
-/// returns by `max_wait` so the caller's send-keys still runs even if the
-/// pane never settles.
-async fn wait_for_pane_ready(session_id: &str, title: &str, max_wait: std::time::Duration) {
-    let Ok(tmux) = crate::tmux::Session::new(session_id, title) else {
-        return;
-    };
-    let poll_interval = std::time::Duration::from_millis(200);
-    let start = std::time::Instant::now();
-    let mut last: Option<String> = None;
-    while start.elapsed() < max_wait {
-        tokio::time::sleep(poll_interval).await;
-        let Ok(now) = tmux.capture_pane(5) else {
-            continue;
-        };
-        if now.trim().len() > 20 {
-            if last.as_deref() == Some(&now) {
-                return;
-            }
-            last = Some(now);
-        }
-    }
-}
-
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let owning_profile = owning_profile_for(profile, Some(&args.identifier))?;
     let storage = Storage::open_unwatched(&owning_profile)?;

@@ -4853,7 +4853,6 @@ async fn status_poll_loop(state: Arc<AppState>) {
                         life,
                     });
                 }
->>>>>>> f9399e2a (feat(audit): daemon logs session disappearances with cause + exit_code)
             }
             apply_tick_status_decisions(
                 &mut instances,
