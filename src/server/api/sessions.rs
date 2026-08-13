@@ -511,7 +511,11 @@ fn is_report_shaped(message: &str) -> bool {
         .find(|l| !l.trim().is_empty())
         .is_some_and(|l| {
             let head = l.trim_start();
-            head.len() >= 7 && head[..7].eq_ignore_ascii_case("status:")
+            // `get`, not `[..7]`: byte 7 mid-char (e.g. "STATUS—") panicked
+            // the request worker and destroyed the sent message (WO#1351 D6).
+            // A non-boundary prefix can never equal the ASCII "status:".
+            head.get(..7)
+                .is_some_and(|h| h.eq_ignore_ascii_case("status:"))
         })
 }
 
@@ -10888,6 +10892,20 @@ mod tests {
         assert!(!is_wo_shaped("hello world"));
         assert!(!is_wo_shaped("wow #5 nice result"));
         assert!(!is_wo_shaped("WO# with no number after it"));
+    }
+
+    #[test]
+    fn report_shape_check_survives_multibyte_head() {
+        // WO#1351 D6: "STATUS" is 6 bytes and an em-dash occupies bytes 6..9,
+        // so byte index 7 lands mid-char. The old `head[..7]` byte slice
+        // panicked here, killing the request worker and DESTROYING the sent
+        // message while the caller saw "server disconnected". If the first 7
+        // bytes are not a char boundary they cannot be the ASCII "status:",
+        // so this must simply be false, never a panic.
+        assert!(!is_report_shaped("STATUS— shipped, WO#1351 evidence"));
+        assert!(!is_report_shaped("héllo: not a report"));
+        assert!(is_report_shaped("STATUS: shipped"));
+        assert!(is_report_shaped("  status: blocked"));
     }
 
     #[test]
