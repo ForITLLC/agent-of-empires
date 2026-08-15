@@ -105,26 +105,25 @@ pub(crate) fn fable_scan_hit(extra_args: &str, content: &str) -> Option<(String,
     classify_fable_drift(content)
 }
 
-/// The account draw tiers for cap relocation, in strict priority order:
-/// drain forit-main first, then forit-backup, then the three co-equal
-/// tier-3 accounts (WO#1286 D1). Personal accounts (RAS-Main, bp-main) are
-/// NOT in the pool: a capped session there parks and escalates, and they
-/// are never draw targets.
-pub(crate) const DRAW_TIERS: [&[&str]; 3] = [
-    &["forit-main"],
-    &["forit-backup"],
-    &["gna-main", "xce-main", "RAS-Work"],
+/// The account draw tiers for cap relocation (WO#1397, Ben-direct
+/// 2026-08-15; supersedes WO#1286 D1). Tier 1 is the co-equal Max-200
+/// pool, drained by freshest verified headroom, never a fixed favorite;
+/// tier 2 is RAS-Work. Ben's earlier personal-account exclusion of
+/// RAS-Main and bp-main is retracted by him directly, and cay-main joins
+/// at creation. Deliberately absent: aoe-wmw and aoe-fiw are RESERVED for
+/// AoE system sessions (Commander/infra) and are never draw targets;
+/// forit-main and forit-backup were absent from Ben's ruling and stay out
+/// of the pool pending his word.
+pub(crate) const DRAW_TIERS: [&[&str]; 2] = [
+    &["gna-main", "xce-main", "RAS-Main", "bp-main", "cay-main"],
+    &["RAS-Work"],
 ];
 
 /// The flattened relocation pool. Sessions on profiles outside this list
 /// are never auto-moved (escalate only). Must stay the exact flatten of
 /// [`DRAW_TIERS`]; a relationship test pins that.
-pub(crate) const DRAW_ORDER: [&str; 5] = [
-    "forit-main",
-    "forit-backup",
-    "gna-main",
-    "xce-main",
-    "RAS-Work",
+pub(crate) const DRAW_ORDER: [&str; 6] = [
+    "gna-main", "xce-main", "RAS-Main", "bp-main", "cay-main", "RAS-Work",
 ];
 
 /// Pick the relocation target for a capped session: scan [`DRAW_TIERS`]
@@ -135,7 +134,7 @@ pub(crate) const DRAW_ORDER: [&str; 5] = [
 /// session must never be staged into an account whose weekly clock is also
 /// spent, however fresh that account's generic headroom claim). A cap of
 /// [`capacity::CapKind::Unknown`] names no clock, so it applies no family
-/// filter. Within a tier the freshest claim wins, so co-equal tier-3
+/// filter. Within a tier the freshest claim wins, so the co-equal tier-1
 /// accounts drain by most recently verified evidence.
 ///
 /// `current` may be OUTSIDE the pool (WO#1393 fix c): a capped session on a
@@ -731,13 +730,14 @@ impl Disposition {
                     "live cap on the old account, record already staged to '{target}'; \
                      it binds on the session's next start"
                 ),
-                CapAction::NonPool { paged: true } => {
-                    "capped on a non-pool profile, never auto-moved, paged".into()
-                }
-                CapAction::NonPool { paged: false } => {
-                    "capped on a non-pool profile, standing page suppressed within re-page cooldown"
-                        .into()
-                }
+                CapAction::NonPool { paged: true } => format!(
+                    "capped on a non-pool profile (pool: {}), never auto-moved, paged",
+                    DRAW_ORDER.join(", ")
+                ),
+                CapAction::NonPool { paged: false } => format!(
+                    "capped on a non-pool profile (pool: {}), standing page suppressed within re-page cooldown",
+                    DRAW_ORDER.join(", ")
+                ),
             },
             Disposition::ReplayedBanner { why } => {
                 format!("replayed scrollback banner ({why}), headroom kept, no page")
@@ -3764,10 +3764,12 @@ and enter the code H7Q2K9F4P to authenticate.
 
     #[test]
     fn fresh_claim_picked_in_draw_order() {
+        // forit-backup's claim is ignored (WO#1397 dropped it from the
+        // pool); the draw lands on the freshest tier-1 claim.
         let state = claims(&[("forit-backup", true), ("gna-main", true)]);
         assert_eq!(
             next_verified_headroom("forit-main", capacity::CapKind::Unknown, &state, TEST_NOW),
-            Some("forit-backup".to_string())
+            Some("gna-main".to_string())
         );
     }
 
@@ -3796,7 +3798,7 @@ and enter the code H7Q2K9F4P to authenticate.
         // A positive claim past HEADROOM_TTL_SECS no longer counts: the
         // Commander must re-probe before the profile re-enters the pool.
         let state = claims_at(
-            &[("forit-backup", true)],
+            &[("gna-main", true)],
             TEST_NOW - capacity::HEADROOM_TTL_SECS - 1,
         );
         assert_eq!(
@@ -3807,21 +3809,29 @@ and enter the code H7Q2K9F4P to authenticate.
 
     #[test]
     fn non_pool_profile_pulls_into_pool_never_targets_one() {
-        // WO#1393 fix c: a capped session on a personal / non-pool account
-        // is offered a pull INTO the pool. The candidate set stays
-        // DRAW_TIERS, so a non-pool profile can be a SOURCE but never a
-        // TARGET, and a dry pool still parks it.
-        let state = claims(&[("forit-main", true), ("forit-backup", true)]);
-        for current in ["aoe-wmw", "per-macbook", "RAS-Main", "bp-main"] {
+        // WO#1393 fix c: a capped session on a non-pool account is offered
+        // a pull INTO the pool. The candidate set stays DRAW_TIERS, so a
+        // non-pool profile can be a SOURCE but never a TARGET, and a dry
+        // pool still parks it. Under WO#1397 the non-pool set is the AoE
+        // reserve (aoe-wmw, aoe-fiw), strays, and the forit accounts absent
+        // from Ben's ruling.
+        let state = claims(&[("gna-main", true)]);
+        for current in [
+            "aoe-wmw",
+            "aoe-fiw",
+            "per-macbook",
+            "forit-main",
+            "forit-backup",
+        ] {
             assert_eq!(
                 next_verified_headroom(current, capacity::CapKind::Unknown, &state, TEST_NOW),
-                Some("forit-main".to_string()),
+                Some("gna-main".to_string()),
                 "{current}"
             );
         }
         assert_eq!(
             next_verified_headroom(
-                "bp-main",
+                "forit-main",
                 capacity::CapKind::Unknown,
                 &capacity::CapacityState::default(),
                 TEST_NOW
@@ -3832,40 +3842,41 @@ and enter the code H7Q2K9F4P to authenticate.
 
     #[test]
     fn kind_dead_target_skipped_for_same_kind_only() {
-        // WO#1393 fix a: forit-backup holds verified headroom (say, an
+        // WO#1393 fix a: gna-main holds verified headroom (say, an
         // observed serving pane on opus) but its weekly clock is spent. A
         // weekly-capped session must skip it; a session-capped or
-        // unknown-kind one may still take it.
-        let mut state = claims(&[("forit-backup", true), ("gna-main", true)]);
+        // unknown-kind one may still take it. RAS-Work sits in tier 2, so
+        // it is only reached when every tier-1 claim is skipped.
+        let mut state = claims(&[("gna-main", true), ("RAS-Work", true)]);
         state
             .profiles
-            .get_mut("forit-backup")
+            .get_mut("gna-main")
             .unwrap()
             .dead_kinds
             .insert("weekly".into(), TEST_NOW - 60);
         assert_eq!(
             next_verified_headroom("forit-main", capacity::CapKind::Weekly, &state, TEST_NOW),
-            Some("gna-main".to_string())
+            Some("RAS-Work".to_string())
         );
         assert_eq!(
             next_verified_headroom("forit-main", capacity::CapKind::Session, &state, TEST_NOW),
-            Some("forit-backup".to_string())
+            Some("gna-main".to_string())
         );
         assert_eq!(
             next_verified_headroom("forit-main", capacity::CapKind::Unknown, &state, TEST_NOW),
-            Some("forit-backup".to_string())
+            Some("gna-main".to_string())
         );
     }
 
     #[test]
-    fn tier3_profile_draws_back_to_tier1() {
-        // A session stranded on a tier-3 profile relocates back up to
-        // forit-main once tier 1 holds a fresh verified claim: the scan is
-        // always top-down from tier 1, never rotation from the current spot.
-        let state = claims(&[("forit-main", true)]);
+    fn tier2_profile_draws_back_to_tier1() {
+        // A session stranded on the tier-2 profile relocates back up once
+        // tier 1 holds a fresh verified claim: the scan is always top-down
+        // from tier 1, never rotation from the current spot.
+        let state = claims(&[("gna-main", true)]);
         assert_eq!(
             next_verified_headroom("RAS-Work", capacity::CapKind::Unknown, &state, TEST_NOW),
-            Some("forit-main".to_string())
+            Some("gna-main".to_string())
         );
     }
 
@@ -3878,16 +3889,23 @@ and enter the code H7Q2K9F4P to authenticate.
         // all-capped arithmetic (or vice versa).
         let flat: Vec<&str> = DRAW_TIERS.iter().flat_map(|t| t.iter().copied()).collect();
         assert_eq!(flat, DRAW_ORDER);
-        // Personal accounts stay out, whatever future edits do to the tiers.
-        assert!(!DRAW_ORDER.contains(&"RAS-Main"));
-        assert!(!DRAW_ORDER.contains(&"bp-main"));
+        // WO#1397: Ben ruled RAS-Main, bp-main and cay-main INTO the Max-200
+        // pool (retracting the WO#1286 personal-account exclusion), the AoE
+        // reserve pair stays out, and the forit accounts are out pending a
+        // Ben ruling. Pin all of it against future tier edits.
+        for member in ["RAS-Main", "bp-main", "cay-main"] {
+            assert!(DRAW_ORDER.contains(&member), "{member}");
+        }
+        for outsider in ["forit-main", "forit-backup", "aoe-wmw", "aoe-fiw"] {
+            assert!(!DRAW_ORDER.contains(&outsider), "{outsider}");
+        }
     }
 
     #[test]
     fn tier_order_beats_claim_freshness() {
-        // forit-backup's claim is older (but fresh); RAS-Work's is newer.
-        // Tier 2 still wins: freshness only breaks ties WITHIN a tier.
-        let mut state = claims_at(&[("forit-backup", true)], TEST_NOW - 3600);
+        // gna-main's claim is older (but fresh); RAS-Work's is newer.
+        // Tier 1 still wins: freshness only breaks ties WITHIN a tier.
+        let mut state = claims_at(&[("gna-main", true)], TEST_NOW - 3600);
         state.profiles.insert(
             "RAS-Work".into(),
             capacity::ProfileCapacity {
@@ -3898,14 +3916,14 @@ and enter the code H7Q2K9F4P to authenticate.
         );
         assert_eq!(
             next_verified_headroom("forit-main", capacity::CapKind::Unknown, &state, TEST_NOW),
-            Some("forit-backup".to_string())
+            Some("gna-main".to_string())
         );
     }
 
     #[test]
-    fn tier3_freshest_claim_wins() {
-        // Tiers 1 and 2 hold nothing; within co-equal tier 3 the most
-        // recently verified claim is the draw.
+    fn tier1_freshest_claim_wins() {
+        // Within co-equal tier 1 the most recently verified claim is the
+        // draw.
         let mut state = claims_at(&[("gna-main", true)], TEST_NOW - 3600);
         state.profiles.insert(
             "xce-main".into(),
@@ -3956,21 +3974,22 @@ and enter the code H7Q2K9F4P to authenticate.
             next_verified_headroom("forit-main", capacity::CapKind::Unknown, &state, now),
             None
         );
-        // (b) Same cap after a fresh verified probe on forit-backup: tier 2
-        // is selected and the staged command moves the RECORD only; the
-        // pane, and Ben's draft if one is sitting in it, is never touched.
+        // (b) Same cap after a fresh verified probe on gna-main (a WO#1397
+        // pool member; forit-backup no longer is one): the staged command
+        // moves the RECORD only; the pane, and Ben's draft if one is
+        // sitting in it, is never touched.
         {
-            let e = state.profiles.get_mut("forit-backup").unwrap();
+            let e = state.profiles.get_mut("gna-main").unwrap();
             e.headroom = true;
             e.updated = now;
         }
         assert_eq!(
             next_verified_headroom("forit-main", capacity::CapKind::Unknown, &state, now),
-            Some("forit-backup".to_string())
+            Some("gna-main".to_string())
         );
         assert_eq!(
-            relocation_move_args(capped, "forit-backup"),
-            ["session", "move", capped, "forit-backup", "--no-restart"]
+            relocation_move_args(capped, "gna-main"),
+            ["session", "move", capped, "gna-main", "--no-restart"]
         );
     }
 
@@ -4533,7 +4552,7 @@ and enter the code H7Q2K9F4P to authenticate.
         for p in DRAW_ORDER {
             state.revoke_headroom(p, capacity::CapKind::Weekly, TEST_NOW - 60);
         }
-        state.profiles.get_mut("forit-main").unwrap().reset_at = Some(TEST_NOW + 11520);
+        state.profiles.get_mut("gna-main").unwrap().reset_at = Some(TEST_NOW + 11520);
         let (kind, reason) = parked_wake(
             true,
             "credit",
@@ -4544,18 +4563,18 @@ and enter the code H7Q2K9F4P to authenticate.
         );
         assert_eq!(kind, "capped-all-accounts");
         assert!(reason.contains("ACTION REQUIRED"), "{reason}");
-        assert!(reason.contains("ALL 5 pool accounts"), "{reason}");
+        assert!(reason.contains("ALL 6 pool accounts"), "{reason}");
         assert!(reason.to_lowercase().contains("probed"), "{reason}");
         // Every pool account appears, with kind and reset countdown.
         for p in DRAW_ORDER {
             assert!(reason.contains(p), "missing {p}: {reason}");
         }
         assert!(
-            reason.contains("forit-main: weekly, resets in 3h12m"),
+            reason.contains("gna-main: weekly, resets in 3h12m"),
             "{reason}"
         );
         assert!(
-            reason.contains("forit-backup: weekly, no reset recorded"),
+            reason.contains("xce-main: weekly, no reset recorded"),
             "{reason}"
         );
         assert!(
@@ -4572,7 +4591,7 @@ and enter the code H7Q2K9F4P to authenticate.
             TEST_NOW,
         );
         assert_eq!(kind, "capped-parked");
-        assert!(reason.contains("forit-main: unprobed"), "{reason}");
+        assert!(reason.contains("gna-main: unprobed"), "{reason}");
         assert!(reason.contains("PATCH /api/capacity"), "{reason}");
         assert!(
             reason.contains("do NOT surface a credits/money gate to Ben"),
