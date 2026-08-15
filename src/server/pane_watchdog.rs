@@ -109,21 +109,24 @@ pub(crate) fn fable_scan_hit(extra_args: &str, content: &str) -> Option<(String,
 /// 2026-08-15; supersedes WO#1286 D1). Tier 1 is the co-equal Max-200
 /// pool, drained by freshest verified headroom, never a fixed favorite;
 /// tier 2 is RAS-Work. Ben's earlier personal-account exclusion of
-/// RAS-Main and bp-main is retracted by him directly, and cay-main joins
-/// at creation. Deliberately absent: aoe-wmw and aoe-fiw are RESERVED for
-/// AoE system sessions (Commander/infra) and are never draw targets;
+/// RAS-Main and bp-main is retracted by him directly; cay-main and
+/// bs-main join at creation (Ben 2026-08-15: "both this and cay are in
+/// the main pool"). Deliberately absent: aoe-wmw and aoe-fiw are RESERVED
+/// for AoE system sessions (Commander/infra) and are never draw targets;
 /// forit-main and forit-backup were absent from Ben's ruling and stay out
 /// of the pool pending his word.
 pub(crate) const DRAW_TIERS: [&[&str]; 2] = [
-    &["gna-main", "xce-main", "RAS-Main", "bp-main", "cay-main"],
+    &[
+        "gna-main", "xce-main", "RAS-Main", "bp-main", "cay-main", "bs-main",
+    ],
     &["RAS-Work"],
 ];
 
 /// The flattened relocation pool. Sessions on profiles outside this list
 /// are never auto-moved (escalate only). Must stay the exact flatten of
 /// [`DRAW_TIERS`]; a relationship test pins that.
-pub(crate) const DRAW_ORDER: [&str; 6] = [
-    "gna-main", "xce-main", "RAS-Main", "bp-main", "cay-main", "RAS-Work",
+pub(crate) const DRAW_ORDER: [&str; 7] = [
+    "gna-main", "xce-main", "RAS-Main", "bp-main", "cay-main", "bs-main", "RAS-Work",
 ];
 
 /// Pick the relocation target for a capped session: scan [`DRAW_TIERS`]
@@ -3893,7 +3896,7 @@ and enter the code H7Q2K9F4P to authenticate.
         // pool (retracting the WO#1286 personal-account exclusion), the AoE
         // reserve pair stays out, and the forit accounts are out pending a
         // Ben ruling. Pin all of it against future tier edits.
-        for member in ["RAS-Main", "bp-main", "cay-main"] {
+        for member in ["RAS-Main", "bp-main", "cay-main", "bs-main"] {
             assert!(DRAW_ORDER.contains(&member), "{member}");
         }
         for outsider in ["forit-main", "forit-backup", "aoe-wmw", "aoe-fiw"] {
@@ -4563,7 +4566,7 @@ and enter the code H7Q2K9F4P to authenticate.
         );
         assert_eq!(kind, "capped-all-accounts");
         assert!(reason.contains("ACTION REQUIRED"), "{reason}");
-        assert!(reason.contains("ALL 6 pool accounts"), "{reason}");
+        assert!(reason.contains("ALL 7 pool accounts"), "{reason}");
         assert!(reason.to_lowercase().contains("probed"), "{reason}");
         // Every pool account appears, with kind and reset countdown.
         for p in DRAW_ORDER {
