@@ -253,6 +253,12 @@ const NON_POOL_PAGE_COOLDOWN: Duration = Duration::from_secs(6 * 60 * 60);
 /// pair. Drift is advisory, not operator-blocking, so it re-fires slowly.
 const DRIFT_COOLDOWN: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// Floor between `orphan_pane` re-announcements for the same dead record
+/// (WO#1391). An orphan is a standing reap signal, not an incident: it
+/// re-fires slowly, on the same cadence as the notifier's surface cooldown,
+/// until someone kills the pane or restores the record.
+const ORPHAN_REEMIT_SECS: u64 = 2 * 60 * 60;
+
 /// How long a session's ACTION REQUIRED fingerprint survives once its gate is
 /// no longer observed, before the content dampener forgets it. Longer than a
 /// handful of scan intervals so a transient one-tick capture miss does not
@@ -1016,20 +1022,61 @@ struct PaneScan {
     stale_held: Option<&'static str>,
 }
 
+/// A live tmux pane owned by a dead (trashed or archived) session record
+/// (WO#1391). Never cap evidence, never mover input, never serving proof:
+/// the record's death outranks anything its pane renders. Reported as a
+/// distinct `orphan_pane` reap signal instead.
+struct OrphanPane {
+    id: String,
+    title: String,
+    profile: String,
+    /// Which dead bucket the record sits in: `"trashed"` or `"archived"`.
+    bucket: &'static str,
+    /// The rule kind the pane's tail matches (`cap`, `auth`, ...), when any:
+    /// names WHAT ghost banner the corpse is showing, purely informational.
+    banner: Option<String>,
+}
+
+/// Whether this orphan should be announced now: first sight emits, then at
+/// most once per [`ORPHAN_REEMIT_SECS`] per session. In-memory like
+/// `last_event_state` (a bounce re-announces, subscribers dedup).
+fn orphan_reemit(last: &mut HashMap<String, u64>, sid: &str, now_secs: u64) -> bool {
+    match last.get(sid) {
+        Some(at) if now_secs.saturating_sub(*at) < ORPHAN_REEMIT_SECS => false,
+        _ => {
+            last.insert(sid.to_string(), now_secs);
+            true
+        }
+    }
+}
+
+/// Event detail for an `orphan_pane` emission: names the dead bucket and any
+/// ghost banner so the Commander can reap without re-inspecting the pane.
+fn orphan_detail(bucket: &str, banner: Option<&str>) -> String {
+    let ghost = banner
+        .map(|k| format!("; banner shows {k} (stale scrollback, not cap evidence)"))
+        .unwrap_or_default();
+    format!("{bucket} record still owns a live tmux pane{ghost} — reap signal, not a cap (WO#1391)")
+}
+
 /// Capture and classify every registered non-structured session's pane tail.
 /// Also returns the set of profiles with at least one pane actively working
 /// ("esc to interrupt" at the live edge) — empirical serving evidence that
 /// outranks a replayed cap banner on a sibling pane (WO#445). Blocking (tmux
 /// subprocesses + storage reads); run under `spawn_blocking`.
+///
+/// Records in a dead bucket (trashed/archived) are partitioned out as
+/// [`OrphanPane`]s when their tmux session is still alive: they contribute
+/// nothing to scans, serving evidence, or usage meters (WO#1391).
 fn scan_panes(
     file_watch: &Arc<FileWatchService>,
     rules: &[CompiledRule],
-) -> (Vec<PaneScan>, HashSet<String>) {
+) -> (Vec<PaneScan>, HashSet<String>, Vec<OrphanPane>) {
     let instances = match super::load_all_instances(file_watch) {
         Ok(i) => i,
         Err(e) => {
             tracing::warn!(target: "server.pane_watchdog", error = %e, "load_all_instances failed; skipping tick");
-            return (Vec::new(), HashSet::new());
+            return (Vec::new(), HashSet::new(), Vec::new());
         }
     };
     let mut serving: HashSet<String> = HashSet::new();
@@ -1037,11 +1084,35 @@ fn scan_panes(
     // (profile, tool) pair per tick, not once per session.
     let mut pin_memo: HashMap<(String, String), Option<String>> = HashMap::new();
     let mut scans = Vec::new();
+    let mut orphans = Vec::new();
     for inst in instances.iter().filter(|inst| !inst.is_structured()) {
         let Ok(sess) = inst.tmux_session() else {
             continue;
         };
         if !sess.exists() {
+            continue;
+        }
+        // A dead record's live pane exits the pipeline here, before any
+        // signal, serving, or usage evidence is collected from it: whatever
+        // the corpse renders is scrollback of a session that no longer
+        // exists as far as the fleet is concerned (WO#1391: the mover
+        // relocated a month-trashed record over exactly such a ghost).
+        if inst.is_trashed() || inst.is_archived() {
+            let banner = sess.capture_pane(60).ok().and_then(|content| {
+                pane_rules::classify_fp_admitting(&content, rules)
+                    .map(|(rule, _, _)| rule.kind.clone())
+            });
+            orphans.push(OrphanPane {
+                id: inst.id.clone(),
+                title: inst.title.clone(),
+                profile: inst.source_profile.clone(),
+                bucket: if inst.is_trashed() {
+                    "trashed"
+                } else {
+                    "archived"
+                },
+                banner,
+            });
             continue;
         }
         let Ok(content) = sess.capture_pane(60) else {
@@ -1139,7 +1210,7 @@ fn scan_panes(
             stale_held: None,
         });
     }
-    (scans, serving)
+    (scans, serving, orphans)
 }
 
 /// The extra_args string that carries a session's EFFECTIVE model pin: the
@@ -1271,6 +1342,10 @@ struct Watchdog {
     /// Per-pane snapshot of the previous tick, feeding [`admit_stale_banner`].
     /// In-memory only (see [`PaneTickMemory`]).
     pane_memory: HashMap<String, PaneTickMemory>,
+    /// When each orphan pane was last announced ([`ORPHAN_REEMIT_SECS`]),
+    /// wall-clock secs. In-memory: a bounce re-announces standing orphans,
+    /// same rationale as `last_event_state` (WO#1391).
+    last_orphan_emit: HashMap<String, u64>,
 }
 
 impl Watchdog {
@@ -1290,13 +1365,14 @@ impl Watchdog {
             staged_rebind: load_staged_rebind(),
             last_usage_above: HashMap::new(),
             pane_memory: HashMap::new(),
+            last_orphan_emit: HashMap::new(),
         }
     }
 
     async fn tick(&mut self, state: &Arc<super::AppState>) {
         let file_watch = state.file_watch.clone();
         let rules = self.rules.clone();
-        let (mut scans, serving) = match tokio::task::spawn_blocking(move || {
+        let (mut scans, serving, orphans) = match tokio::task::spawn_blocking(move || {
             scan_panes(&file_watch, &rules)
         })
         .await
@@ -1307,6 +1383,31 @@ impl Watchdog {
                 return;
             }
         };
+
+        // WO#1391: dead records' live panes were partitioned out of the scan
+        // set above; announce each as a reap signal, debounced, and touch
+        // nothing else (no cap fold, no mover, no urgent stamp).
+        for o in &orphans {
+            if orphan_reemit(&mut self.last_orphan_emit, &o.id, unix_secs()) {
+                let detail = orphan_detail(o.bucket, o.banner.as_deref());
+                tracing::warn!(
+                    target: "server.pane_watchdog",
+                    id = %o.id,
+                    title = %o.title,
+                    profile = %o.profile,
+                    bucket = o.bucket,
+                    "orphan pane: dead record with a live tmux session (WO#1391)"
+                );
+                super::event_bus::emit_and_fan_out(
+                    state,
+                    "orphan_pane",
+                    &o.id,
+                    &o.title,
+                    &o.profile,
+                    &detail,
+                );
+            }
+        }
 
         let now = Instant::now();
         self.capped_profiles
@@ -2888,6 +2989,37 @@ mod tests {
     }
 
     const TEST_NOW: u64 = 1_800_000_000;
+
+    // ── WO#1391: orphan panes (dead record, live tmux session) ──────────
+
+    #[test]
+    fn orphan_reemit_debounces_per_session() {
+        let mut last = HashMap::new();
+        // (sid, at, expected) — first sight emits, cooldown holds, expiry
+        // re-emits, and a different orphan is never silenced by this one.
+        let cases = [
+            ("ca21a37c", TEST_NOW, true),
+            ("ca21a37c", TEST_NOW + 60, false),
+            ("d1f64ffc", TEST_NOW + 60, true),
+            ("ca21a37c", TEST_NOW + ORPHAN_REEMIT_SECS - 1, false),
+            ("ca21a37c", TEST_NOW + ORPHAN_REEMIT_SECS, true),
+        ];
+        for (sid, at, expected) in cases {
+            assert_eq!(orphan_reemit(&mut last, sid, at), expected, "{sid}@{at}");
+        }
+    }
+
+    #[test]
+    fn orphan_detail_names_bucket_and_banner() {
+        let d = orphan_detail("trashed", Some("cap"));
+        assert!(d.contains("trashed"), "{d}");
+        assert!(d.contains("cap"), "{d}");
+        assert!(d.contains("reap"), "{d}");
+        // Without a banner the pane is still an orphan worth reaping.
+        let d = orphan_detail("archived", None);
+        assert!(d.contains("archived"), "{d}");
+        assert!(!d.contains("banner shows"), "{d}");
+    }
 
     // ── commander resolution: cross-profile Commander wake target ───────
 
