@@ -20,6 +20,7 @@ mod file_provenance;
 mod git;
 mod log_level;
 mod mcp;
+mod message_tap;
 mod messages;
 pub(crate) mod plugin_settings;
 pub mod plugins;
@@ -84,6 +85,7 @@ pub(crate) use sessions::persist_session_update;
 #[cfg(feature = "serve")]
 pub(crate) use sessions::purge_expired_trash;
 // Startup backfill that relocates trashed worktrees; not a route handler.
+pub use message_tap::{create_subscription, delete_subscription, list_subscriptions};
 #[cfg(feature = "serve")]
 pub(crate) use sessions::reconcile_trashed_worktrees;
 pub use system::{
@@ -99,7 +101,7 @@ pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
     set_telemetry_consent,
 };
-pub use watchdog::get_watchdog_classifications;
+pub use watchdog::{get_cap_incidents, get_watchdog_classifications};
 
 /// Canonical 404 for a session id that does not resolve to a live instance.
 /// Body shape (`error` discriminator + human `message`) matches the rest of

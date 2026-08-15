@@ -101,6 +101,14 @@ pub struct ProfileCapacity {
     /// Unix seconds of the last update to this entry; the freshness gate.
     #[serde(default)]
     pub updated: u64,
+    /// Per-family cap observations: cap-kind string -> unix seconds the
+    /// banner was last seen. `cap_kind` alone remembers only the LAST family,
+    /// so a session-cap observation used to erase the knowledge that the same
+    /// account was weekly-dead, and the mover would stage a weekly-capped
+    /// session into a weekly-dead account (WO#1393 fix a). Each family decays
+    /// on its own clock via [`CapacityState::kind_dead`].
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub dead_kinds: HashMap<String, u64>,
 }
 
 /// The whole shared capacity map, one entry per account profile.
@@ -155,8 +163,65 @@ impl CapacityState {
         let entry = self.profiles.entry(profile.to_string()).or_default();
         entry.headroom = false;
         entry.cap_kind = Some(kind.as_str().to_string());
+        entry.dead_kinds.insert(kind.as_str().to_string(), now_secs);
         entry.updated = now_secs;
         self.updated = now_secs;
+    }
+
+    /// True while `profile` carries a live observation of THIS cap family:
+    /// stamped within the family's own decay window and not past a recorded
+    /// reset time. The mover uses this to refuse staging a capped session
+    /// into an account that is dead for the SAME kind, without freezing out
+    /// accounts whose observation is about a different clock (WO#1393 fix a).
+    pub fn kind_dead(&self, profile: &str, kind: CapKind, now_secs: u64) -> bool {
+        let Some(entry) = self.profiles.get(profile) else {
+            return false;
+        };
+        let Some(&stamped) = entry.dead_kinds.get(kind.as_str()) else {
+            return false;
+        };
+        // A recorded reset in the past means the clock has already rolled
+        // over; the observation is spent regardless of its TTL.
+        if entry.reset_at.is_some_and(|reset| now_secs >= reset) {
+            return false;
+        }
+        now_secs.saturating_sub(stamped) <= dead_kind_ttl_secs(kind)
+    }
+
+    /// Record an EMPIRICAL serving observation: a pane on this profile was
+    /// seen actively working. That is stronger evidence than any stale cap
+    /// stamp, so it grants headroom in-daemon (the one exception to the
+    /// "claims only enter from outside" rule; the pane doing real work IS
+    /// the serve probe). Account-scoped cap kinds (session/weekly/monthly)
+    /// are cleared by any serving pane; the fable credit pool is cleared
+    /// only when the serving pane was actually ON a fable model, since a
+    /// pane serving on opus proves nothing about fable credit (WO#1393
+    /// fix b: live capacity, not a stale capacity-file cache).
+    pub fn grant_observed_serving(&mut self, profile: &str, fable_serving: bool, now_secs: u64) {
+        let entry = self.profiles.entry(profile.to_string()).or_default();
+        entry.headroom = true;
+        entry.note = Some("observed serving pane".to_string());
+        entry.updated = now_secs;
+        let fable = CapKind::Fable.as_str();
+        entry
+            .dead_kinds
+            .retain(|kind, _| kind == fable && !fable_serving);
+        if entry.dead_kinds.is_empty() {
+            entry.cap_kind = None;
+        }
+        self.updated = now_secs;
+    }
+}
+
+/// How long an observed cap of each family stays trusted as "this account is
+/// dead for that kind" absent a recorded reset time. Session windows roll
+/// every 5 hours; weekly and monthly clocks move slowly enough that a day of
+/// caution is cheap; the fable credit pool keeps the generic headroom TTL.
+fn dead_kind_ttl_secs(kind: CapKind) -> u64 {
+    match kind {
+        CapKind::Session => 5 * 60 * 60,
+        CapKind::Weekly | CapKind::MonthlySpend => 24 * 60 * 60,
+        CapKind::Fable | CapKind::Unknown => HEADROOM_TTL_SECS,
     }
 }
 
@@ -279,10 +344,8 @@ mod tests {
                 profile.to_string(),
                 ProfileCapacity {
                     headroom: *headroom,
-                    cap_kind: None,
-                    note: None,
-                    reset_at: None,
                     updated: *updated,
+                    ..Default::default()
                 },
             );
         }
@@ -352,14 +415,82 @@ mod tests {
             ProfileCapacity {
                 headroom: false,
                 cap_kind: Some("weekly".to_string()),
-                note: None,
                 reset_at: Some(NOW + 3600),
                 updated: NOW,
+                ..Default::default()
             },
         );
         state.save(&path);
         let loaded = CapacityState::load(&path);
         assert_eq!(loaded.profiles["xce-main"].reset_at, Some(NOW + 3600));
+    }
+
+    #[test]
+    fn kind_dead_tracks_families_independently() {
+        let mut state = CapacityState::default();
+        state.revoke_headroom("forit-main", CapKind::Weekly, NOW - 60);
+        state.revoke_headroom("forit-main", CapKind::Session, NOW - 30);
+        // Both observations live side by side even though cap_kind only
+        // remembers the last one.
+        assert!(state.kind_dead("forit-main", CapKind::Weekly, NOW));
+        assert!(state.kind_dead("forit-main", CapKind::Session, NOW));
+        assert!(!state.kind_dead("forit-main", CapKind::Fable, NOW));
+        assert!(!state.kind_dead("forit-backup", CapKind::Weekly, NOW));
+    }
+
+    #[test]
+    fn kind_dead_decays_per_family_and_respects_reset() {
+        let mut state = CapacityState::default();
+        // Session observations expire after their 5h window ...
+        state.revoke_headroom("a", CapKind::Session, NOW - 5 * 3600 - 1);
+        assert!(!state.kind_dead("a", CapKind::Session, NOW));
+        // ... while a weekly observation of the same age is still live.
+        state.revoke_headroom("b", CapKind::Weekly, NOW - 5 * 3600 - 1);
+        assert!(state.kind_dead("b", CapKind::Weekly, NOW));
+        // A recorded reset in the past spends the observation early.
+        state.revoke_headroom("c", CapKind::Weekly, NOW - 60);
+        state.profiles.get_mut("c").unwrap().reset_at = Some(NOW - 1);
+        assert!(!state.kind_dead("c", CapKind::Weekly, NOW));
+        // A future reset does not.
+        state.profiles.get_mut("c").unwrap().reset_at = Some(NOW + 3600);
+        assert!(state.kind_dead("c", CapKind::Weekly, NOW));
+    }
+
+    #[test]
+    fn observed_serving_grants_headroom_and_clears_account_kinds() {
+        let mut state = CapacityState::default();
+        state.revoke_headroom("forit-main", CapKind::Weekly, NOW - 60);
+        state.revoke_headroom("forit-main", CapKind::Fable, NOW - 30);
+        // A non-fable serving pane clears the account-scoped kinds but says
+        // nothing about the fable credit pool.
+        state.grant_observed_serving("forit-main", false, NOW);
+        assert!(state.verified_headroom("forit-main", NOW));
+        assert!(!state.kind_dead("forit-main", CapKind::Weekly, NOW));
+        assert!(state.kind_dead("forit-main", CapKind::Fable, NOW));
+        assert_eq!(
+            state.profiles["forit-main"].note.as_deref(),
+            Some("observed serving pane")
+        );
+        // A fable serving pane clears the fable stamp too, and with no dead
+        // kinds left the summary cap_kind resets.
+        state.grant_observed_serving("forit-main", true, NOW);
+        assert!(!state.kind_dead("forit-main", CapKind::Fable, NOW));
+        assert!(state.profiles["forit-main"].cap_kind.is_none());
+    }
+
+    #[test]
+    fn dead_kinds_roundtrip_and_default_empty() {
+        // Legacy rows without the field must still parse.
+        let legacy: ProfileCapacity =
+            serde_json::from_str(r#"{"headroom": false, "updated": 5}"#).expect("legacy row");
+        assert!(legacy.dead_kinds.is_empty());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capacity.json");
+        let mut state = CapacityState::default();
+        state.revoke_headroom("xce-main", CapKind::MonthlySpend, NOW);
+        state.save(&path);
+        let loaded = CapacityState::load(&path);
+        assert!(loaded.kind_dead("xce-main", CapKind::MonthlySpend, NOW + 60));
     }
 
     #[test]

@@ -237,9 +237,8 @@ mod tests {
             ProfileCapacity {
                 headroom: false,
                 cap_kind: Some("monthly-spend".to_string()),
-                note: None,
-                reset_at: None,
                 updated: NOW - 100,
+                ..Default::default()
             },
         );
         apply_patch(
@@ -261,8 +260,8 @@ mod tests {
                 headroom: false,
                 cap_kind: Some("fable-credit".to_string()),
                 note: Some("watchdog observed".to_string()),
-                reset_at: None,
                 updated: NOW - 100,
+                ..Default::default()
             },
         );
         apply_patch(
@@ -332,8 +331,8 @@ mod tests {
                 headroom: false,
                 cap_kind: Some("fable-credit".to_string()),
                 note: Some("watchdog observed".to_string()),
-                reset_at: None,
                 updated: NOW - 100,
+                ..Default::default()
             },
         );
         let entry = apply_profile_patch(&mut state, "xce-main", patch(true, None, None), NOW);

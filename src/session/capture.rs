@@ -214,6 +214,20 @@ pub(crate) fn relink_stranded_transcript(
 /// attempt to relink a stranded `<sid>.jsonl` into it (see
 /// [`relink_stranded_transcript`]). Wrapper that the daemon's resume-fallback
 /// path calls; returns the recovered transcript path or `None`.
+/// Resolve the canonical live-store transcript path for a session:
+/// `<claude_home>/projects/<encoded-project>/<sid>.jsonl`. Pure path math,
+/// no store scan; the caller decides what a missing file means.
+pub(crate) fn claude_transcript_path(project_path: &str, sid: &str) -> Option<PathBuf> {
+    let claude_home = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude").ok()?;
+    let canonical = canonicalize_or_raw(project_path);
+    Some(
+        claude_home
+            .join("projects")
+            .join(encode_claude_project_path(&canonical.to_string_lossy()))
+            .join(format!("{sid}.jsonl")),
+    )
+}
+
 pub(crate) fn recover_stranded_transcript(project_path: &str, sid: &str) -> Option<PathBuf> {
     let claude_home = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude").ok()?;
     let projects_root = claude_home.join("projects");

@@ -45,3 +45,57 @@ pub async fn get_watchdog_classifications(
     })?;
     Ok(Json(value))
 }
+
+/// Filters for `GET /api/cap-incidents`; all optional and combinable.
+#[derive(serde::Deserialize)]
+pub struct CapIncidentQuery {
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub open: Option<bool>,
+}
+
+/// `GET /api/cap-incidents?session=&profile=&open=` — the WO#1393 D2 cap
+/// incident ledger (onset, state trail, resolution, running duration for
+/// open incidents), read from the same file the pane watchdog persists.
+pub async fn get_cap_incidents(
+    State(_state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<CapIncidentQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(path) = crate::server::cap_ledger::ledger_path() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no app dir; cap-incident ledger unavailable".into(),
+        ));
+    };
+    let ledger = crate::server::cap_ledger::CapLedger::load(&path);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let rows: Vec<serde_json::Value> = ledger
+        .query(q.session.as_deref(), q.profile.as_deref(), q.open)
+        .into_iter()
+        .map(|i| {
+            let mut v = serde_json::to_value(i).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "duration_secs".into(),
+                    serde_json::json!(i.duration_secs(now_secs)),
+                );
+                obj.insert(
+                    "duration".into(),
+                    serde_json::json!(crate::server::pane_watchdog::fmt_hm(
+                        i.duration_secs(now_secs)
+                    )),
+                );
+            }
+            v
+        })
+        .collect();
+    Ok(Json(
+        serde_json::json!({ "updated": ledger.updated, "incidents": rows }),
+    ))
+}

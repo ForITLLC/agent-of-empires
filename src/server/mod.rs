@@ -12,11 +12,13 @@ pub(crate) mod attach_project;
 pub mod auth;
 mod ben_gate_surface;
 pub mod callback;
+pub(crate) mod cap_ledger;
 pub(crate) mod capacity;
 mod charter_drift;
 pub mod event_bus;
 pub mod live_ws;
 pub mod login;
+pub(crate) mod message_tap;
 mod pane;
 pub mod pane_composer;
 pub(crate) mod pane_watchdog;
@@ -574,6 +576,8 @@ pub struct AppState {
     /// and used to register per-profile `subscribe_channel` watches that
     /// fan into `disk_changed`.
     pub(crate) file_watch: Arc<FileWatchService>,
+    /// Regex message subscriptions + the tapped-transcript set (WO#1393 D1).
+    pub(crate) message_tap: Arc<message_tap::MessageTap>,
     /// Wakeup signal for `disk_watcher_consumer`. Per-profile forwarder
     /// tasks call `notify_one()` on every received `FileEvent`; the
     /// consumer task awaits `notified()` and reloads `state.instances`.
@@ -1296,6 +1300,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         telemetry_last_reported: std::sync::Mutex::new(None),
         shutdown: CancellationToken::new(),
         file_watch: Arc::clone(&file_watch),
+        message_tap: Arc::new(message_tap::MessageTap::load()),
         disk_changed: Arc::new(tokio::sync::Notify::new()),
         disk_watch_handles: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
@@ -2040,6 +2045,13 @@ fn build_router(state: Arc<AppState>) -> Router {
         // paths (CLI `aoe send` and POST /api/sessions/{id}/send).
         .route("/api/messages", get(api::get_messages))
         // Latest pane-watchdog per-tick classification snapshot (WO#450).
+        .route("/api/cap-incidents", get(api::get_cap_incidents))
+        // Regex message subscriptions over the transcript tap (WO#1393 D1).
+        .route(
+            "/api/subscriptions",
+            get(api::list_subscriptions).post(api::create_subscription),
+        )
+        .route("/api/subscriptions/{id}", delete(api::delete_subscription))
         .route(
             "/api/watchdog/classifications",
             get(api::get_watchdog_classifications),
@@ -2695,6 +2707,10 @@ const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // cap/auth event to an arbitrary URL, nor silence one by deleting it.
     ("POST", "/api/webhooks"),
     ("DELETE", "/api/webhooks/{id}"),
+    // Regex message subscriptions read every fleet transcript's new lines
+    // (WO#1393 D1): same exfiltration class as webhooks, so same denial.
+    ("POST", "/api/subscriptions"),
+    ("DELETE", "/api/subscriptions/{id}"),
     ("POST", "/api/power/classes/{class}/cancel"),
     ("DELETE", "/api/wakes/{id}"),
     ("PATCH", "/api/capacity"),
@@ -6540,6 +6556,7 @@ pub mod test_support {
             telemetry_last_reported: std::sync::Mutex::new(None),
             shutdown: CancellationToken::new(),
             file_watch,
+            message_tap: Arc::new(message_tap::MessageTap::default()),
             disk_changed: Arc::new(tokio::sync::Notify::new()),
             disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
@@ -7810,9 +7827,9 @@ mod tests {
             capacity::ProfileCapacity {
                 headroom: false,
                 cap_kind: Some("weekly".to_string()),
-                note: None,
                 reset_at: Some(1_900_000_000),
                 updated: 1_800_000_000,
+                ..Default::default()
             },
         );
         cap.save(&cap_path);
