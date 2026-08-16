@@ -421,11 +421,13 @@ fn push_shelf_error_lines(
 /// in all-profiles view where the full name is too wide.
 ///
 /// Hyphen/underscore-delimited names collapse to their segment initials
-/// (`forit-backup` becomes `fb`); single-segment names take their first three
-/// chars (`default` becomes `def`). Always lowercased, capped at four chars.
-/// The mapping is per-name and deterministic, so two profiles that collapse to
-/// the same code render identically; the full name still shows in a filtered
-/// view's list title and in the New/Restart dialogs.
+/// (`forit-backup` becomes `fb`), except a two-char lead segment keeps both
+/// its chars (`bp-main` becomes `bpm`, `bs-main` becomes `bsm`) since its
+/// second letter is what tells sibling prefixes apart. Single-segment names
+/// take their first three chars (`default` becomes `def`). Always lowercased,
+/// capped at four chars. The mapping is per-name and deterministic, so two
+/// profiles that still collapse to the same code render identically; the full
+/// name shows in a filtered view's list title and in the New/Restart dialogs.
 /// Per-row tag content plus the mode's max content width. The renderer
 /// right-pads `content` to `max_width` so the bracket span is fixed-width
 /// across rows (`[fb  ]` vs `[def ]`), keeping the activity column from
@@ -548,11 +550,20 @@ pub(crate) fn profile_short_code(profile: &str) -> String {
     let code: String = match segments.as_slice() {
         [] => String::new(),
         [single] => single.chars().take(3).collect(),
-        many => many
-            .iter()
-            .filter_map(|s| s.chars().next())
-            .take(4)
-            .collect(),
+        [first, rest @ ..] => {
+            // A two-char lead segment is typically an account prefix whose
+            // second letter is the distinguishing information; taking only
+            // its initial collapses distinct prefixes onto one code
+            // (`bp-main` and `bs-main` would both read `bm`), so keep both
+            // chars. Longer lead segments keep the initials scheme.
+            let lead_len = if first.chars().count() == 2 { 2 } else { 1 };
+            first
+                .chars()
+                .take(lead_len)
+                .chain(rest.iter().filter_map(|s| s.chars().next()))
+                .take(4)
+                .collect()
+        }
     };
     code.to_lowercase()
 }
@@ -4366,9 +4377,20 @@ mod tests {
 
     #[test]
     fn profile_short_code_multi_segment_takes_initials() {
-        assert_eq!(profile_short_code("forit-backup"), "fb");
-        assert_eq!(profile_short_code("pivot-main"), "pm");
-        assert_eq!(profile_short_code("wma-work"), "ww");
+        let cases = [
+            ("forit-backup", "fb"),
+            ("pivot-main", "pm"),
+            ("wma-work", "ww"),
+            // Two-char lead segments keep both chars so sibling prefixes
+            // stay distinguishable instead of both collapsing to "bm".
+            ("bp-main", "bpm"),
+            ("bs-main", "bsm"),
+            // Two-char lead still respects the four-char cap.
+            ("ab-cd-ef-gh", "abce"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(profile_short_code(input), expected, "{input:?}");
+        }
     }
 
     #[test]
