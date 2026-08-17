@@ -421,9 +421,9 @@ fn push_shelf_error_lines(
 /// in all-profiles view where the full name is too wide.
 ///
 /// Hyphen/underscore-delimited names collapse to their segment initials
-/// (`forit-backup` becomes `fb`), except a two-char lead segment keeps both
-/// its chars (`bp-main` becomes `bpm`, `bs-main` becomes `bsm`) since its
-/// second letter is what tells sibling prefixes apart. Single-segment names
+/// (`forit-backup` becomes `fb`), except a lead segment of up to three chars
+/// keeps all its chars (`bp-main` becomes `bpm`, `bsc-main` becomes `bscm`)
+/// since its later letters are what tell sibling prefixes apart. Single-segment names
 /// take their first three chars (`default` becomes `def`). Always lowercased,
 /// capped at four chars. The mapping is per-name and deterministic, so two
 /// profiles that still collapse to the same code render identically; the full
@@ -551,12 +551,14 @@ pub(crate) fn profile_short_code(profile: &str) -> String {
         [] => String::new(),
         [single] => single.chars().take(3).collect(),
         [first, rest @ ..] => {
-            // A two-char lead segment is typically an account prefix whose
-            // second letter is the distinguishing information; taking only
+            // A short lead segment is typically an account prefix whose
+            // later letters are the distinguishing information; taking only
             // its initial collapses distinct prefixes onto one code
-            // (`bp-main` and `bs-main` would both read `bm`), so keep both
-            // chars. Longer lead segments keep the initials scheme.
-            let lead_len = if first.chars().count() == 2 { 2 } else { 1 };
+            // (`bsc-main` and `bso-main` would both read `bm`), so leads of
+            // up to three chars keep all their chars. Longer lead segments
+            // keep the initials scheme.
+            let lead_count = first.chars().count();
+            let lead_len = if lead_count <= 3 { lead_count } else { 1 };
             first
                 .chars()
                 .take(lead_len)
@@ -4380,12 +4382,14 @@ mod tests {
         let cases = [
             ("forit-backup", "fb"),
             ("pivot-main", "pm"),
-            ("wma-work", "ww"),
-            // Two-char lead segments keep both chars so sibling prefixes
-            // stay distinguishable instead of both collapsing to "bm".
+            // Leads of up to three chars keep all their chars so sibling
+            // prefixes stay distinguishable instead of collapsing together
+            // ("bsc-main" and "bso-main" would both read "bm").
             ("bp-main", "bpm"),
-            ("bs-main", "bsm"),
-            // Two-char lead still respects the four-char cap.
+            ("bsc-main", "bscm"),
+            ("bso-main", "bsom"),
+            ("wma-work", "wmaw"),
+            // Short lead still respects the four-char cap.
             ("ab-cd-ef-gh", "abce"),
         ];
         for (input, expected) in cases {
