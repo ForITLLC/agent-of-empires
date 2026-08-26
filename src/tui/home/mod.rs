@@ -6928,6 +6928,13 @@ impl HomeView {
         if let Some(inst) = self.instances.get_mut(id) {
             inst.group_path = new_group_path;
             inst.source_profile = target.to_string();
+            // WO#1497 D3a: a TUI move is a human at the keyboard — stamp
+            // operator provenance so automated movers hold off this record.
+            inst.profile_set_by = Some("operator".to_string());
+            inst.profile_set_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .ok();
         }
         Ok(())
     }

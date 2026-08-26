@@ -132,8 +132,7 @@ pub(crate) const DRAW_TIERS: [&[&str]; 2] = [
 /// are never auto-moved (escalate only). Must stay the exact flatten of
 /// [`DRAW_TIERS`]; a relationship test pins that.
 pub(crate) const DRAW_ORDER: [&str; 8] = [
-    "gna-main", "xce-main", "RAS-Main", "bp-main", "cay-main", "bsc-main", "bso-main",
-    "RAS-Work",
+    "gna-main", "xce-main", "RAS-Main", "bp-main", "cay-main", "bsc-main", "bso-main", "RAS-Work",
 ];
 
 /// Pick the relocation target for a capped session: scan [`DRAW_TIERS`]
@@ -293,8 +292,19 @@ pub(crate) fn capped_move_reason(
 /// is load-bearing (Ben, 2026-08-05): the record moves and the account
 /// re-binds on the session's NEXT start; the live pane, and any unsubmitted
 /// draft sitting in it, is never touched.
-pub(crate) fn relocation_move_args<'a>(id: &'a str, target: &'a str) -> [&'a str; 5] {
-    ["session", "move", id, target, "--no-restart"]
+pub(crate) fn relocation_move_args<'a>(id: &'a str, target: &'a str) -> [&'a str; 7] {
+    // `--actor auto-mover` (WO#1497 D3a/b): the move records daemon
+    // provenance on the relocated record, and the move verb REFUSES it
+    // when an operator placed the session within the human-placement hold.
+    [
+        "session",
+        "move",
+        id,
+        target,
+        "--no-restart",
+        "--actor",
+        "auto-mover",
+    ]
 }
 
 /// How long an observed cap on a profile is trusted before it is assumed to
@@ -1310,6 +1320,15 @@ struct PaneTickMemory {
     profile: String,
 }
 
+/// True when this tick's scan proves an externally-staged rebind: the SAME
+/// live pane (pid continuity, both sides resolved) now carries a DIFFERENT
+/// record profile than last tick — i.e. someone relocated the record without
+/// restarting the pane, so the pane still renders under the old account
+/// (WO#1497 D3c). Unresolvable pids prove nothing and never adopt.
+fn external_rebind_staged(prev: &PaneTickMemory, pid: Option<u32>, profile: &str) -> bool {
+    prev.pane_pid.is_some() && prev.pane_pid == pid && prev.profile != profile
+}
+
 /// Decide whether a soft-stale banner (real banner text above an idle
 /// composer) is a live standing block or replayed scrollback. The TEXT
 /// cannot discriminate: a substring match cannot separate a banner from a
@@ -1554,6 +1573,47 @@ impl Watchdog {
         // serving/pre-grant gates as a hard live one. An admitted hit is
         // promoted to this scan's live signal; a held one only annotates
         // the classification row.
+        // WO#1497 D3c: adopt an EXTERNALLY-staged rebind. When a record's
+        // profile changed since last tick but the pane did not (same live
+        // pid), someone moved the record without a restart — a human
+        // `session move --no-restart`, a TUI move, an API write. The pane
+        // still renders under the OLD account, so its banner/meter must not
+        // be attributed to the new profile ("still capped" off a pre-move
+        // banner is the WO#1497 defect). Recording the same StagedRebind the
+        // watchdog's own mover records lets the existing cap_attribution /
+        // AwaitingRebind machinery hold cap state UNKNOWN until the pane
+        // first renders under the new binding (pid change clears it above).
+        let mut adopted = false;
+        for s in &scans {
+            if self.staged_rebind.contains_key(&s.id) {
+                continue;
+            }
+            let Some(prev) = self.pane_memory.get(&s.id) else {
+                continue;
+            };
+            if external_rebind_staged(prev, s.pane_pid, &s.profile) {
+                tracing::info!(
+                    target: "server.pane_watchdog",
+                    id = %s.id,
+                    from = %prev.profile,
+                    to = %s.profile,
+                    "externally-staged profile rebind adopted; cap state UNKNOWN for the new profile until the pane rebinds (WO#1497 D3c)"
+                );
+                self.staged_rebind.insert(
+                    s.id.clone(),
+                    StagedRebind {
+                        from_profile: prev.profile.clone(),
+                        target: s.profile.clone(),
+                        pane_pid: s.pane_pid,
+                    },
+                );
+                adopted = true;
+            }
+        }
+        if adopted {
+            self.persist_staged_rebind();
+        }
+
         for scan in &mut scans {
             let Some(hit) = &scan.stale_hit else {
                 continue;
@@ -3999,8 +4059,58 @@ and enter the code H7Q2K9F4P to authenticate.
         );
         assert_eq!(
             relocation_move_args(capped, "gna-main"),
-            ["session", "move", capped, "gna-main", "--no-restart"]
+            [
+                "session",
+                "move",
+                capped,
+                "gna-main",
+                "--no-restart",
+                "--actor",
+                "auto-mover"
+            ]
         );
+    }
+
+    #[test]
+    fn external_rebind_adoption_requires_pid_continuity_and_profile_change() {
+        // WO#1497 D3c: same live pane + changed record profile = an
+        // externally-staged rebind the watchdog must adopt so the pane's
+        // banner keeps belonging to the account bound at render time.
+        let prev = |pid: Option<u32>, profile: &str| PaneTickMemory {
+            pane_pid: pid,
+            cap_fp: None,
+            working: false,
+            profile: profile.to_string(),
+        };
+        // The defect case: human `session move --no-restart` → adopt.
+        assert!(external_rebind_staged(
+            &prev(Some(42), "bso-main"),
+            Some(42),
+            "gna-main"
+        ));
+        // Same profile: nothing staged.
+        assert!(!external_rebind_staged(
+            &prev(Some(42), "gna-main"),
+            Some(42),
+            "gna-main"
+        ));
+        // Pid changed: the pane restarted, the new profile is truthful.
+        assert!(!external_rebind_staged(
+            &prev(Some(42), "bso-main"),
+            Some(43),
+            "gna-main"
+        ));
+        // Unresolvable pid on either side proves nothing — never adopt.
+        assert!(!external_rebind_staged(
+            &prev(None, "bso-main"),
+            Some(42),
+            "gna-main"
+        ));
+        assert!(!external_rebind_staged(
+            &prev(Some(42), "bso-main"),
+            None,
+            "gna-main"
+        ));
     }
 
     #[test]
@@ -4573,7 +4683,10 @@ and enter the code H7Q2K9F4P to authenticate.
         );
         assert_eq!(kind, "capped-all-accounts");
         assert!(reason.contains("ACTION REQUIRED"), "{reason}");
-        assert!(reason.contains("ALL 7 pool accounts"), "{reason}");
+        // Count derives from the pool so a topology change cannot re-stale
+        // this assertion (it said "ALL 7" after the pool grew to 8).
+        let all = format!("ALL {} pool accounts", DRAW_ORDER.len());
+        assert!(reason.contains(&all), "{reason}");
         assert!(reason.to_lowercase().contains("probed"), "{reason}");
         // Every pool account appears, with kind and reset countdown.
         for p in DRAW_ORDER {
@@ -5314,8 +5427,14 @@ ACTION REQUIRED (Ben): approve the Ramp device login for gna-finance
 
         let mut off = ActivityConfig::default();
         assert!(
+            paging_allowed(&off),
+            "the class defaults ON (WO#1497 D1): a silent PARKED fleet is the \
+             160h-latency failure mode"
+        );
+        off.set(PAGE_CLASS, false);
+        assert!(
             !paging_allowed(&off),
-            "the class defaults off, so the watchdog must not page"
+            "turning the class off must withhold pages"
         );
         off.set(PAGE_CLASS, true);
         assert!(paging_allowed(&off));
@@ -5331,8 +5450,11 @@ ACTION REQUIRED (Ben): approve the Ramp device login for gna-finance
         );
 
         // Neighbouring classes must not open this one. `push_notify` in
-        // particular reads like it would govern a page, and does not.
+        // particular reads like it would govern a page, and does not. With the
+        // class defaulting ON, prove it by turning ONLY this class off and
+        // every neighbour on: the page stays withheld.
         let mut other = ActivityConfig::default();
+        other.set(PAGE_CLASS, false);
         other.set("push_notify", true);
         other.set("session_auto_restart", true);
         assert!(!paging_allowed(&other));

@@ -691,8 +691,11 @@ pub struct ActivityConfig {
     pub monitor: bool,
 
     /// The pane watchdog paging the Commander about a pane it read (cap
-    /// banner, ACTION REQUIRED, device code).
-    #[serde(default)]
+    /// banner, ACTION REQUIRED, device code). Default ON (WO#1497 D1): with
+    /// pages withheld, a PARKED fleet waits silently on a capacity PATCH
+    /// nobody knows to make — per-home sat capped 160h39m behind exactly
+    /// that. Detection/moves work without it; the page is the escalation.
+    #[serde(default = "default_pane_watchdog_page_on")]
     #[setting(label = "Pane-watchdog paging", widget = "toggle")]
     pub pane_watchdog_page: bool,
 
@@ -743,13 +746,19 @@ fn default_account_switch_on() -> bool {
     true
 }
 
+/// Absent from an older config must read ON (WO#1497 D1): a silent PARKED
+/// fleet is the 160h-latency failure mode.
+fn default_pane_watchdog_page_on() -> bool {
+    true
+}
+
 impl Default for ActivityConfig {
     fn default() -> Self {
         Self {
             harness_wakeup: false,
             cron: false,
             monitor: false,
-            pane_watchdog_page: false,
+            pane_watchdog_page: true,
             session_message_dispatch: false,
             worker_report_to_commander: false,
             session_auto_restart: false,
@@ -3563,14 +3572,18 @@ mod activity_class_tests {
     use super::*;
 
     #[test]
-    fn every_class_is_off_by_default_except_account_switching() {
+    fn every_class_is_off_by_default_except_account_switching_and_paging() {
         let cfg = ActivityConfig::default();
         for class in ActivityConfig::CLASSES {
-            let expected = *class == "rate_limit_account_switch";
+            // rate_limit_account_switch: without it a capped session simply
+            // stops. pane_watchdog_page (WO#1497 D1): without it a PARKED
+            // fleet waits silently on a capacity PATCH nobody knows to make.
+            let expected = matches!(*class, "rate_limit_account_switch" | "pane_watchdog_page");
             assert_eq!(
                 cfg.is_on(class),
                 expected,
-                "{class} default is wrong; only rate_limit_account_switch may default on"
+                "{class} default is wrong; only rate_limit_account_switch and \
+                 pane_watchdog_page may default on"
             );
         }
     }

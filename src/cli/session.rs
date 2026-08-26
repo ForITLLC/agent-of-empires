@@ -227,6 +227,51 @@ pub struct MoveArgs {
     /// later. The new account binding then takes effect on the next start.
     #[arg(long = "no-restart")]
     pub no_restart: bool,
+
+    /// Who is making this move: 'operator' (a human), 'auto-mover' (the
+    /// daemon cap relocator), or 'api' (scripts/automation). Defaults to
+    /// 'operator' on an interactive terminal, else 'api'. A non-operator
+    /// move REFUSES to override a placement an operator made within the
+    /// last 6 hours (WO#1497 D3b) — re-run with `--actor operator` to
+    /// override deliberately.
+    #[arg(long, value_parser = ["operator", "auto-mover", "api"])]
+    pub actor: Option<String>,
+}
+
+/// Hold window during which a non-operator mover must not override a
+/// human placement (WO#1497 D3b).
+pub(crate) const HUMAN_PLACEMENT_HOLD_SECS: u64 = 6 * 3600;
+
+/// `Some(age_secs)` when this move must be REFUSED: a non-operator actor
+/// is trying to override a profile placement an operator made less than
+/// [`HUMAN_PLACEMENT_HOLD_SECS`] ago. Operator moves are never vetoed, and
+/// records with no provenance (pre-WO#1497, or never moved) are free.
+pub(crate) fn human_placement_veto(
+    actor: &str,
+    set_by: Option<&str>,
+    set_at: Option<u64>,
+    now_secs: u64,
+) -> Option<u64> {
+    if actor == "operator" || set_by != Some("operator") {
+        return None;
+    }
+    let age = now_secs.saturating_sub(set_at?);
+    (age < HUMAN_PLACEMENT_HOLD_SECS).then_some(age)
+}
+
+/// Resolve the effective move actor: an explicit `--actor` wins; otherwise
+/// an interactive terminal is a human ("operator") and anything else —
+/// a daemon shell-out, a cron, a script — is "api".
+fn resolve_move_actor(explicit: Option<&str>) -> String {
+    if let Some(a) = explicit {
+        return a.to_string();
+    }
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        "operator".to_string()
+    } else {
+        "api".to_string()
+    }
 }
 
 #[derive(Args)]
@@ -781,12 +826,39 @@ async fn move_session(args: MoveArgs) -> Result<()> {
         return Ok(());
     }
 
+    let actor = resolve_move_actor(args.actor.as_deref());
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(age) = human_placement_veto(
+        &actor,
+        record.profile_set_by.as_deref(),
+        record.profile_set_at,
+        now_secs,
+    ) {
+        bail!(
+            "REFUSING to move '{}' ({}): an operator placed it on '{}' {}h{:02}m ago \
+             (inside the {}h human-placement hold). A human placement outranks '{}'; \
+             re-run with --actor operator to override deliberately.",
+            title,
+            id,
+            owner,
+            age / 3600,
+            (age % 3600) / 60,
+            HUMAN_PLACEMENT_HOLD_SECS / 3600,
+            actor
+        );
+    }
+
     // Build the relocated record: re-home it on the target profile and drop
     // the per-profile group association (group_path is meaningful only
     // within its origin profile; carrying it over would dangle).
     let mut moved = record.clone();
     moved.source_profile = target.clone();
     moved.group_path = String::new();
+    moved.profile_set_by = Some(actor.clone());
+    moved.profile_set_at = Some(now_secs);
 
     // Insert into the target FIRST, then remove from the source. A crash
     // between the two leaves a harmless duplicate (recoverable) rather than
@@ -805,8 +877,8 @@ async fn move_session(args: MoveArgs) -> Result<()> {
     })?;
 
     println!(
-        "✓ Moved record '{}' ({}): profile '{}' -> '{}'.",
-        title, id, owner, target
+        "✓ Moved record '{}' ({}): profile '{}' -> '{}' (actor: {}).",
+        title, id, owner, target, actor
     );
 
     if args.no_restart {
@@ -4239,5 +4311,45 @@ mod show_json_tests {
         assert!(!serialized.contains("trashed_at"), "{serialized}");
         assert!(!serialized.contains("archived_at"), "{serialized}");
         assert!(serialized.contains("\"state\":\"live\""), "{serialized}");
+    }
+
+    /// WO#1497 D3b: a non-operator mover must not override a placement an
+    /// operator made inside the hold window; everything else is free.
+    #[test]
+    fn human_placement_veto_shields_recent_operator_moves_only() {
+        let now = 1_787_800_000;
+        let recent = Some(now - 3600); // 1h ago, inside the 6h hold
+        let stale = Some(now - HUMAN_PLACEMENT_HOLD_SECS - 1);
+        // The WO#1497 incident shape: the auto-mover (or an API script)
+        // overriding Ben's hour-old placement → REFUSED, age reported.
+        assert_eq!(
+            human_placement_veto("auto-mover", Some("operator"), recent, now),
+            Some(3600)
+        );
+        assert_eq!(
+            human_placement_veto("api", Some("operator"), recent, now),
+            Some(3600)
+        );
+        // An operator overriding an operator is a human decision — allowed.
+        assert_eq!(
+            human_placement_veto("operator", Some("operator"), recent, now),
+            None
+        );
+        // The hold expires.
+        assert_eq!(
+            human_placement_veto("auto-mover", Some("operator"), stale, now),
+            None
+        );
+        // Prior automated placements and provenance-free records are free.
+        assert_eq!(
+            human_placement_veto("auto-mover", Some("auto-mover"), recent, now),
+            None
+        );
+        assert_eq!(human_placement_veto("api", None, None, now), None);
+        // operator provenance with no timestamp cannot prove freshness.
+        assert_eq!(
+            human_placement_veto("auto-mover", Some("operator"), None, now),
+            None
+        );
     }
 }

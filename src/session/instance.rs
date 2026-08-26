@@ -1053,6 +1053,16 @@ pub struct Instance {
     #[serde(default, skip_serializing)]
     pub source_profile: String,
 
+    // Provenance of the last cross-profile placement (WO#1497 D3a): who
+    // relocated this record ("operator" | "auto-mover" | "api") and when
+    // (unix secs). Movers consult this before overriding a recent HUMAN
+    // placement; None on records that have never been moved since the
+    // fields landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_set_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_set_at: Option<u64>,
+
     // Push-notification per-session overrides. None means "inherit the
     // server-wide default for this event type" (WebConfig.notify_on_*).
     // Some(true)/Some(false) is an explicit user toggle and takes
@@ -1874,6 +1884,8 @@ impl Instance {
             resume_intent: ResumeIntent::Default,
             force_fresh_next_launch: false,
             source_profile: String::new(),
+            profile_set_by: None,
+            profile_set_at: None,
             notify_on_waiting: None,
             notify_on_idle: None,
             notify_on_error: None,
