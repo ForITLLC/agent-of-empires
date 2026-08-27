@@ -3250,6 +3250,169 @@ async fn load_or_generate_token_at(
     token
 }
 
+/// A cross-profile duplicate session record: the same id present in two
+/// profile stores at once. `move_session` inserts into the target store
+/// before removing from the source, so a crash between the two writes
+/// leaves this shape behind, and nothing else ever cleans it up.
+#[derive(Debug, Clone)]
+struct CrossProfileDup {
+    id: String,
+    title: String,
+    kept_profile: String,
+    dropped_profile: String,
+    content_carried: bool,
+}
+
+/// Placement recency for duplicate resolution: an explicit profile
+/// placement stamp beats any implicit signal, with `last_accessed_at`
+/// breaking ties between rows that were never explicitly placed.
+fn placement_key(inst: &Instance) -> (u64, i64) {
+    (
+        inst.profile_set_at.unwrap_or(0),
+        inst.last_accessed_at.map(|t| t.timestamp()).unwrap_or(0),
+    )
+}
+
+/// Carry content the losing duplicate holds that the winner lacks (or
+/// holds stale): the goal cluster travels as a unit when the loser's is
+/// newer, worktree binding and title only fill gaps. Returns whether
+/// anything was carried, so the repair pass knows a content write-back
+/// is needed before the ghost row is dropped.
+fn carry_content(winner: &mut Instance, loser: &Instance) -> bool {
+    let mut carried = false;
+    let loser_goal_newer = match (loser.goal_updated_at, winner.goal_updated_at) {
+        (Some(l), Some(w)) => l > w,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if loser.goal.is_some() && (winner.goal.is_none() || loser_goal_newer) {
+        winner.goal = loser.goal.clone();
+        winner.goal_updated_at = loser.goal_updated_at;
+        winner.goal_perpetual = loser.goal_perpetual;
+        winner.goal_last_read_at = loser.goal_last_read_at;
+        winner.goal_read_count = loser.goal_read_count;
+        winner.goal_read_tracking_since = loser.goal_read_tracking_since;
+        winner.goal_reader_declared_at = loser.goal_reader_declared_at;
+        carried = true;
+    }
+    if winner.worktree_info.is_none() && loser.worktree_info.is_some() {
+        winner.worktree_info = loser.worktree_info.clone();
+        carried = true;
+    }
+    if winner.title.trim().is_empty() && !loser.title.trim().is_empty() {
+        winner.title = loser.title.clone();
+        carried = true;
+    }
+    carried
+}
+
+/// Collapse cross-profile duplicate ids to the row with the newest
+/// placement, carrying newer content off the dropped row. Order is
+/// preserved by first occurrence.
+fn dedupe_cross_profile_instances(
+    instances: Vec<Instance>,
+) -> (Vec<Instance>, Vec<CrossProfileDup>) {
+    let mut kept: Vec<Instance> = Vec::with_capacity(instances.len());
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut dups = Vec::new();
+    for inst in instances {
+        let Some(&i) = index.get(&inst.id) else {
+            index.insert(inst.id.clone(), kept.len());
+            kept.push(inst);
+            continue;
+        };
+        let loser = if placement_key(&inst) > placement_key(&kept[i]) {
+            std::mem::replace(&mut kept[i], inst)
+        } else {
+            inst
+        };
+        let winner = &mut kept[i];
+        let content_carried = carry_content(winner, &loser);
+        dups.push(CrossProfileDup {
+            id: winner.id.clone(),
+            title: winner.title.clone(),
+            kept_profile: winner.source_profile.clone(),
+            dropped_profile: loser.source_profile.clone(),
+            content_carried,
+        });
+    }
+    (kept, dups)
+}
+
+/// Persist the duplicate repair: write carried content onto the kept row
+/// in its home store, then drop the ghost row from the store it should no
+/// longer live in. Idempotent, and self-quiescing: once the ghost row is
+/// gone the dedupe pass stops reporting the id. Content is written before
+/// the ghost is removed so a crash between the two writes loses nothing.
+fn repair_cross_profile_dups(
+    dups: &[CrossProfileDup],
+    kept: &[Instance],
+    file_watch: &Arc<FileWatchService>,
+) {
+    for dup in dups {
+        if dup.content_carried {
+            let Some(winner) = kept.iter().find(|i| i.id == dup.id) else {
+                continue;
+            };
+            let res = Storage::open(&dup.kept_profile, file_watch.clone()).and_then(|s| {
+                s.update(|instances, _| {
+                    if let Some(row) = instances.iter_mut().find(|i| i.id == dup.id) {
+                        row.goal = winner.goal.clone();
+                        row.goal_updated_at = winner.goal_updated_at;
+                        row.goal_perpetual = winner.goal_perpetual;
+                        row.goal_last_read_at = winner.goal_last_read_at;
+                        row.goal_read_count = winner.goal_read_count;
+                        row.goal_read_tracking_since = winner.goal_read_tracking_since;
+                        row.goal_reader_declared_at = winner.goal_reader_declared_at;
+                        if row.worktree_info.is_none() {
+                            row.worktree_info = winner.worktree_info.clone();
+                        }
+                        if row.title.trim().is_empty() {
+                            row.title = winner.title.clone();
+                        }
+                    }
+                    Ok(())
+                })
+            });
+            if let Err(e) = res {
+                tracing::warn!(
+                    target: "server.file_watch",
+                    session = %dup.id,
+                    profile = %dup.kept_profile,
+                    error = %e,
+                    "cross-profile dup repair: content write-back failed; \
+                     leaving ghost row in place until it succeeds"
+                );
+                continue;
+            }
+        }
+        let res = Storage::open(&dup.dropped_profile, file_watch.clone()).and_then(|s| {
+            s.update(|instances, _| {
+                instances.retain(|i| i.id != dup.id);
+                Ok(())
+            })
+        });
+        match res {
+            Ok(()) => tracing::warn!(
+                target: "server.file_watch",
+                session = %dup.id,
+                title = %dup.title,
+                kept_profile = %dup.kept_profile,
+                dropped_profile = %dup.dropped_profile,
+                content_carried = dup.content_carried,
+                "repaired cross-profile duplicate session record"
+            ),
+            Err(e) => tracing::warn!(
+                target: "server.file_watch",
+                session = %dup.id,
+                profile = %dup.dropped_profile,
+                error = %e,
+                "cross-profile dup repair: ghost row removal failed; will retry"
+            ),
+        }
+    }
+}
+
 /// Load sessions from all profiles, matching the TUI's "all profiles" view.
 fn load_all_instances(file_watch: &Arc<FileWatchService>) -> anyhow::Result<Vec<Instance>> {
     let profiles = match crate::session::list_profiles() {
@@ -3282,6 +3445,10 @@ fn load_all_instances(file_watch: &Arc<FileWatchService>) -> anyhow::Result<Vec<
                 );
             }
         }
+    }
+    let (all, dups) = dedupe_cross_profile_instances(all);
+    if !dups.is_empty() {
+        repair_cross_profile_dups(&dups, &all, file_watch);
     }
     Ok(all)
 }
@@ -6701,6 +6868,73 @@ mod tests {
     fn vecs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
+
+    #[test]
+    fn dedupe_cross_profile_keeps_newest_placement_and_carries_content() {
+        let t0 = chrono::DateTime::from_timestamp(1_787_780_000, 0).unwrap();
+        let t1 = chrono::DateTime::from_timestamp(1_787_790_000, 0).unwrap();
+
+        // Ghost row: older placement, but it holds the goal the winner lacks.
+        let mut ghost = Instance::new("for-FinanceReporting", "/tmp/frep");
+        ghost.id = "dup-a".into();
+        ghost.source_profile = "forit-main".into();
+        ghost.profile_set_by = Some("api".into());
+        ghost.profile_set_at = Some(100);
+        ghost.goal = Some("finish the Q3 close".into());
+        ghost.goal_updated_at = Some(t1);
+        ghost.goal_read_count = 7;
+        ghost.last_accessed_at = Some(t0);
+
+        let mut placed = Instance::new("for-FinanceReporting", "/tmp/frep");
+        placed.id = "dup-a".into();
+        placed.source_profile = "gna-main".into();
+        placed.profile_set_by = Some("operator".into());
+        placed.profile_set_at = Some(200);
+        placed.last_accessed_at = Some(t1);
+
+        let mut solo = Instance::new("solo", "/tmp/solo");
+        solo.id = "solo-b".into();
+        solo.source_profile = "forit-main".into();
+
+        let (kept, drops) = dedupe_cross_profile_instances(vec![ghost, placed, solo]);
+        assert_eq!(kept.len(), 2);
+        let winner = kept.iter().find(|i| i.id == "dup-a").unwrap();
+        assert_eq!(winner.source_profile, "gna-main");
+        assert_eq!(winner.profile_set_by.as_deref(), Some("operator"));
+        assert_eq!(winner.goal.as_deref(), Some("finish the Q3 close"));
+        assert_eq!(winner.goal_updated_at, Some(t1));
+        assert_eq!(winner.goal_read_count, 7);
+        assert!(kept.iter().any(|i| i.id == "solo-b"));
+        assert_eq!(drops.len(), 1);
+        assert_eq!(
+            (
+                drops[0].id.as_str(),
+                drops[0].kept_profile.as_str(),
+                drops[0].dropped_profile.as_str(),
+                drops[0].content_carried,
+            ),
+            ("dup-a", "gna-main", "forit-main", true)
+        );
+
+        // Placement tie (no profile_set_at on either) falls back to
+        // last_accessed_at; no content differs, so no carry is flagged.
+        let mut older = Instance::new("t", "/tmp/t");
+        older.id = "dup-c".into();
+        older.source_profile = "p1".into();
+        older.last_accessed_at = Some(t0);
+        let mut newer = Instance::new("t", "/tmp/t");
+        newer.id = "dup-c".into();
+        newer.source_profile = "p2".into();
+        newer.last_accessed_at = Some(t1);
+        let (kept, drops) = dedupe_cross_profile_instances(vec![older, newer]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].source_profile, "p2");
+        assert_eq!(
+            (drops[0].dropped_profile.as_str(), drops[0].content_carried),
+            ("p1", false)
+        );
+    }
+
     #[test]
     fn drained_identity_reapply_honors_concurrent_generation_and_marker_writes() {
         let baseline = (
