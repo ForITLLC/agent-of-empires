@@ -126,6 +126,13 @@ pub enum SessionCommands {
     /// requested model. Pass an empty model (`""`) to CLEAR the pin and fall
     /// back to the account's default model.
     SetModel(SetModelArgs),
+
+    /// Flip a session's yolo mode (the agent's skip-approvals flag) on the
+    /// RECORD only, in whatever profile owns it. Mirrors `session set-model
+    /// --no-restart`: the live pane is never touched, and the change applies
+    /// the next time the session starts. Idempotent: a no-op when the record
+    /// already matches.
+    SetYolo(SetYoloArgs),
 }
 
 #[derive(Args)]
@@ -291,6 +298,17 @@ pub struct SetModelArgs {
     /// or to stage the change.
     #[arg(long = "no-restart")]
     pub no_restart: bool,
+}
+
+#[derive(Args)]
+pub struct SetYoloArgs {
+    /// Session ID or title. Looked up across ALL profiles, so no `-p` is
+    /// needed (exactly like `session set-model`).
+    pub identifier: String,
+
+    /// `on` to launch the agent with its yolo flag, `off` to launch without
+    /// it (`true`/`false` accepted as aliases).
+    pub state: String,
 }
 
 #[derive(Args)]
@@ -503,6 +521,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::EmptyTrash => empty_trash(profile).await,
         SessionCommands::Move(args) => move_session(args).await,
         SessionCommands::SetModel(args) => set_model_session(args).await,
+        SessionCommands::SetYolo(args) => set_yolo_session(args).await,
     }
 }
 
@@ -621,6 +640,55 @@ async fn set_model_session(args: SetModelArgs) -> Result<()> {
 
     println!("  Restarting to relaunch under the new model...");
     restart_session(&owner, SessionIdArgs { identifier: id }).await?;
+    Ok(())
+}
+
+/// Flip a session's stored yolo mode, record-only, cross-profile. Unlike
+/// `set-model` there is no restart path at all: yolo changes what flags the
+/// agent LAUNCHES with, so the safe application point is the session's next
+/// start, never a forced bounce of a possibly mid-task pane.
+async fn set_yolo_session(args: SetYoloArgs) -> Result<()> {
+    let enabled = match args.state.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" => true,
+        "off" | "false" => false,
+        other => bail!("invalid yolo state '{}': pass 'on' or 'off'", other),
+    };
+    let shown = if enabled { "on" } else { "off" };
+
+    let (owner, record) = find_session_across_profiles(&args.identifier)?;
+    let id = record.id.clone();
+    let title = record.title.clone();
+
+    if record.yolo_mode == enabled {
+        println!(
+            "Session '{}' ({}) already has yolo {}; nothing to change.",
+            title, id, shown
+        );
+        return Ok(());
+    }
+
+    let storage = Storage::new_unwatched(&owner)?;
+    let landed = storage.update(|instances, _groups| {
+        if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
+            stored.yolo_mode = enabled;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })?;
+    if !landed {
+        bail!(
+            "Session {} ({}) was removed from profile '{}' before set-yolo could land",
+            title,
+            id,
+            owner
+        );
+    }
+
+    println!(
+        "✓ Set yolo {} for '{}' ({}) in profile '{}'; applies on the session's next start.",
+        shown, title, id, owner
+    );
     Ok(())
 }
 
@@ -3493,6 +3561,21 @@ mod restart_args_tests {
                 assert!(args.model.is_empty());
             }
             _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn set_yolo_parses_identifier_and_state() {
+        for state in ["on", "off"] {
+            let cli = Cli::try_parse_from(["aoe", "set-yolo", "claude-3", state])
+                .expect("set-yolo must parse");
+            match cli.cmd {
+                SessionCommands::SetYolo(args) => {
+                    assert_eq!(args.identifier, "claude-3");
+                    assert_eq!(args.state, state);
+                }
+                _ => panic!("wrong subcommand"),
+            }
         }
     }
 }

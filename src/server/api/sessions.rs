@@ -6885,8 +6885,13 @@ pub struct CreateSessionBody {
     pub tool: String,
     #[serde(default)]
     pub group: String,
+    /// Omitted falls back to the server's `session.yolo_mode_default` config
+    /// (the same default the TUI new-session dialog seeds from); an explicit
+    /// value from the caller always wins. A plain bool here silently launched
+    /// every API-created session with yolo off, which strands agents that
+    /// stop on approval prompts.
     #[serde(default)]
-    pub yolo_mode: bool,
+    pub yolo_mode: Option<bool>,
     /// Explicit worktree opt-in. When omitted or false, legacy callers that
     /// send `worktree_branch` still opt into worktree mode.
     #[serde(default)]
@@ -7518,7 +7523,10 @@ pub async fn create_session(
         body.command_override = String::new();
         body.extra_args = String::new();
         body.extra_env = Vec::new();
-        body.yolo_mode = false;
+        // Explicit `Some(false)`, not `None`: an omitted value inherits the
+        // operator's `yolo_mode_default`, and locked-down mode must never
+        // inherit an operator convenience default.
+        body.yolo_mode = Some(false);
         body.worktree_enabled = false;
         body.worktree_branch = None;
         body.create_new_branch = false;
@@ -7925,7 +7933,11 @@ pub async fn create_session(
         base_branch: body.base_branch,
         sandbox: body.sandbox,
         sandbox_image: body.sandbox_image,
-        yolo_mode: body.yolo_mode,
+        yolo_mode: body.yolo_mode.unwrap_or_else(|| {
+            crate::session::Config::load_or_warn()
+                .session
+                .yolo_mode_default
+        }),
         extra_env: body.extra_env,
         extra_args: body.extra_args,
         command_override: body.command_override,
@@ -9551,6 +9563,33 @@ pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_body_yolo_omitted_inherits_config_default() {
+        // (yolo field in the request, config default) -> resolved yolo.
+        // The Option decode is the load-bearing part: a regression back to a
+        // plain bool makes the omitted rows decode to Some(false).
+        let cases = [
+            (None, true, true),
+            (None, false, false),
+            (Some(false), true, false),
+            (Some(true), false, true),
+        ];
+        for (sent, config_default, expected) in cases {
+            let mut body = serde_json::json!({"path": "/tmp/x", "tool": "claude"});
+            if let Some(v) = sent {
+                body["yolo_mode"] = serde_json::json!(v);
+            }
+            let decoded: CreateSessionBody = serde_json::from_value(body).unwrap();
+            assert_eq!(decoded.yolo_mode, sent, "decode of {sent:?}");
+            assert_eq!(
+                decoded.yolo_mode.unwrap_or(config_default),
+                expected,
+                "resolve of {sent:?} with default {config_default}"
+            );
+        }
+    }
+
     fn build_rename_test_state(
         persisted: Vec<Instance>,
         cached: Vec<Instance>,
