@@ -483,6 +483,21 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `GET /api/sessions/{id}/restart-status`: the truthful terminal record
+    /// of the last daemon-owned restart cascade (WO#1502). Unlike sampling
+    /// `status` from the list — which the hook poller overwrites within
+    /// ~500ms — this reads the cascade's own outcome write. A 404 means an
+    /// older daemon without the endpoint; callers fall back to list polling.
+    pub async fn restart_status(&self, session_id: &str) -> Result<serde_json::Value, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/restart-status",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json().await?)
+    }
+
     /// `GET /api/power`: the daemon's authoritative master power state.
     pub async fn get_power(&self) -> Result<serde_json::Value, HttpError> {
         let url = format!("{}/api/power", self.endpoint.base_url);

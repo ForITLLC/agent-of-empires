@@ -2165,10 +2165,52 @@ async fn try_daemon_restart(session_id: &str, title: &str) -> Result<bool> {
     }
 
     // Accepted: the cascade now runs daemon-side regardless of what this
-    // process does. Poll the session list until the status leaves
-    // `Starting`; on timeout report success-in-progress instead of failing,
-    // since the restart itself is no longer this process's to abort.
+    // process does. Prefer the cascade's own terminal record
+    // (`restart-status`, WO#1502) over sampling `status` from the list: the
+    // hook poller overwrites the list status within ~500ms, which both faked
+    // "✓ Restarted" for cascades that bailed before touching the pane
+    // (stale-profile "no longer exists") and read transient Error blips as
+    // failure. A daemon without the endpoint (404) keeps the legacy poll.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    if client.restart_status(session_id).await.is_ok() {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Ok(body) = client.restart_status(session_id).await {
+                // Anything other than "done" ("in_flight", "unknown" after a
+                // daemon bounce mid-cascade, or an unrecognized shape) keeps
+                // waiting out the deadline.
+                if body.get("state").and_then(|v| v.as_str()) == Some("done") {
+                    if body.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                        let profile = body
+                            .get("profile")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if profile.is_empty() {
+                            println!("✓ Restarted session: {} (daemon-side)", title);
+                        } else {
+                            println!(
+                                "✓ Restarted session: {} (daemon-side, profile '{}')",
+                                title, profile
+                            );
+                        }
+                        return Ok(true);
+                    }
+                    let err = body
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    bail!("Daemon-side restart failed for {title}: {err}");
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                println!(
+                    "✓ Restart accepted for {}; still settling daemon-side (watch `aoe list`)",
+                    title
+                );
+                return Ok(true);
+            }
+        }
+    }
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let Ok(sessions) = client.list_sessions::<serde_json::Value>().await else {

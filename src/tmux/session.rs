@@ -1437,17 +1437,55 @@ impl Session {
     /// Blocking (bounded ~22s worst case: ready wait + draft wait + verify);
     /// call from a blocking context.
     pub fn send_keys_verified(&self, text: &str, enter_delay_ms: u64, tool: &str) -> Result<()> {
+        self.send_keys_verified_with_history(text, enter_delay_ms, tool, &[])
+    }
+
+    /// Submit a machine-recognised parked draft with a bare Enter (never a
+    /// re-paste). Returns `Ok(true)` when the draft was this send's OWN text
+    /// and it left the composer — the delivery is complete and pasting again
+    /// would deliver it twice; `Ok(false)` means keep looping (a prior
+    /// message delivered, or the draft is still stuck and the bounded retry
+    /// budget decides).
+    fn submit_machine_draft(
+        &self,
+        class: MachineDraft,
+        text: &str,
+        machine_history: &[String],
+    ) -> Result<bool> {
+        self.send_raw_bytes(b"\r")?;
+        std::thread::sleep(VERIFY_SETTLE);
+        if class == MachineDraft::Outgoing {
+            let after = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
+            let gone = super::status_detection::claude_composer_draft(&after)
+                .map(|d| classify_machine_draft(&d, text, machine_history) == MachineDraft::No)
+                .unwrap_or(true);
+            if gone {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`send_keys_verified`](Self::send_keys_verified) with the caller's
+    /// recent MACHINE send history for this pane (WO#1502 c). A parked
+    /// composer draft that matches the outgoing text or a history entry is a
+    /// previous machine send whose Enter was swallowed — it is submitted bare
+    /// (delivering it) instead of being refused forever as a phantom
+    /// "operator draft"; text matching neither stays a human draft and is
+    /// refused exactly as before. History entries are message texts the
+    /// machine itself put (or tried to put) in this composer: audit-log sends
+    /// and the configured restart wake message.
+    pub fn send_keys_verified_with_history(
+        &self,
+        text: &str,
+        enter_delay_ms: u64,
+        tool: &str,
+        machine_history: &[String],
+    ) -> Result<()> {
         reject_forged_boundary(text)?;
         if tool != "claude" {
             return self.send_keys_with_delay(text, enter_delay_ms);
         }
-
-        const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
-        const READY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
-        const DRAFT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        const VERIFY_SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
-        const MAX_SUBMIT_RETRIES: u32 = 3;
-        const VERIFY_CAPTURE_LINES: usize = 30;
 
         // Phase 1: wait for the composer. On timeout proceed anyway; a pane in
         // a state the detector doesn't recognize (dialog, alt screen) must
@@ -1472,12 +1510,49 @@ impl Session {
         // whereas a human's draft submitted under their name cannot be
         // recalled and forges authorship they never gave.
         let mut draft_deadline: Option<std::time::Instant> = None;
+        let mut machine_submits: u32 = 0;
         loop {
             let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
             if super::status_detection::claude_pane_input_ready(&content) {
                 let Some(draft) = super::status_detection::claude_composer_draft(&content) else {
                     break;
                 };
+                // WO#1502 c: a parked draft is often not a human's words at
+                // all — it is a previous MACHINE send whose Enter was
+                // swallowed (a restart wake, or an earlier attempt of this
+                // very message). Refusing those as operator drafts turned one
+                // swallowed Enter into a composer poisoned forever: every
+                // later send refused against the same stuck text. Recognised
+                // machine text is submitted bare (delivering it — never
+                // fused, never re-pasted); unrecognised text keeps the
+                // human-draft refusal below, authorship intact.
+                let class = classify_machine_draft(&draft, text, machine_history);
+                if class != MachineDraft::No {
+                    if machine_submits >= MAX_SUBMIT_RETRIES {
+                        let err = SubmitUnconfirmed {
+                            attempts: machine_submits,
+                            prior_machine_message: class == MachineDraft::Prior,
+                        };
+                        tracing::warn!(target: "tmux.command",
+                            "send_keys_verified: machine draft would not submit; {err}"
+                        );
+                        return Err(err.into());
+                    }
+                    machine_submits += 1;
+                    tracing::info!(target: "tmux.command",
+                        "send_keys_verified: parked draft matches {} machine text; \
+                         submitting it bare ({machine_submits}/{MAX_SUBMIT_RETRIES})",
+                        if class == MachineDraft::Outgoing { "this send's own" } else { "a prior" },
+                    );
+                    if self.submit_machine_draft(class, text, machine_history)? {
+                        return Ok(());
+                    }
+                    // A prior message delivered, or the draft is still stuck
+                    // (the retry budget above decides). Restart the ready
+                    // window so the recovery didn't consume it.
+                    ready_deadline = std::time::Instant::now() + READY_TIMEOUT;
+                    continue;
+                }
                 let deadline = *draft_deadline
                     .get_or_insert_with(|| std::time::Instant::now() + DRAFT_TIMEOUT);
                 if std::time::Instant::now() >= deadline {
@@ -1519,8 +1594,34 @@ impl Session {
                 // ready detector says no (a redraw flicker, or a composer
                 // shape the detector doesn't recognize — the WO#453 fusion
                 // rode exactly this branch). If the final capture shows one,
-                // refuse here too rather than fuse.
+                // refuse here too rather than fuse — unless it is machine
+                // text (WO#1502 c), which gets the same bounded bare-Enter
+                // recovery as the ready-composer branch above.
                 if let Some(draft) = super::status_detection::claude_composer_draft(&content) {
+                    let class = classify_machine_draft(&draft, text, machine_history);
+                    if class != MachineDraft::No {
+                        if machine_submits >= MAX_SUBMIT_RETRIES {
+                            let err = SubmitUnconfirmed {
+                                attempts: machine_submits,
+                                prior_machine_message: class == MachineDraft::Prior,
+                            };
+                            tracing::warn!(target: "tmux.command",
+                                "send_keys_verified: machine draft on unready composer \
+                                 would not submit; {err}"
+                            );
+                            return Err(err.into());
+                        }
+                        machine_submits += 1;
+                        tracing::info!(target: "tmux.command",
+                            "send_keys_verified: machine draft on an unready composer; \
+                             submitting it bare ({machine_submits}/{MAX_SUBMIT_RETRIES})"
+                        );
+                        if self.submit_machine_draft(class, text, machine_history)? {
+                            return Ok(());
+                        }
+                        ready_deadline = std::time::Instant::now() + READY_TIMEOUT;
+                        continue;
+                    }
                     let refusal = ParkedDraftRefusal::from_draft(&draft);
                     tracing::warn!(target: "tmux.command",
                         "send_keys_verified: draft visible on an unready composer; {refusal}"
@@ -1561,9 +1662,19 @@ impl Session {
         }
         let content = self.capture_pane(VERIFY_CAPTURE_LINES).unwrap_or_default();
         if super::status_detection::claude_message_stuck_in_composer(&content, text) {
+            // WO#1502 c: the old WARN+Ok here reported "sent" for a message
+            // still visibly parked in the composer — the caller logged
+            // outcome=sent and nobody ever learned the delivery failed. A
+            // typed error lets the API surface `submit_unconfirmed` and the
+            // machine-history recovery above makes the retry safe.
+            let err = SubmitUnconfirmed {
+                attempts: MAX_SUBMIT_RETRIES,
+                prior_machine_message: false,
+            };
             tracing::warn!(target: "tmux.command",
-                "send_keys_verified: message still unsubmitted after {MAX_SUBMIT_RETRIES} Enter resends"
+                "send_keys_verified: {err}"
             );
+            return Err(err.into());
         }
         Ok(())
     }
@@ -2276,6 +2387,117 @@ impl std::fmt::Display for ParkedDraftRefusal {
 
 impl std::error::Error for ParkedDraftRefusal {}
 
+/// The message's text reached the composer but its submitting Enter never
+/// registered: after the bounded resubmit budget the text is still parked,
+/// unsubmitted, at `❯` (WO#1502 c).
+///
+/// Returning `Ok` here — the old behavior, a WARN and nothing else — made the
+/// API answer `{"sent":true}` and the audit row say `sent` for a message the
+/// target never received; the parked text then poisoned every LATER send as a
+/// phantom "operator draft". Like [`ParkedDraftRefusal`] this is a TYPE so it
+/// survives the anyhow boundary: the API layer downcasts it to report the
+/// delivery state it actually knows — typed, not submitted — instead of
+/// guessing between "sent" and "transport broke".
+///
+/// Carries counts only, never the message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitUnconfirmed {
+    /// Bare-Enter resubmits attempted before giving up.
+    pub attempts: u32,
+    /// True when the text wedging the composer is a PRIOR machine message
+    /// (recognised against the send history) that bare Enter could not
+    /// deliver either — the pane itself is not accepting submits.
+    pub prior_machine_message: bool,
+}
+
+impl std::fmt::Display for SubmitUnconfirmed {
+    /// Stable wording: it lands in daemon logs and API `detail` fields that
+    /// other sessions grep.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let which = if self.prior_machine_message {
+            "a prior machine message"
+        } else {
+            "the message"
+        };
+        write!(
+            f,
+            "{which} is typed into the composer but still UNSUBMITTED after \
+             {} bare-Enter resend(s); the pane is not accepting submits. \
+             Delivery state: typed, not submitted — a retry of the same \
+             message will submit the parked copy instead of double-pasting.",
+            self.attempts
+        )
+    }
+}
+
+impl std::error::Error for SubmitUnconfirmed {}
+
+/// What the text parked in the composer IS, judged against what this send is
+/// carrying and what the machine recently sent to this pane (WO#1502 c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MachineDraft {
+    /// The parked text is THIS send's own message (a prior attempt whose
+    /// Enter was swallowed): a bare Enter completes this delivery.
+    Outgoing,
+    /// The parked text is an EARLIER machine send (a swallowed-Enter wake or
+    /// message): submit it bare to deliver it, then proceed with this send.
+    Prior,
+    /// Unrecognised: a human's unsent words until proven otherwise. Refuse,
+    /// never submit — the WO#453/WO#741 authorship line.
+    No,
+}
+
+/// Whitespace-collapsed form: the composer renders a message wrapped to pane
+/// width, so byte equality never holds across a re-wrap.
+fn normalize_draft_text(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A rendered draft "is" a machine message when, whitespace-normalized, it
+/// equals the message — or is a ≥40-char prefix/suffix of it (the capture
+/// window can clip a long draft at either end). The length floor keeps a
+/// short human note that happens to open like a machine message from being
+/// submitted under the recovery; an unmatched draft stays a human draft and
+/// is refused, so a false negative costs a retry while a false positive
+/// would forge authorship. Judged against the OUTGOING text first: its parked
+/// copy means this very delivery is one Enter from complete.
+pub(crate) fn classify_machine_draft(
+    draft: &str,
+    outgoing: &str,
+    machine_history: &[String],
+) -> MachineDraft {
+    fn matches_one(draft_n: &str, msg_n: &str) -> bool {
+        if draft_n.is_empty() || msg_n.is_empty() {
+            return false;
+        }
+        if draft_n == msg_n {
+            return true;
+        }
+        draft_n.chars().count() >= 40 && (msg_n.starts_with(draft_n) || msg_n.ends_with(draft_n))
+    }
+    let draft_n = normalize_draft_text(draft);
+    if matches_one(&draft_n, &normalize_draft_text(outgoing)) {
+        return MachineDraft::Outgoing;
+    }
+    if machine_history
+        .iter()
+        .any(|m| matches_one(&draft_n, &normalize_draft_text(m)))
+    {
+        return MachineDraft::Prior;
+    }
+    MachineDraft::No
+}
+
+// Timing/window constants shared by the verified-send phases and the
+// machine-draft recovery (WO#1502 c). File-scope because both the send loop
+// and its recovery helper read them.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
+const READY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+const DRAFT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const VERIFY_SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+const MAX_SUBMIT_RETRIES: u32 = 3;
+const VERIFY_CAPTURE_LINES: usize = 30;
+
 /// Refuses to send any message carrying the injection boundary marker.
 ///
 /// The marker's entire meaning is "a human typed the text above this line".
@@ -2399,6 +2621,86 @@ mod tests {
     #[test]
     fn test_refusal_counts_a_single_line_draft_as_one_line() {
         assert_eq!(1, ParkedDraftRefusal::from_draft("no newline here").lines);
+    }
+
+    /// The authorship line for the WO#1502 c recovery: a parked draft is
+    /// submitted bare ONLY when it provably matches machine text (this send's
+    /// own message, or a recent machine send to this pane). Everything else
+    /// stays a human draft and is refused, so a false negative costs one
+    /// retry while a false positive would forge authorship.
+    #[test]
+    fn test_classify_machine_draft() {
+        let outgoing = "STATUS: shipped — daemon rebuilt, verify green, see commit abc1234";
+        let history = vec![
+            "wake up: pick up what you were doing".to_string(),
+            "WO#1500: audit the pane liveness detector and report".to_string(),
+        ];
+        let long_prior = &history[1];
+        let cases = [
+            // A human's words match nothing → refused, never submitted.
+            ("just checking in on this", MachineDraft::No),
+            // Exact copy of the outgoing text: this send's own swallowed Enter.
+            (outgoing, MachineDraft::Outgoing),
+            // The composer re-wraps to pane width; whitespace-normalized
+            // equality still recognises the outgoing text.
+            (
+                "STATUS: shipped — daemon rebuilt,\n  verify green, see\n  commit abc1234",
+                MachineDraft::Outgoing,
+            ),
+            // Exact match against history → a prior machine send.
+            ("wake up: pick up what you were doing", MachineDraft::Prior),
+            // A short prefix of the outgoing text (< 40 chars) is NOT enough:
+            // a human note may open with the same words.
+            ("STATUS: shipped", MachineDraft::No),
+            // A ≥40-char clipped tail of a history entry (capture window cut
+            // the head off) still identifies the machine message.
+            (&long_prior[long_prior.len() - 41..], MachineDraft::Prior),
+            // Empty draft is never a machine message.
+            ("", MachineDraft::No),
+        ];
+        for (draft, expected) in cases {
+            assert_eq!(
+                classify_machine_draft(draft, outgoing, &history),
+                expected,
+                "{draft:?}"
+            );
+        }
+        // Outgoing wins over Prior when the same text is both: the delivery
+        // in flight is the one a bare Enter completes.
+        let mut history_with_self = history.clone();
+        history_with_self.push(outgoing.to_string());
+        assert_eq!(
+            classify_machine_draft(outgoing, outgoing, &history_with_self),
+            MachineDraft::Outgoing
+        );
+    }
+
+    /// Same boundary guarantee as the parked-draft refusal above: the API
+    /// layer downcasts this type to report "typed, not submitted" instead of
+    /// a fate-unknown transport error, and the prose is a wire format.
+    #[test]
+    fn test_submit_unconfirmed_survives_anyhow_and_pins_its_prose() {
+        let err: anyhow::Error = SubmitUnconfirmed {
+            attempts: 3,
+            prior_machine_message: false,
+        }
+        .into();
+        let recovered = err
+            .downcast_ref::<SubmitUnconfirmed>()
+            .expect("unconfirmed submit must remain identifiable after crossing anyhow");
+        assert_eq!(3, recovered.attempts);
+        let prose = recovered.to_string();
+        assert!(prose.contains("typed, not submitted"), "{prose}");
+        assert!(prose.contains("3 bare-Enter resend(s)"), "{prose}");
+        assert!(SubmitUnconfirmed {
+            attempts: 1,
+            prior_machine_message: true,
+        }
+        .to_string()
+        .starts_with("a prior machine message"),);
+        // ...and a refusal never downcasts to it (and vice versa).
+        let refusal: anyhow::Error = ParkedDraftRefusal::from_draft("draft").into();
+        assert!(refusal.downcast_ref::<SubmitUnconfirmed>().is_none());
     }
 
     /// Forgery guard. The delimiter's whole meaning is "a human typed the text

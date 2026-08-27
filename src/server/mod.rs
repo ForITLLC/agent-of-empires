@@ -316,6 +316,21 @@ pub(crate) enum StatusSource {
 }
 
 /// Shared application state accessible by all request handlers.
+/// What actually happened to a daemon-owned restart cascade, recorded at its
+/// true terminal moment (WO#1502). `ok:false` + `error` is a cascade that ran
+/// and failed; the record is absent while a cascade is in flight or when none
+/// has run since the daemon booted. `profile` is the profile the cascade
+/// actually used — after a stale-profile adoption this names the moved-to
+/// profile, which is the caller's proof the rebind landed.
+#[derive(Debug, Clone)]
+pub struct RestartOutcomeRecord {
+    pub ok: bool,
+    pub error: Option<String>,
+    /// Unix seconds when the cascade reached its terminal state.
+    pub finished_at: i64,
+    pub profile: String,
+}
+
 pub struct AppState {
     pub profile: String,
     pub read_only: bool,
@@ -429,6 +444,15 @@ pub struct AppState {
     /// racing a second kill+start against the first. Synchronous mutex:
     /// critical sections are tiny and never span an `await`.
     pub restart_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Terminal outcome of the LAST daemon-owned restart cascade per session
+    /// id (WO#1502). The `status` a poller samples from the list is overwritten
+    /// within ~500ms by the hook poller, so a CLI watching it can read a
+    /// cascade that never ran as "✓ Restarted" — or a transient blip as
+    /// failure. `GET /api/sessions/{id}/restart-status` serves this record
+    /// instead: written exactly once per cascade, at its true end, and never
+    /// touched by status detection. Synchronous mutex: tiny critical sections,
+    /// never spans an `await`.
+    pub restart_outcomes: std::sync::Mutex<std::collections::HashMap<String, RestartOutcomeRecord>>,
     /// Master power switch + wake registry (`GET/POST /api/power`,
     /// `/api/wakes`). One authoritative ON/OFF for the whole install,
     /// persisted in the app dir; OFF refuses session create, send, ensure,
@@ -1263,6 +1287,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         delete_epoch: std::sync::atomic::AtomicU64::new(0),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        restart_outcomes: std::sync::Mutex::new(std::collections::HashMap::new()),
         power: Arc::new(power::PowerRegistry::load_from_app_dir()),
         restart_budget: Arc::new(restart_budget::RestartBudget::new()),
         events: Arc::new(event_bus::EventBus::new()),
@@ -1880,6 +1905,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/summarize", post(api::summarize_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route("/api/sessions/{id}/restart", post(api::restart_session))
+        .route(
+            "/api/sessions/{id}/restart-status",
+            get(api::restart_status),
+        )
         .route(
             "/api/sessions/{id}/terminal",
             post(api::ensure_terminal).delete(api::kill_terminal),
@@ -6526,6 +6555,7 @@ pub mod test_support {
             delete_epoch: std::sync::atomic::AtomicU64::new(0),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            restart_outcomes: std::sync::Mutex::new(std::collections::HashMap::new()),
             power: Arc::new(power::PowerRegistry::ephemeral()),
             restart_budget: Arc::new(restart_budget::RestartBudget::new()),
             events: Arc::new(event_bus::EventBus::new()),

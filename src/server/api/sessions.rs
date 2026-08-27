@@ -5370,6 +5370,15 @@ pub async fn restart_session(
         }
     }
 
+    // This cascade owns the outcome slot now: drop the previous cascade's
+    // record so a `restart-status` poller cannot read a stale terminal state
+    // as this restart's result (WO#1502).
+    state
+        .restart_outcomes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+
     // Suppress the status poller / recovery cascade for this id while the
     // detached task owns the restart, exactly like the startup-recovery
     // workers, so the mid-cascade dead pane never trips a phantom Error.
@@ -5416,15 +5425,57 @@ async fn run_detached_restart(state: Arc<AppState>, id: String) {
         let instances = state.instances.read().await;
         instances.iter().find(|i| i.id == id).cloned()
     };
-    let Some(instance) = snapshot else {
+    let Some(mut instance) = snapshot else {
         tracing::warn!(
             target: "http.api.sessions",
             session = %id,
             "detached restart: instance vanished before cascade"
         );
+        record_restart_outcome(
+            &state,
+            &id,
+            false,
+            Some("instance vanished before cascade".to_string()),
+            "",
+        );
         finish_detached_restart(&state, &id).await;
         return;
     };
+
+    // WO#1502 a/b: the profile in memory is load-time state, but `session
+    // move --no-restart` rewrites the sessions files directly — so at this
+    // moment the remembered profile's file may no longer hold the row. A
+    // cascade opening storage for the stale profile dies with "session no
+    // longer exists" without touching the pane, and the pane keeps running
+    // under the OLD account's CLAUDE_CONFIG_DIR until the pane watchdog's
+    // ~3-minute rebind adoption catches up. Disk owns placement: re-resolve
+    // the owner now and adopt it, in the cascade AND in the live map.
+    {
+        let expected = instance.source_profile.clone();
+        let resolve_id = id.clone();
+        let disk_owner = tokio::task::spawn_blocking(move || {
+            crate::session::find_owning_profile_on_disk(&resolve_id, &expected)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(owner) = disk_owner {
+            if owner != crate::session::config::effective_profile(&instance.source_profile) {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    stale = %instance.source_profile,
+                    adopted = %owner,
+                    "detached restart: row moved on disk; adopting owning profile (WO#1502)"
+                );
+                instance.source_profile = owner.clone();
+                let mut instances = state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    inst.source_profile = owner;
+                }
+            }
+        }
+    }
     let profile = instance.source_profile.clone();
     let sync_base = instance.clone();
 
@@ -5457,6 +5508,7 @@ async fn run_detached_restart(state: Arc<AppState>, id: String) {
                     (Some(Status::Error), Some(e.clone()))
                 }
             };
+            record_restart_outcome(&state, &id, status.is_none(), last_error.clone(), &profile);
             let working = (*result.instance).clone();
             {
                 let mut instances = state.instances.write().await;
@@ -5499,6 +5551,13 @@ async fn run_detached_restart(state: Arc<AppState>, id: String) {
                 session = %id,
                 "detached restart cascade panicked: {e}"
             );
+            record_restart_outcome(
+                &state,
+                &id,
+                false,
+                Some(format!("restart cascade panicked: {e}")),
+                &profile,
+            );
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                 inst.status = Status::Error;
@@ -5508,6 +5567,76 @@ async fn run_detached_restart(state: Arc<AppState>, id: String) {
     }
 
     finish_detached_restart(&state, &id).await;
+}
+
+/// Stamp the terminal outcome of a detached restart cascade (WO#1502).
+/// Written exactly once per cascade, at its true end, while the in-flight
+/// mark is still held — so a `restart-status` poller never sees a gap where
+/// the cascade looks finished but the record is missing.
+fn record_restart_outcome(
+    state: &Arc<AppState>,
+    id: &str,
+    ok: bool,
+    error: Option<String>,
+    profile: &str,
+) {
+    let rec = crate::server::RestartOutcomeRecord {
+        ok,
+        error,
+        finished_at: chrono::Utc::now().timestamp(),
+        profile: profile.to_string(),
+    };
+    state
+        .restart_outcomes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(id.to_string(), rec);
+}
+
+/// `GET /api/sessions/{id}/restart-status`: the truthful read of the last
+/// daemon-owned restart (WO#1502). The list's `status` field is overwritten
+/// within ~500ms by the hook poller, so a caller sampling it can read a
+/// cascade that never ran as success — this endpoint serves the cascade's own
+/// terminal record instead.
+pub async fn restart_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let in_flight = state
+        .restart_inflight
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&id);
+    let rec = state
+        .restart_outcomes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&id)
+        .cloned();
+    Json(restart_status_body(in_flight, rec.as_ref())).into_response()
+}
+
+/// The HTTP shape of a restart-status read. Pure so the contract a poller
+/// branches on can be asserted without a daemon. In-flight wins over any
+/// stale record: the record describes the PREVIOUS cascade until the current
+/// one reaches its own terminal write.
+fn restart_status_body(
+    in_flight: bool,
+    rec: Option<&crate::server::RestartOutcomeRecord>,
+) -> serde_json::Value {
+    if in_flight {
+        return serde_json::json!({"state": "in_flight"});
+    }
+    match rec {
+        Some(r) => serde_json::json!({
+            "state": "done",
+            "ok": r.ok,
+            "error": r.error,
+            "finished_at": r.finished_at,
+            "profile": r.profile,
+        }),
+        None => serde_json::json!({"state": "unknown"}),
+    }
 }
 
 /// Clear the restart bookkeeping: recovery suppression drains on the same
@@ -13121,6 +13250,13 @@ enum SendKeysError {
     /// two answer the caller's real question -- "can I retry?" -- in opposite
     /// ways: this one delivered nothing and knows it.
     ParkedDraft(crate::tmux::ParkedDraftRefusal),
+    /// The message was typed into the composer but its submitting Enter never
+    /// took: the text is parked at the prompt, unsent. Distinct from
+    /// [`Self::Tmux`] because delivery state is KNOWN (typed, not submitted),
+    /// and a retry is safe: the machine-draft recovery in
+    /// `send_keys_verified_with_history` recognizes the parked copy and
+    /// submits it bare rather than typing it again.
+    SubmitUnconfirmed(crate::tmux::SubmitUnconfirmed),
     Tmux(anyhow::Error),
 }
 
@@ -13178,6 +13314,23 @@ fn send_error_parts(err: &SendKeysError) -> (StatusCode, serde_json::Value) {
                 "detail": refusal.to_string(),
             }),
         ),
+        // 502: the daemon did its part (typed the message) but the agent
+        // pane never accepted the submit — an upstream failure the caller
+        // must hear about, not a silent "sent". Unlike `Tmux` below, the
+        // delivery state is precisely known.
+        SendKeysError::SubmitUnconfirmed(unconfirmed) => (
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({
+                "error": "submit_unconfirmed",
+                // The message text IS in the composer; only Enter failed.
+                "sent": "typed_unsubmitted",
+                // Safe because a retry finds its own text parked and
+                // submits it bare — it never types a second copy.
+                "retry_safe": true,
+                "attempts": unconfirmed.attempts,
+                "detail": unconfirmed.to_string(),
+            }),
+        ),
         // No `sent` field: a transport failure genuinely does not know whether
         // the message landed, and asserting either way would be a guess the
         // caller cannot audit.
@@ -13198,6 +13351,7 @@ fn send_error_audit_outcome(err: &SendKeysError) -> String {
         SendKeysError::Transient(_) => "error: session_transient".to_string(),
         SendKeysError::StructuredView => "error: acp_mode_unsupported".to_string(),
         SendKeysError::ParkedDraft(_) => "refused: parked_draft".to_string(),
+        SendKeysError::SubmitUnconfirmed(_) => "error: submit_unconfirmed".to_string(),
         SendKeysError::Tmux(_) => "error: tmux_error".to_string(),
     }
 }
@@ -13265,6 +13419,40 @@ pub async fn send_message(
         return crate::server::power::activity_class_off_response(
             crate::server::power::DISPATCH_CLASS,
         );
+    }
+
+    // WO#1502: a send may revive a dead pane, and the revive cascade opens
+    // storage for the remembered profile — stale after an external `session
+    // move --no-restart` rewrote the files. Re-resolve ownership from disk
+    // (fast path: one file read when memory is right) and adopt, exactly as
+    // the detached restart does, so a revive can never relaunch the pane
+    // under the moved-away-from profile's CLAUDE_CONFIG_DIR.
+    let mut instance = instance;
+    if req.revive {
+        let expected = instance.source_profile.clone();
+        let resolve_id = id.clone();
+        let disk_owner = tokio::task::spawn_blocking(move || {
+            crate::session::find_owning_profile_on_disk(&resolve_id, &expected)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(owner) = disk_owner {
+            if owner != crate::session::config::effective_profile(&instance.source_profile) {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    stale = %instance.source_profile,
+                    adopted = %owner,
+                    "send revive: row moved on disk; adopting owning profile (WO#1502)"
+                );
+                instance.source_profile = owner.clone();
+                let mut instances = state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    inst.source_profile = owner;
+                }
+            }
+        }
     }
 
     let sync_base = instance.clone();
@@ -13337,17 +13525,53 @@ pub async fn send_message(
             return Err(Box::new((inst_owned, outcome, SendKeysError::NotRunning)));
         }
         let delay = crate::agents::send_keys_enter_delay(&tool);
+        // WO#1502 c: recent machine sends to this pane, so a parked composer
+        // draft that is really a previous machine message (or this message's
+        // own earlier attempt) is recognized and submitted bare instead of
+        // being refused forever as an operator draft. Sources: the durable
+        // send audit (texts the machine put or tried to put in this
+        // composer) and the profile's restart wake message (typed by the
+        // restart cascade outside the audit path). Best-effort — an
+        // unreadable log just means no recovery, which is the old behavior.
+        let mut machine_history: Vec<String> = crate::messages::default_db_path()
+            .ok()
+            .and_then(|p| {
+                crate::messages::MessageLog::open(&p, crate::messages::DEFAULT_RETENTION).ok()
+            })
+            .map(|log| {
+                log.for_session(&inst_owned.id, 10)
+                    .into_iter()
+                    .filter(|(_, r)| {
+                        r.outcome == "sent" || r.outcome == "error: submit_unconfirmed"
+                    })
+                    .map(|(_, r)| r.message)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let wake =
+            crate::session::profile_config::resolve_config_or_warn(&inst_owned.source_profile)
+                .session
+                .restart_wake_message;
+        if !wake.trim().is_empty() {
+            machine_history.push(wake);
+        }
         // Verified send: post-restart claude panes accept a paste ~0.6s before
         // the composer accepts its Enter; the verified variant gates on
         // composer readiness and resubmits a swallowed Enter (never re-pastes).
-        if let Err(e) = tmux_session.send_keys_verified(&message, delay, &tool) {
+        if let Err(e) =
+            tmux_session.send_keys_verified_with_history(&message, delay, &tool, &machine_history)
+        {
             // A parked-draft refusal arrives on the same Result as a real tmux
             // failure, so it has to be recovered by type here or the caller
             // cannot tell "nothing was sent, deliberately" from "the transport
-            // broke, delivery unknown".
+            // broke, delivery unknown". Same for an unconfirmed submit, which
+            // knows the opposite: the text IS typed, only Enter failed.
             let err = match e.downcast::<crate::tmux::ParkedDraftRefusal>() {
                 Ok(refusal) => SendKeysError::ParkedDraft(refusal),
-                Err(e) => SendKeysError::Tmux(e),
+                Err(e) => match e.downcast::<crate::tmux::SubmitUnconfirmed>() {
+                    Ok(unconfirmed) => SendKeysError::SubmitUnconfirmed(unconfirmed),
+                    Err(e) => SendKeysError::Tmux(e),
+                },
             };
             return Err(Box::new((inst_owned, outcome, err)));
         }
@@ -13476,6 +13700,21 @@ pub async fn send_message(
                         target: "http.api.sessions",
                         "send_message: refused for {id}: operator draft in composer ({} chars)",
                         refusal.chars,
+                    );
+                    if did_work {
+                        let mut instances = state.instances.write().await;
+                        if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
+                            apply_cascade_state_sync(i, &sync_base, &started);
+                        }
+                    }
+                }
+                SendKeysError::SubmitUnconfirmed(unconfirmed) => {
+                    // No Error status paint: the pane is alive and holds the
+                    // typed message; a retry will submit it. Painting Error
+                    // would invite a pane "fix" that loses the parked text.
+                    tracing::warn!(
+                        target: "http.api.sessions",
+                        "send_message: submit unconfirmed for {id}: {unconfirmed}"
                     );
                     if did_work {
                         let mut instances = state.instances.write().await;
@@ -13948,6 +14187,106 @@ mod send_error_contract_tests {
             "error: tmux_error",
             send_error_audit_outcome(&transport_failure())
         );
+    }
+
+    /// WO#1502 c: an unconfirmed submit knows the OPPOSITE of the refusal —
+    /// the text IS typed, only its Enter failed — and used to be reported as
+    /// `{"sent":true}`. The contract: its own status (502, no collision), a
+    /// three-valued `sent` ("typed_unsubmitted", not a bool a caller could
+    /// mistake for delivered), retry_safe (the machine-draft recovery submits
+    /// the parked copy instead of typing again), and a truthful audit row.
+    #[test]
+    fn test_an_unconfirmed_submit_reports_typed_unsubmitted_and_retry_safe() {
+        let unconfirmed = SendKeysError::SubmitUnconfirmed(crate::tmux::SubmitUnconfirmed {
+            attempts: 3,
+            prior_machine_message: false,
+        });
+        let (status, body) = send_error_parts(&unconfirmed);
+        assert_eq!(StatusCode::BAD_GATEWAY, status);
+        for other in [
+            SendKeysError::NotRunning,
+            SendKeysError::ResumeFailed("sid".into()),
+            SendKeysError::Transient(crate::session::Status::Starting),
+            SendKeysError::StructuredView,
+            refusal(),
+            transport_failure(),
+        ] {
+            let (other_status, _) = send_error_parts(&other);
+            assert_ne!(status, other_status, "status collides with {other:?}");
+        }
+        assert_eq!("submit_unconfirmed", body["error"].as_str().unwrap());
+        assert_eq!("typed_unsubmitted", body["sent"].as_str().unwrap());
+        assert_eq!(Some(true), body["retry_safe"].as_bool());
+        assert_eq!(3, body["attempts"].as_u64().unwrap());
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("typed, not submitted"));
+        assert_eq!(
+            "error: submit_unconfirmed",
+            send_error_audit_outcome(&unconfirmed)
+        );
+    }
+}
+
+/// WO#1502: the `restart-status` contract a CLI poller branches on. The
+/// list's `status` is overwritten within ~500ms by the hook poller, so it can
+/// report "✓ Restarted" for a cascade that bailed before touching the pane;
+/// this endpoint's body is the cascade's own terminal write and these shapes
+/// are what make it trustworthy.
+#[cfg(test)]
+mod restart_status_tests {
+    use super::*;
+
+    fn done(ok: bool, error: Option<&str>, profile: &str) -> crate::server::RestartOutcomeRecord {
+        crate::server::RestartOutcomeRecord {
+            ok,
+            error: error.map(str::to_string),
+            finished_at: 1_756_200_000,
+            profile: profile.to_string(),
+        }
+    }
+
+    /// In flight wins over any record: the record describes the PREVIOUS
+    /// cascade until the current one reaches its own terminal write.
+    #[test]
+    fn in_flight_masks_a_stale_record() {
+        let stale = done(true, None, "gna-main");
+        let body = restart_status_body(true, Some(&stale));
+        assert_eq!("in_flight", body["state"].as_str().unwrap());
+        assert!(body.get("ok").is_none());
+    }
+
+    /// Success carries the profile the cascade ACTUALLY used — after a
+    /// stale-profile adoption this is the moved-to profile, the caller's
+    /// proof the rebind landed.
+    #[test]
+    fn success_names_the_profile_the_cascade_used() {
+        let body = restart_status_body(false, Some(&done(true, None, "cay-main")));
+        assert_eq!("done", body["state"].as_str().unwrap());
+        assert_eq!(Some(true), body["ok"].as_bool());
+        assert_eq!("cay-main", body["profile"].as_str().unwrap());
+    }
+
+    /// A failed cascade is reported as failed WITH its error — never left for
+    /// the caller to infer from a status field something else overwrites.
+    #[test]
+    fn failure_carries_the_cascade_error() {
+        let body = restart_status_body(
+            false,
+            Some(&done(false, Some("session x no longer exists"), "gna-main")),
+        );
+        assert_eq!("done", body["state"].as_str().unwrap());
+        assert_eq!(Some(false), body["ok"].as_bool());
+        assert!(body["error"].as_str().unwrap().contains("no longer exists"));
+    }
+
+    /// No record and not in flight: the honest answer is "unknown", never a
+    /// fabricated success or failure.
+    #[test]
+    fn absent_record_reads_unknown() {
+        let body = restart_status_body(false, None);
+        assert_eq!("unknown", body["state"].as_str().unwrap());
     }
 }
 

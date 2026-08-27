@@ -15,7 +15,8 @@ pub(crate) mod utils;
 pub(crate) mod vt;
 
 pub use session::{
-    PaneCursor, PaneEnvMutation, ParkedDraftRefusal, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL,
+    PaneCursor, PaneEnvMutation, ParkedDraftRefusal, Session, SubmitUnconfirmed,
+    SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL,
 };
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub(crate) use status_detection::{

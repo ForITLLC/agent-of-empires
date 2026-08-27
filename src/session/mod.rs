@@ -463,6 +463,33 @@ pub fn require_known_profile(profile: &str) -> Result<()> {
     );
 }
 
+/// Resolve which profile's `sessions.json` owns `id` RIGHT NOW, by exact id:
+/// `expected` (the caller's in-memory belief) is checked first, then every
+/// other profile. Returns `None` when no profile's file holds the row.
+///
+/// A daemon holds `source_profile` in memory from load time, but `session
+/// move --no-restart` (the CLI, or an external mover) rewrites the files
+/// directly — so at the moment a restart or revive cascade starts, memory can
+/// name a profile whose file no longer has the row. A cascade that opens
+/// storage for the remembered profile then dies with "session no longer
+/// exists" without ever touching the live pane, while the caller was told the
+/// restart was accepted (WO#1502 a/b). Disk is the source of truth for
+/// ownership; call this at cascade start and adopt the answer.
+pub fn find_owning_profile_on_disk(id: &str, expected: &str) -> Option<String> {
+    fn owns(profile: &str, id: &str) -> bool {
+        storage::Storage::new_unwatched(profile)
+            .and_then(|s| s.load())
+            .map(|rows| rows.iter().any(|i| i.id == id))
+            .unwrap_or(false)
+    }
+    let expected = config::effective_profile(expected);
+    if owns(&expected, id) {
+        return Some(expected);
+    }
+    let profiles = list_profiles().ok()?;
+    profiles.into_iter().find(|p| *p != expected && owns(p, id))
+}
+
 #[cfg(test)]
 pub(crate) static FAIL_NEXT_LIST_PROFILES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1041,6 +1068,44 @@ mod tests {
     #[test]
     fn favorites_first_defaults_on() {
         assert!(config::SessionConfig::default().favorites_first);
+    }
+
+    /// WO#1502 a/b root cause: after `session move --no-restart` rewrote the
+    /// files, the daemon's remembered profile no longer owns the row. The
+    /// resolver must follow the row to its new profile — this is the exact
+    /// state the failing restart cascades died in ("session no longer
+    /// exists") for a session sitting live in the moved-to profile's file.
+    #[test]
+    #[serial_test::serial]
+    fn owning_profile_follows_a_cross_profile_move_on_disk() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = test_support::isolate_app_dir_at(temp.path());
+
+        let inst = Instance::new("moved-session", "/tmp/moved");
+        let id = inst.id.clone();
+        let rows = vec![inst];
+        let dest = storage::Storage::new_unwatched("profile-b").unwrap();
+        dest.update(|i, _g| {
+            *i = rows.to_vec();
+            Ok(())
+        })
+        .unwrap();
+        // profile-a exists but its file no longer holds the row (the move
+        // removed it); memory still believes profile-a.
+        let old = storage::Storage::new_unwatched("profile-a").unwrap();
+        old.update(|_i, _g| Ok(())).unwrap();
+
+        assert_eq!(
+            find_owning_profile_on_disk(&id, "profile-a").as_deref(),
+            Some("profile-b")
+        );
+        // Fast path: when memory is right, the answer is the expected profile.
+        assert_eq!(
+            find_owning_profile_on_disk(&id, "profile-b").as_deref(),
+            Some("profile-b")
+        );
+        // A row on no profile's disk resolves to None (genuinely deleted).
+        assert_eq!(find_owning_profile_on_disk("no-such-id", "profile-a"), None);
     }
 
     fn app_dir(root: impl AsRef<Path>) -> PathBuf {
