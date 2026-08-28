@@ -82,7 +82,7 @@ impl NoAgentsDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = super::centered_rect(area, 70, 20);
+        let dialog_area = super::client_fit_rect(area, 70, 20);
 
         frame.render_widget(Clear, dialog_area);
 

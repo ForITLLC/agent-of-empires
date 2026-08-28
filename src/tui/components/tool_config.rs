@@ -119,7 +119,7 @@ pub fn render_tool_config_overlay(
     let dialog_height = fields_height + 4;
 
     let title = format!(" Tool Configuration: {} ", selected_tool);
-    let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+    let dialog_area = crate::tui::dialogs::client_fit_rect(area, dialog_width, dialog_height);
     frame.render_widget(Clear, dialog_area);
 
     let block = Block::default()

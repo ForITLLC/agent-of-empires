@@ -471,7 +471,7 @@ impl RenameDialog {
 
         let dialog_width = 50;
         let height = 15 + if show_toggle { 1 } else { 0 } + if show_warning { 2 } else { 0 };
-        let dialog_area = super::centered_rect(area, dialog_width, height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, height);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -614,7 +614,7 @@ impl RenameDialog {
         let dialog_width = 50;
         let has_error = self.validation_error.is_some();
         let dialog_height = if has_error { 16 } else { 13 };
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
 

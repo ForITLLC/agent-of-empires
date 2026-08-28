@@ -90,7 +90,7 @@ impl WorktreeNameDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = super::centered_rect(area, 54, 13);
+        let dialog_area = super::client_fit_rect(area, 54, 13);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()

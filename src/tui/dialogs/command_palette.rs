@@ -305,7 +305,7 @@ impl CommandPaletteDialog {
         self.visible_item_rows.clear();
         let dialog_width: u16 = area.width.saturating_sub(8).clamp(40, 70);
         let dialog_height: u16 = area.height.saturating_sub(6).clamp(10, 20);
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
         self.dialog_area = dialog_area;
 
         frame.render_widget(Clear, dialog_area);

@@ -146,7 +146,7 @@ impl InfoDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = super::centered_rect(area, self.width, self.height);
+        let dialog_area = super::client_fit_rect(area, self.width, self.height);
         self.dialog_area = dialog_area;
 
         frame.render_widget(Clear, dialog_area);
@@ -167,7 +167,7 @@ impl InfoDialog {
             .constraints([Constraint::Min(1), Constraint::Length(2)])
             .split(inner);
 
-        // Message. Wrap to the *rendered* width (centered_rect may have
+        // Message. Wrap to the *rendered* width (client_fit_rect may have
         // clamped below the requested size on small terminals) so the row
         // count is exact. In `Tail` mode scroll so the message's tail stays
         // visible when it doesn't fit (error output puts the payload last:

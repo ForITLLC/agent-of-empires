@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use super::{centered_rect, DialogResult};
+use super::{client_fit_rect, DialogResult};
 use crate::session::config::ToolSessionConfig;
 use crate::tui::styles::Theme;
 
@@ -117,7 +117,7 @@ impl ToolPickerDialog {
         let width = 50u16.min(area.width.saturating_sub(4));
         // +2 for borders, +1 for the footer hint row.
         let height = (self.items.len() as u16 + 3).min(area.height.saturating_sub(4));
-        let dialog_area = centered_rect(area, width, height);
+        let dialog_area = client_fit_rect(area, width, height);
         self.dialog_area = dialog_area;
 
         frame.render_widget(Clear, dialog_area);

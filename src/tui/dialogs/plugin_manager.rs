@@ -16,7 +16,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use tokio::sync::oneshot;
 
-use super::{centered_rect, DialogResult};
+use super::{client_fit_rect, DialogResult};
 use crate::plugin::changelog::{ChangelogEntry, UpdateChangelog};
 use crate::plugin::discover::{DiscoveryBadge, DiscoveryResult};
 use crate::plugin::install::{
@@ -1306,7 +1306,7 @@ impl PluginManagerDialog {
     pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {
         let width = area.width.clamp(40, 100);
         let height = area.height.clamp(12, 28);
-        let rect = centered_rect(area, width, height);
+        let rect = client_fit_rect(area, width, height);
         f.render_widget(Clear, rect);
         // A modal always owns the keyboard, so its border is always accent.
         self.render_into(f, rect, theme, true);
@@ -1869,7 +1869,7 @@ impl PluginManagerDialog {
             title,
         } = content;
         // A tiny terminal can be narrower/shorter than our preferred size;
-        // never pass clamp/centered_rect a max below the min (it panics).
+        // never pass clamp/client_fit_rect a max below the min (it panics).
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -1884,7 +1884,7 @@ impl PluginManagerDialog {
             .saturating_add(footer_rows)
             .saturating_add(2)
             .clamp(1, area.height);
-        let rect = centered_rect(area, width, height);
+        let rect = client_fit_rect(area, width, height);
         f.render_widget(Clear, rect);
         let block = Block::default()
             .title(title.to_string())

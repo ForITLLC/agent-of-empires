@@ -17,7 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use super::{centered_rect, DialogResult};
+use super::{client_fit_rect, DialogResult};
 use crate::tips::Tip;
 use crate::tui::home::bindings::{self, ActionId};
 use crate::tui::styles::Theme;
@@ -278,7 +278,7 @@ impl TipsDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = centered_rect(area, 74, 22);
+        let dialog_area = client_fit_rect(area, 74, 22);
         self.dialog_rect = dialog_area;
         frame.render_widget(Clear, dialog_area);
 

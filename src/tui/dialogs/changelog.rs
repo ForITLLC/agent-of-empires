@@ -166,7 +166,7 @@ impl ChangelogDialog {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_width = (area.width * 80 / 100).clamp(60, 100);
         let dialog_height = (area.height * 80 / 100).clamp(16, 40);
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
         self.dialog_area = dialog_area;
 
         frame.render_widget(Clear, dialog_area);

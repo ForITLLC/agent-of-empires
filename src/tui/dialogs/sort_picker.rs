@@ -122,7 +122,7 @@ impl SortPickerDialog {
         let dialog_width: u16 = (widest + 16).clamp(32, 60);
         let dialog_height: u16 = self.rows.len() as u16 + 5;
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
         self.dialog_area = dialog_area;
         frame.render_widget(Clear, dialog_area);
 

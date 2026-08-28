@@ -125,7 +125,7 @@ impl NewSessionDialog {
             .sum();
         let dialog_height = fields_height + 4; // +2 border, +2 margin
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = crate::tui::dialogs::client_fit_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -721,7 +721,7 @@ impl NewSessionDialog {
             .sum();
         let dialog_height = fields_height + 4;
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = crate::tui::dialogs::client_fit_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -843,7 +843,7 @@ impl NewSessionDialog {
 
         let title = " Worktree Configuration ";
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = crate::tui::dialogs::client_fit_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -1300,7 +1300,7 @@ impl NewSessionDialog {
             + if has_sandbox { 3 } else { 0 }
             + if show_sandbox_options_help { 12 } else { 0 };
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = crate::tui::dialogs::client_fit_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -1372,7 +1372,7 @@ impl NewSessionDialog {
             7
         };
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = crate::tui::dialogs::client_fit_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
 

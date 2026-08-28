@@ -289,7 +289,7 @@ impl ProjectsDialog {
             0
         };
         let dialog_height: u16 = list_height + 9 + adding_extra;
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()

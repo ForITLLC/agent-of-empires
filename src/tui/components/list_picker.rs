@@ -179,7 +179,7 @@ impl ListPicker {
         let dialog_height = (list_height + 7).min(area.height);
         let dialog_width: u16 = 50;
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = crate::tui::dialogs::client_fit_rect(area, dialog_width, dialog_height);
         self.dialog_area = dialog_area;
         // Own the filtered list (Vec<String>) instead of borrowing
         // (Vec<&String>) so subsequent `&mut self` writes below don't

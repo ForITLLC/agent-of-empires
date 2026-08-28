@@ -96,7 +96,7 @@ impl UpdateConfirmDialog {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let height = if self.needs_sudo { 11 } else { 10 };
-        let dialog_area = super::centered_rect(area, 60, height);
+        let dialog_area = super::client_fit_rect(area, 60, height);
 
         frame.render_widget(Clear, dialog_area);
 

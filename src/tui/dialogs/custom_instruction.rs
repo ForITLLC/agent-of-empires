@@ -89,7 +89,7 @@ impl CustomInstructionDialog {
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_width = (area.width * 70 / 100).max(40).min(area.width);
         let dialog_height = (area.height * 60 / 100).max(10).min(area.height);
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
 

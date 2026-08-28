@@ -121,7 +121,7 @@ impl AttachProjectDialog {
         // Two extra rows over the list: the restart warning and the key hint.
         let dialog_height: u16 = (self.options.len().max(3) as u16 + 6).min(20);
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
         self.dialog_area = dialog_area;
         frame.render_widget(Clear, dialog_area);
 

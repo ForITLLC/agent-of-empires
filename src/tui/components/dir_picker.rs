@@ -253,7 +253,7 @@ impl DirPicker {
         let dialog_height = (list_height + 7).min(area.height);
         let dialog_width: u16 = 60.min(area.width.saturating_sub(4));
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = crate::tui::dialogs::client_fit_rect(area, dialog_width, dialog_height);
         frame.render_widget(Clear, dialog_area);
 
         // " Browse: <path> " with border chars leaves dialog_width - 2 for content,
@@ -371,7 +371,7 @@ impl DirPicker {
         let dialog_width: u16 = 50;
         let dialog_height: u16 = 16;
 
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = crate::tui::dialogs::client_fit_rect(area, dialog_width, dialog_height);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()

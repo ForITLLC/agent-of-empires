@@ -144,7 +144,7 @@ impl SendMessageDialog {
         let content_lines = self.text_area.lines().len() as u16;
         let height = (content_lines + 2).clamp(3, 12).min(area.height.max(3));
         let dialog_width = responsive::dialog_width(area.width);
-        let dialog_area = super::centered_rect(area, dialog_width, height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, height);
 
         frame.render_widget(Clear, dialog_area);
 

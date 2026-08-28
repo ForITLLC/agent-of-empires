@@ -91,7 +91,7 @@ impl TelemetryConsentDialog {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dnt = crate::telemetry::do_not_track();
-        let dialog_area = super::centered_rect(area, 76, if dnt { 13 } else { 17 });
+        let dialog_area = super::client_fit_rect(area, 76, if dnt { 13 } else { 17 });
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()

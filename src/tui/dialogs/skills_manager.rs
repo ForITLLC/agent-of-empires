@@ -17,7 +17,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use ratatui_textarea::TextArea;
 
-use super::{centered_rect, DialogResult};
+use super::{client_fit_rect, DialogResult};
 use crate::session::skills_model::{self, DiscoveredSkill, SkillError, SyncOutcome, SyncStatus};
 use crate::tui::styles::Theme;
 use crate::tui::worker::Worker;
@@ -465,7 +465,7 @@ impl SkillsManagerDialog {
     pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {
         let width = area.width.clamp(40, 100);
         let height = area.height.clamp(12, 28);
-        let rect = centered_rect(area, width, height);
+        let rect = client_fit_rect(area, width, height);
         f.render_widget(Clear, rect);
         let block = Block::default()
             .title(" Skills ")
@@ -699,7 +699,7 @@ impl SkillsManagerDialog {
         )));
         let width = area.width.clamp(1, 60);
         let height = ((lines.len() as u16).saturating_add(2)).min(area.height);
-        let rect = centered_rect(area, width, height);
+        let rect = client_fit_rect(area, width, height);
         f.render_widget(Clear, rect);
         let block = Block::default()
             .title(title.to_string())

@@ -218,7 +218,7 @@ impl ProfilePickerDialog {
         let dialog_height = (list_height + 5).min(area.height);
         let dialog_width: u16 = 40;
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -325,7 +325,7 @@ impl ProfilePickerDialog {
         // name(1) + spacer(1) + error_lines + hint(1) + borders(2) + margin(2)
         let dialog_height: u16 = if has_error { 7 + error_lines } else { 7 };
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -390,7 +390,7 @@ impl ProfilePickerDialog {
         let dialog_height: u16 = 8;
         let dialog_width: u16 = 40;
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()

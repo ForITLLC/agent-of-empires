@@ -213,7 +213,7 @@ impl RepoTrustDialog {
 
         let dialog_width = 64.min(area.width.saturating_sub(4));
         let dialog_height = (content_height + 6).min(area.height.saturating_sub(4));
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
 
