@@ -105,3 +105,79 @@ pub fn centered_rect(
         height: height.min(area.height),
     }
 }
+
+/// Park the visible terminal cursor on the dialog's bottom-right corner.
+///
+/// A tmux client smaller than the window (a phone attached alongside a
+/// desktop client under `window-size largest`) shows only the part of the
+/// window containing the cursor, and tmux tracks only a VISIBLE cursor.
+/// Dialogs center in the full frame, so without an in-dialog cursor they
+/// can land entirely outside a small client's visible region. tmux pans
+/// minimally, so anchoring the bottom-right corner pulls the whole dialog
+/// into view on any client at least as large as the dialog.
+pub fn anchor_client_view(frame: &mut ratatui::Frame, dialog_area: ratatui::layout::Rect) {
+    if dialog_area.width == 0 || dialog_area.height == 0 {
+        return;
+    }
+    frame.set_cursor_position(ratatui::layout::Position::new(
+        dialog_area.right().saturating_sub(1),
+        dialog_area.bottom().saturating_sub(1),
+    ));
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Confirm-class dialogs must leave the terminal cursor on their own
+    /// bottom-right border corner so a smaller attached tmux client pans to
+    /// the dialog instead of showing an empty corner of the frame (WO#1513:
+    /// restart dialog invisible on a 90x44 phone client of a 235x85 window).
+    #[test]
+    fn confirm_dialogs_anchor_cursor_to_bottom_right_corner() {
+        let cases: Vec<(&str, Box<dyn FnMut(&mut ratatui::Frame)>)> = vec![
+            ("ConfirmDialog", {
+                let theme = load_theme("empire");
+                let mut d = super::ConfirmDialog::new("Stop Session", "Stop 'x'?", "stop_session");
+                Box::new(move |f| d.render(f, f.area(), &theme))
+            }),
+            ("RestartDialog", {
+                let theme = load_theme("empire");
+                let mut d = super::RestartDialog::new(
+                    "sess",
+                    "default",
+                    "claude",
+                    "",
+                    "",
+                    vec!["default".into()],
+                    vec!["claude".into()],
+                );
+                Box::new(move |f| d.render(f, f.area(), &theme))
+            }),
+        ];
+        for (name, mut render) in cases {
+            let backend = TestBackend::new(235, 85);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| render(f)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            // The bottom-right-most rounded corner char is the dialog's own.
+            let mut corner = None;
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    if buf[(x, y)].symbol() == "╯" {
+                        corner = Some((x, y));
+                    }
+                }
+            }
+            let corner = corner.unwrap_or_else(|| panic!("{name}: no dialog border rendered"));
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert_eq!(
+                (cursor.x, cursor.y),
+                corner,
+                "{name}: cursor must sit on the dialog's bottom-right corner"
+            );
+        }
+    }
+}

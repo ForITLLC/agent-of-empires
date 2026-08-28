@@ -200,6 +200,7 @@ impl ConfirmDialog {
         let dialog_area = super::centered_rect(area, width, height);
 
         frame.render_widget(Clear, dialog_area);
+        super::anchor_client_view(frame, dialog_area);
 
         let emphasis = match self.tone {
             Tone::Destructive => theme.error,

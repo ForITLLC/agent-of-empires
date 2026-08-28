@@ -469,6 +469,7 @@ impl RestartDialog {
         // isn't clipped (the cycler + suffix run past the old 54-col width).
         let dialog_area = super::centered_rect(area, 64, 14);
         frame.render_widget(Clear, dialog_area);
+        super::anchor_client_view(frame, dialog_area);
 
         let block = Block::default()
             .borders(Borders::ALL)

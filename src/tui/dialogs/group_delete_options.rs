@@ -228,6 +228,7 @@ impl GroupDeleteOptionsDialog {
         let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
+        super::anchor_client_view(frame, dialog_area);
 
         let block = Block::default()
             .borders(Borders::ALL)
