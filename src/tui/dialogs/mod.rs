@@ -106,15 +106,121 @@ pub fn centered_rect(
     }
 }
 
-/// Park the visible terminal cursor on the dialog's bottom-right corner.
+/// Center a confirm-class dialog within the region the smallest attached
+/// tmux client can see, so it stays usable on a phone-sized client.
 ///
 /// A tmux client smaller than the window (a phone attached alongside a
-/// desktop client under `window-size largest`) shows only the part of the
-/// window containing the cursor, and tmux tracks only a VISIBLE cursor.
-/// Dialogs center in the full frame, so without an in-dialog cursor they
-/// can land entirely outside a small client's visible region. tmux pans
-/// minimally, so anchoring the bottom-right corner pulls the whole dialog
-/// into view on any client at least as large as the dialog.
+/// desktop client under `window-size largest`) shows only a cut-down
+/// region of the window, panned per-client to follow the visible cursor.
+/// tmux's pan mapping is a three-zone clamp per axis (pin-left when the
+/// cursor is within a client-width of the left edge, pin-right near the
+/// right edge, else center on the cursor), so for a dialog centered in a
+/// window much wider than the client there is NO cursor position that
+/// brings the whole dialog into view; the dialog itself has to move.
+///
+/// Centering inside the top-left `min-client`-sized region works for
+/// every client at least as large as the dialog: a client's view either
+/// starts at the window origin (pin-left zone) and spans the region, or
+/// is centered on the in-dialog cursor. When every attached client is at
+/// least window-sized (the desktop-only case) the region is the whole
+/// frame and this is exactly `centered_rect`.
+pub fn client_fit_rect(
+    area: ratatui::layout::Rect,
+    width: u16,
+    height: u16,
+) -> ratatui::layout::Rect {
+    centered_rect(
+        shrink_to_min_client(area, min_attached_client()),
+        width,
+        height,
+    )
+}
+
+/// Top-left sub-region of `area` no larger than the smallest attached
+/// client's visible size. `min_client` is the raw client tty size; one row
+/// is reserved for the tmux status line.
+fn shrink_to_min_client(
+    area: ratatui::layout::Rect,
+    min_client: Option<(u16, u16)>,
+) -> ratatui::layout::Rect {
+    let Some((cw, ch)) = min_client else {
+        return area;
+    };
+    ratatui::layout::Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width.min(cw),
+        height: area.height.min(ch.saturating_sub(1)),
+    }
+}
+
+/// Smallest attached client (width, height) of the tmux session hosting
+/// this TUI, or None outside tmux / on any query failure. Cached briefly:
+/// dialogs re-render on every event tick and the client set changes
+/// rarely, so a short TTL keeps the exec off the hot path while still
+/// tracking a phone attaching mid-dialog.
+fn min_attached_client() -> Option<(u16, u16)> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    type ClientCache = Option<(Instant, Option<(u16, u16)>)>;
+    static CACHE: Mutex<ClientCache> = Mutex::new(None);
+
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((at, val)) = *cache {
+        if at.elapsed() < Duration::from_secs(2) {
+            return val;
+        }
+    }
+    let val = query_min_attached_client();
+    *cache = Some((Instant::now(), val));
+    val
+}
+
+/// One `tmux list-clients` against the HOST server (the one whose pane we
+/// render in, from $TMUX; not the server aoe manages sessions on).
+fn query_min_attached_client() -> Option<(u16, u16)> {
+    let tmux_env = std::env::var("TMUX").ok()?;
+    let socket = tmux_env.split(',').next().filter(|s| !s.is_empty())?;
+    let pane = std::env::var("TMUX_PANE").ok()?;
+    let out = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            socket,
+            "list-clients",
+            "-t",
+            &pane,
+            "-F",
+            "#{client_width} #{client_height}",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut min: Option<(u16, u16)> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut it = line.split_whitespace();
+        let (Some(w), Some(h)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(w), Ok(h)) = (w.parse::<u16>(), h.parse::<u16>()) else {
+            continue;
+        };
+        min = Some(match min {
+            Some((mw, mh)) => (mw.min(w), mh.min(h)),
+            None => (w, h),
+        });
+    }
+    min
+}
+
+/// Park the visible terminal cursor on the dialog's bottom-right corner.
+///
+/// tmux pans a smaller client's view only to a VISIBLE cursor; dialogs
+/// render no cursor of their own, so without this anchor a small client
+/// never pans toward the dialog at all. Combined with [`client_fit_rect`]
+/// the corner lands inside the pin-left zone for every client at least as
+/// large as the dialog, which pans the whole dialog into view.
 pub fn anchor_client_view(frame: &mut ratatui::Frame, dialog_area: ratatui::layout::Rect) {
     if dialog_area.width == 0 || dialog_area.height == 0 {
         return;
@@ -129,7 +235,37 @@ pub fn anchor_client_view(frame: &mut ratatui::Frame, dialog_area: ratatui::layo
 mod anchor_tests {
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
     use ratatui::Terminal;
+
+    /// The dialog region shrinks to what the smallest attached client can
+    /// see (one client row reserved for the tmux status line), and the
+    /// dialog centers inside that region so every client at least as large
+    /// as the dialog gets the whole dialog in its pin-left view.
+    #[test]
+    fn dialog_region_fits_smallest_client() {
+        let frame = Rect::new(0, 0, 235, 85);
+        // (min_client, expected shrunk region)
+        let cases = [
+            // no tmux / no clients: full frame, identical to centered_rect
+            (None, frame),
+            // phone client 90x44 tty: region is its 90x43 visible area
+            (Some((90, 44)), Rect::new(0, 0, 90, 43)),
+            // all clients at least window-sized: full frame
+            (Some((235, 86)), frame),
+            (Some((240, 90)), frame),
+            // degenerate client: width clamps, height saturates to 0
+            (Some((50, 1)), Rect::new(0, 0, 50, 0)),
+        ];
+        for (min_client, want) in cases {
+            let got = super::shrink_to_min_client(frame, min_client);
+            assert_eq!(got, want, "min_client={min_client:?}");
+        }
+        // The phone-shrunk region centers a 64x14 dialog fully inside the
+        // client-visible area (WO#1513 geometry).
+        let dialog = super::centered_rect(Rect::new(0, 0, 90, 43), 64, 14);
+        assert_eq!(dialog, Rect::new(13, 14, 64, 14));
+    }
 
     /// Confirm-class dialogs must leave the terminal cursor on their own
     /// bottom-right border corner so a smaller attached tmux client pans to

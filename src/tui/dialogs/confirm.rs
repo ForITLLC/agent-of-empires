@@ -197,7 +197,7 @@ impl ConfirmDialog {
             .saturating_add(chrome)
             .max(min_height)
             .min(area.height);
-        let dialog_area = super::centered_rect(area, width, height);
+        let dialog_area = super::client_fit_rect(area, width, height);
 
         frame.render_widget(Clear, dialog_area);
         super::anchor_client_view(frame, dialog_area);

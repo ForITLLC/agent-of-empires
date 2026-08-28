@@ -225,7 +225,7 @@ impl GroupDeleteOptionsDialog {
             dialog_height += 1;
         }
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        let dialog_area = super::client_fit_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
         super::anchor_client_view(frame, dialog_area);
