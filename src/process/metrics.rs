@@ -26,6 +26,21 @@ impl MemorySample {
             0.0
         }
     }
+
+    /// True when launching more agent processes now would push the host
+    /// toward swap thrash: the OS reports an elevated memory-pressure level
+    /// (macOS levels 2/4, Linux PSI some-avg10 past the floor), or available
+    /// memory is under a tenth of total. Unknown figures fail open; a host
+    /// we cannot read must not deadlock a resurrection.
+    pub fn pressure_elevated(&self) -> bool {
+        if self.macos_pressure_level.is_some_and(|level| level > 1) {
+            return true;
+        }
+        if self.psi_mem_some_avg10.is_some_and(|psi| psi > 10.0) {
+            return true;
+        }
+        self.total_bytes > 0 && (self.available_bytes as f64 / self.total_bytes as f64) < 0.10
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -394,5 +409,65 @@ fn process_snapshot() -> Vec<ProcessRecord> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::MemorySample;
+
+    /// WO#1528: the boot-resurrection stagger gates launches on this. Any
+    /// elevated OS signal or a sub-10% available floor must read as
+    /// pressured; an unreadable host must fail open (never deadlock boot).
+    #[test]
+    fn pressure_elevated_decision_table() {
+        let gib = 1024u64 * 1024 * 1024;
+        // (sample, expected, case)
+        let cases = [
+            (MemorySample::default(), false, "unreadable host fails open"),
+            (
+                MemorySample {
+                    total_bytes: 32 * gib,
+                    available_bytes: 16 * gib,
+                    macos_pressure_level: Some(1),
+                    ..Default::default()
+                },
+                false,
+                "normal level + headroom",
+            ),
+            (
+                MemorySample {
+                    total_bytes: 32 * gib,
+                    available_bytes: 16 * gib,
+                    macos_pressure_level: Some(2),
+                    ..Default::default()
+                },
+                true,
+                "macOS warn level",
+            ),
+            (
+                MemorySample {
+                    total_bytes: 32 * gib,
+                    available_bytes: 2 * gib,
+                    macos_pressure_level: Some(1),
+                    ..Default::default()
+                },
+                true,
+                "available under 10% floor",
+            ),
+            (
+                MemorySample {
+                    total_bytes: 32 * gib,
+                    available_bytes: 16 * gib,
+                    psi_mem_some_avg10: Some(25.0),
+                    ..Default::default()
+                },
+                true,
+                "linux PSI past floor",
+            ),
+        ];
+        for (sample, expected, case) in cases {
+            assert_eq!(sample.pressure_elevated(), expected, "{case}");
+        }
     }
 }

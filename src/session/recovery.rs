@@ -336,6 +336,29 @@ pub fn warm_tmux_server() {
 /// constant and the TTL together is the right knob if telemetry warrants.
 pub const STARTUP_RECOVERY_CONCURRENCY: usize = 3;
 
+/// Extra hold on a recovery launch slot after each cascade completes, so at
+/// most `STARTUP_RECOVERY_CONCURRENCY` agents are ever inside their heavy
+/// cold-start phase per settle window instead of the whole fleet arriving in
+/// one burst. A resurrected agent's peak memory draw lands seconds AFTER its
+/// cascade returns (model runtime init, MCP connects), so releasing the
+/// permit at cascade completion still stacks cold-starts; holding it briefly
+/// spreads them out.
+pub const STARTUP_RECOVERY_SETTLE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Relaunch order for the boot resurrection: the fleet manager first, infra
+/// (`per-`) sessions next, everything else after, so the rails the wide
+/// fleet depends on (manager routing, the MCP gateway lane) are up before
+/// the burst. Ties keep their original registry order (stable sort).
+pub fn startup_recovery_priority(title: &str) -> u8 {
+    if title == "AoE-Commander" {
+        0
+    } else if title.starts_with("per-") {
+        1
+    } else {
+        2
+    }
+}
+
 /// Time-to-live entries in the `recently_restarted` map remain authoritative
 /// for. Sized to cover the typical worst-case cascade latency
 /// (`RESUME_PROBE_MAX` ~3s × 2 tiers + kill_clean grace ~150ms ≈ 6.15s) plus
@@ -608,6 +631,24 @@ impl Drop for HookTimeoutScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_recovery_priority_orders_manager_then_infra_then_fleet() {
+        let cases = [
+            ("AoE-Commander", 0u8),
+            // Exact-match only for the manager tier; a lookalike is fleet.
+            ("AoE-Commander-2", 2),
+            ("per-dev", 1),
+            ("per-mcp", 1),
+            // Infra tier keys on the `per-` prefix, not a substring.
+            ("super-dev", 2),
+            ("for-Support", 2),
+            ("", 2),
+        ];
+        for (title, expected) in cases {
+            assert_eq!(startup_recovery_priority(title), expected, "{title:?}");
+        }
+    }
 
     #[cfg(feature = "serve")]
     #[test]

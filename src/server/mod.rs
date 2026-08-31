@@ -5600,6 +5600,11 @@ async fn daemon_startup_recovery_mark(
         return None;
     }
 
+    // WO#1528: the cascade workers spawn in this order and the semaphore
+    // grants permits FIFO, so sorting here IS the relaunch order. Manager
+    // and infra lanes come up before the wide fleet floods the host.
+    candidates.sort_by_key(|i| crate::session::recovery::startup_recovery_priority(&i.title));
+
     // Record the attempt *before* any worker runs `tmux new-session`, so a
     // mid-pass crash fails toward "already attempted" for the next pass.
     crate::session::recovery::mark_recovery_attempted(
@@ -5627,6 +5632,44 @@ async fn daemon_startup_recovery_mark(
     Some((lock, candidates))
 }
 
+/// WO#1528 D2: hold a recovery worker while the host is under memory
+/// pressure, so the boot resurrection cannot pile cold-starts onto a machine
+/// already swapping. Polls every 5s and gives up after 180s so a permanently
+/// tight host still recovers its fleet (slowly) instead of never. Fail-open:
+/// a sampling error reads as "no pressure" (see `MemorySample::pressure_elevated`).
+async fn wait_for_memory_headroom(instance_id: &str) {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(5);
+    const CAP: std::time::Duration = std::time::Duration::from_secs(180);
+    let started = std::time::Instant::now();
+    let mut paused = false;
+    loop {
+        let sample = tokio::task::spawn_blocking(crate::process::metrics::sample_memory)
+            .await
+            .unwrap_or_default();
+        if !sample.pressure_elevated() {
+            return;
+        }
+        if started.elapsed() >= CAP {
+            tracing::warn!(
+                target: "session.startup_recovery",
+                instance_id = %instance_id,
+                waited_secs = started.elapsed().as_secs(),
+                "memory pressure still elevated past the stagger cap; launching anyway (WO#1528)",
+            );
+            return;
+        }
+        if !paused {
+            paused = true;
+            tracing::info!(
+                target: "session.startup_recovery",
+                instance_id = %instance_id,
+                "pausing recovery launch under elevated memory pressure (WO#1528)",
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Phase B: drive the cascade workers for the pre-marked candidates.
 async fn daemon_startup_recovery_cascade(
     state: Arc<AppState>,
@@ -5651,7 +5694,12 @@ async fn daemon_startup_recovery_cascade(
                 .acquire_owned()
                 .await
                 .expect("recovery semaphore not closed");
-            let _guard = lock_handle.lock().await;
+            // WO#1528 D2: gate on host memory BEFORE taking the instance
+            // lock, so a paused launch never blocks REST lifecycle verbs
+            // for this session while it waits. The refresher keeps the
+            // recently_restarted mark fresh through the pause.
+            wait_for_memory_headroom(&id).await;
+            let instance_guard = lock_handle.lock().await;
 
             // Re-check both `is_recovery_candidate` AND tmux liveness after
             // acquiring the lock: between the snapshot and this point a
@@ -5838,6 +5886,16 @@ async fn daemon_startup_recovery_cascade(
                     );
                 }
             }
+
+            // WO#1528 D1: keep holding the concurrency permit through the
+            // settle window so the just-launched agent's cold-start peak
+            // (which lands AFTER the cascade returns) passes before the next
+            // candidate launches. Release the instance lock first; the
+            // settle must never block lifecycle verbs on this session. The
+            // skip paths above return earlier and settle nothing, which is
+            // right: they launched nothing.
+            drop(instance_guard);
+            tokio::time::sleep(crate::session::recovery::STARTUP_RECOVERY_SETTLE).await;
         });
     }
 
