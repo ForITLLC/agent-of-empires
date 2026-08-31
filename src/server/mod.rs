@@ -5685,15 +5685,23 @@ async fn daemon_startup_recovery_cascade(
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     for inst in candidates {
-        let permit_sem = semaphore.clone();
+        // WO#1528 D1: take the permit HERE, before spawning, so this loop
+        // blocks while the semaphore is full and workers start strictly in
+        // candidate (priority) order. Acquiring inside the task would hand
+        // the permits to whichever tasks the runtime polled first, which
+        // is scheduler order, not spawn order (tokio's LIFO slot can run
+        // the newest task first), silently discarding the sort above.
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("recovery semaphore not closed");
         let inst_state = state.clone();
         let id = inst.id.clone();
         let lock_handle = inst_state.instance_lock(&id).await;
         tasks.spawn(async move {
-            let _permit = permit_sem
-                .acquire_owned()
-                .await
-                .expect("recovery semaphore not closed");
+            // Held for the worker's whole life, including the settle window.
+            let _permit = permit;
             // WO#1528 D2: gate on host memory BEFORE taking the instance
             // lock, so a paused launch never blocks REST lifecycle verbs
             // for this session while it waits. The refresher keeps the
