@@ -372,6 +372,22 @@ impl App {
             .all(|key| key.code == first.code && key.modifiers == first.modifiers)
     }
 
+    /// Decide whether an accumulated burst routes through `handle_paste`
+    /// (pasted or dictated text) or is replayed as individually typed keys.
+    /// Length filters out genuine typing; the auto-repeat check keeps held
+    /// navigation keys on the key path. The leading-slash exception exists
+    /// because pasted text and dictation essentially never start with '/',
+    /// while a fast-typed "/command" on a lagging terminal batches its keys
+    /// tightly enough to trip the burst detector; routed as a paste it would
+    /// open the message composer instead of running the command. Replaying
+    /// it as keys lets '/' reach its binding and the rest land wherever
+    /// typing would have.
+    fn burst_routes_as_paste(burst_str: &str, burst_keys: &[KeyEvent]) -> bool {
+        burst_keys.len() >= PASTE_BURST_MIN_LEN
+            && !Self::is_auto_repeat_burst(burst_keys)
+            && !burst_str.starts_with('/')
+    }
+
     /// Peel a trailing Enter off a paste burst so plain-Enter Submit
     /// semantics survive when the user types or dictates fast enough to
     /// pump everything through the burst path.
@@ -1016,9 +1032,7 @@ impl App {
                                         _ => break,
                                     }
                                 }
-                                if burst_keys.len() >= PASTE_BURST_MIN_LEN
-                                    && !Self::is_auto_repeat_burst(&burst_keys)
-                                {
+                                if Self::burst_routes_as_paste(&burst_str, &burst_keys) {
                                     // Peel a trailing Enter so the dialog's
                                     // plain-Enter Submit branch still fires.
                                     // Embedded mid-burst Enters stay as '\n'
@@ -4863,6 +4877,36 @@ mod tests {
         for (keys, expected) in cases {
             assert_eq!(App::is_auto_repeat_burst(&keys), expected, "{keys:?}");
         }
+    }
+
+    #[test]
+    fn burst_routes_as_paste_decision_table() {
+        let chars = |s: &str| -> Vec<KeyEvent> {
+            s.chars()
+                .map(|c| key(KeyCode::Char(c), KeyModifiers::NONE))
+                .collect()
+        };
+        let cases = [
+            // Long mixed burst: pasted or dictated text, route as paste.
+            ("paste", true),
+            // Below PASTE_BURST_MIN_LEN: genuine typing, replay as keys.
+            ("hi", false),
+            // Leading slash: a fast-typed "/command" on a lagging terminal,
+            // replay as keys so '/' reaches its binding.
+            ("/compact", false),
+            // Slash later in the text is ordinary content.
+            ("a/b/c", true),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                App::burst_routes_as_paste(text, &chars(text)),
+                expected,
+                "{text:?}"
+            );
+        }
+        // Auto-repeat (held key) stays on the key path regardless of length.
+        let held = vec![key(KeyCode::Char('j'), KeyModifiers::NONE); 5];
+        assert!(!App::burst_routes_as_paste("jjjjj", &held));
     }
 
     #[test]
