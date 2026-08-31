@@ -4918,6 +4918,12 @@ pub async fn stop_session(
         return super::read_only_response();
     }
 
+    tracing::info!(
+        target: "server.lifecycle",
+        verb = "stop",
+        session = %id,
+        "lifecycle verb received: stop"
+    );
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -4927,6 +4933,13 @@ pub async fn stop_session(
     let (profile, is_structured, already_stopped) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            tracing::warn!(
+                target: "server.lifecycle",
+                verb = "stop",
+                session = %id,
+                outcome = "not_found",
+                "lifecycle verb failed: unknown session"
+            );
             return super::session_not_found();
         };
         let structured;
@@ -5060,6 +5073,13 @@ pub async fn stop_session(
         }
     }
 
+    tracing::info!(
+        target: "server.lifecycle",
+        verb = "stop",
+        session = %id,
+        outcome = "executed",
+        "lifecycle verb executed: stop"
+    );
     // Re-read so the response reflects the Stopped status.
     let instances = state.instances.read().await;
     let response = match instances.iter().find(|i| i.id == id) {
@@ -5092,12 +5112,25 @@ pub async fn start_session(
         return super::read_only_response();
     }
 
+    tracing::info!(
+        target: "server.lifecycle",
+        verb = "start",
+        session = %id,
+        "lifecycle verb received: start"
+    );
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
     let (profile, is_structured, is_stopped, instance) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            tracing::warn!(
+                target: "server.lifecycle",
+                verb = "start",
+                session = %id,
+                outcome = "not_found",
+                "lifecycle verb failed: unknown session"
+            );
             return super::session_not_found();
         };
         let structured;
@@ -5119,6 +5152,13 @@ pub async fn start_session(
 
     // Only a stopped session has anything to start; otherwise return current.
     if !is_stopped {
+        tracing::info!(
+            target: "server.lifecycle",
+            verb = "start",
+            session = %id,
+            outcome = "noop_not_stopped",
+            "lifecycle verb no-op: session is not stopped; nothing to start"
+        );
         let instances = state.instances.read().await;
         let response = match instances.iter().find(|i| i.id == id) {
             Some(inst) => {
@@ -5206,6 +5246,13 @@ pub async fn start_session(
 
     match restart_result {
         Ok(Ok((started, outcome))) => {
+            tracing::info!(
+                target: "server.lifecycle",
+                verb = "start",
+                session = %id,
+                outcome = "executed",
+                "lifecycle verb executed: start"
+            );
             let resume_failed_sid = match &outcome {
                 crate::session::StartOutcome::ResumeFailed { sid } => Some(sid.clone()),
                 _ => None,
@@ -5351,22 +5398,56 @@ pub async fn restart_session(
         }
     }
 
-    // In-flight guard: only one daemon-owned cascade per session. `insert`
-    // returning false means a prior POST's cascade is still running.
+    // In-flight guard: only one daemon-owned cascade per session but never
+    // a permanent one. A cascade task that dies without its finish path (the
+    // WO#1527 wedge: per-mcp sat `in_flight` for hours while every POST got a
+    // silent 202) would otherwise turn this endpoint into a void forever, so
+    // a mark older than the TTL is loudly declared leaked and replaced.
     {
         let mut inflight = state
             .restart_inflight
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if !inflight.insert(id.clone()) {
-            return (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "status": "already_restarting",
-                    "session_id": id,
-                })),
-            )
-                .into_response();
+        match admit_restart_inflight(&mut inflight, &id, std::time::Instant::now()) {
+            InflightAdmit::Fresh => {
+                tracing::info!(
+                    target: "server.lifecycle",
+                    verb = "restart",
+                    session = %id,
+                    outcome = "accepted",
+                    "lifecycle verb received: restart accepted; cascade dispatched"
+                );
+            }
+            InflightAdmit::StaleReplaced { age_secs } => {
+                tracing::error!(
+                    target: "server.lifecycle",
+                    verb = "restart",
+                    session = %id,
+                    stale_mark_age_secs = age_secs,
+                    "lifecycle verb received: in-flight restart mark exceeded \
+                     TTL; prior cascade died without finishing; self-healing \
+                     the leaked mark and dispatching a fresh cascade (WO#1527)"
+                );
+            }
+            InflightAdmit::AlreadyRestarting { age_secs } => {
+                tracing::warn!(
+                    target: "server.lifecycle",
+                    verb = "restart",
+                    session = %id,
+                    inflight_age_secs = age_secs,
+                    outcome = "already_restarting",
+                    "lifecycle verb received: restart refused; cascade already in flight"
+                );
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "already_restarting",
+                        "session_id": id,
+                        "inflight_age_seconds": age_secs,
+                    })),
+                )
+                    .into_response();
+            }
         }
     }
 
@@ -5411,10 +5492,63 @@ pub async fn restart_session(
         .into_response()
 }
 
+/// How long an in-flight restart mark is trusted before a new POST treats it
+/// as leaked. Real cascades finish (or fail) within a couple of minutes; ten
+/// is generous enough that only a genuinely dead cascade ever trips it.
+const RESTART_INFLIGHT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+enum InflightAdmit {
+    /// No prior mark: this POST owns a fresh cascade.
+    Fresh,
+    /// A prior mark within TTL: refuse, a cascade is genuinely running.
+    AlreadyRestarting { age_secs: u64 },
+    /// A prior mark PAST the TTL: the owning cascade died without its finish
+    /// path (WO#1527). The mark is replaced and this POST owns a new cascade.
+    StaleReplaced { age_secs: u64 },
+}
+
+/// Admission decision for `POST /restart` against the in-flight map. Pure so
+/// the TTL self-heal contract is assertable without a daemon.
+fn admit_restart_inflight(
+    inflight: &mut std::collections::HashMap<String, std::time::Instant>,
+    id: &str,
+    now: std::time::Instant,
+) -> InflightAdmit {
+    match inflight.get(id) {
+        None => {
+            inflight.insert(id.to_string(), now);
+            InflightAdmit::Fresh
+        }
+        Some(taken_at) => {
+            let age = now.saturating_duration_since(*taken_at);
+            if age < RESTART_INFLIGHT_TTL {
+                InflightAdmit::AlreadyRestarting {
+                    age_secs: age.as_secs(),
+                }
+            } else {
+                inflight.insert(id.to_string(), now);
+                InflightAdmit::StaleReplaced {
+                    age_secs: age.as_secs(),
+                }
+            }
+        }
+    }
+}
+
+/// PID of the live agent pane for a session, resolving renamed panes the
+/// same way the pollers do. Blocking (tmux execs); call via `spawn_blocking`.
+fn live_agent_pane_pid(id: &str, title: &str) -> Option<u32> {
+    let derived = crate::tmux::Session::generate_name(id, title);
+    let pane_meta = crate::tmux::batch_pane_metadata().ok()?;
+    let name = crate::tmux::resolve_agent_session_name_in(&pane_meta, id, &derived);
+    crate::process::get_pane_pid(&name)
+}
+
 /// The detached half of [`restart_session`]: runs the kill+start cascade off
 /// the request, then persists the merged result. MUST clear the in-flight
 /// mark and the recovery suppression on every exit path — a leaked in-flight
-/// entry would wedge the endpoint into `already_restarting` forever.
+/// entry would wedge the endpoint into `already_restarting` until the TTL
+/// self-heal in [`admit_restart_inflight`] catches it.
 async fn run_detached_restart(state: Arc<AppState>, id: String) {
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
@@ -5484,6 +5618,19 @@ async fn run_detached_restart(state: Arc<AppState>, id: String) {
         .restart_wake_message
         .clone();
 
+    // Pane PID before the cascade: the restart's proof-of-effect baseline. A
+    // kill+respawn ALWAYS changes the pane PID, so a "successful" cascade
+    // that leaves it unchanged did not actually act (WO#1527: verbs must
+    // never claim success into a void).
+    let pre_pane_pid = {
+        let pid_id = id.clone();
+        let pid_title = sync_base.title.clone();
+        tokio::task::spawn_blocking(move || live_agent_pane_pid(&pid_id, &pid_title))
+            .await
+            .ok()
+            .flatten()
+    };
+
     let request_id = id.clone();
     let restart_result = tokio::task::spawn_blocking(move || {
         crate::session::restart::perform_restart(crate::session::restart::RestartRequest {
@@ -5498,7 +5645,43 @@ async fn run_detached_restart(state: Arc<AppState>, id: String) {
     match restart_result {
         Ok(result) => {
             let (status, last_error) = match &result.outcome {
-                Ok(_) => (None, None),
+                Ok(_) => {
+                    let post_pane_pid = {
+                        let pid_id = id.clone();
+                        let pid_title = sync_base.title.clone();
+                        tokio::task::spawn_blocking(move || {
+                            live_agent_pane_pid(&pid_id, &pid_title)
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    };
+                    if pre_pane_pid.is_some() && post_pane_pid == pre_pane_pid {
+                        let msg = format!(
+                            "restart ineffective: pane PID {} unchanged after cascade",
+                            pre_pane_pid.unwrap_or_default()
+                        );
+                        tracing::error!(
+                            target: "server.lifecycle",
+                            verb = "restart",
+                            session = %id,
+                            pane_pid = pre_pane_pid.unwrap_or_default(),
+                            "restart cascade reported success but the pane PID \
+                             did not change; recording failure (WO#1527)"
+                        );
+                        (Some(Status::Error), Some(msg))
+                    } else {
+                        tracing::info!(
+                            target: "server.lifecycle",
+                            verb = "restart",
+                            session = %id,
+                            old_pane_pid = pre_pane_pid.unwrap_or_default(),
+                            new_pane_pid = post_pane_pid.unwrap_or_default(),
+                            "restart cascade executed; pane PID change verified"
+                        );
+                        (None, None)
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "http.api.sessions",
@@ -5602,18 +5785,19 @@ pub async fn restart_status(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let in_flight = state
+    let in_flight_age = state
         .restart_inflight
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .contains(&id);
+        .get(&id)
+        .map(|taken_at| std::time::Instant::now().saturating_duration_since(*taken_at));
     let rec = state
         .restart_outcomes
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(&id)
         .cloned();
-    Json(restart_status_body(in_flight, rec.as_ref())).into_response()
+    Json(restart_status_body(in_flight_age, rec.as_ref())).into_response()
 }
 
 /// The HTTP shape of a restart-status read. Pure so the contract a poller
@@ -5621,11 +5805,17 @@ pub async fn restart_status(
 /// stale record: the record describes the PREVIOUS cascade until the current
 /// one reaches its own terminal write.
 fn restart_status_body(
-    in_flight: bool,
+    in_flight_age: Option<std::time::Duration>,
     rec: Option<&crate::server::RestartOutcomeRecord>,
 ) -> serde_json::Value {
-    if in_flight {
-        return serde_json::json!({"state": "in_flight"});
+    if let Some(age) = in_flight_age {
+        // Age lets a poller distinguish a live cascade from a leaked mark
+        // (WO#1527): past the TTL the honest state is "stale", telling the
+        // caller a repeat POST will self-heal and run a fresh cascade.
+        return serde_json::json!({
+            "state": if age >= RESTART_INFLIGHT_TTL { "stale" } else { "in_flight" },
+            "age_seconds": age.as_secs(),
+        });
     }
     match rec {
         Some(r) => serde_json::json!({
@@ -5810,7 +6000,10 @@ pub(crate) async fn power_restore_sessions(state: Arc<AppState>, ids: Vec<String
                 .restart_inflight
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            inflight.insert(id.clone())
+            !matches!(
+                admit_restart_inflight(&mut inflight, &id, std::time::Instant::now()),
+                InflightAdmit::AlreadyRestarting { .. }
+            )
         };
         if !fresh {
             continue;
@@ -14287,13 +14480,54 @@ mod restart_status_tests {
     }
 
     /// In flight wins over any record: the record describes the PREVIOUS
-    /// cascade until the current one reaches its own terminal write.
+    /// cascade until the current one reaches its own terminal write. Past
+    /// the TTL the honest state flips to "stale"; the WO#1527 wedge (a
+    /// cascade that died without finishing) must be visible to a poller,
+    /// never an eternal "in_flight". Age always rides along.
     #[test]
     fn in_flight_masks_a_stale_record() {
         let stale = done(true, None, "gna-main");
-        let body = restart_status_body(true, Some(&stale));
+        let body = restart_status_body(Some(std::time::Duration::from_secs(5)), Some(&stale));
         assert_eq!("in_flight", body["state"].as_str().unwrap());
+        assert_eq!(Some(5), body["age_seconds"].as_u64());
         assert!(body.get("ok").is_none());
+
+        let leaked = restart_status_body(Some(RESTART_INFLIGHT_TTL), Some(&stale));
+        assert_eq!("stale", leaked["state"].as_str().unwrap());
+    }
+
+    /// WO#1527: the in-flight mark self-heals. A repeat POST within the TTL
+    /// is refused (one cascade per session), but a mark whose cascade died
+    /// without its finish path is replaced once the TTL passes; the exact
+    /// wedge that held per-mcp `already_restarting` for hours.
+    #[test]
+    fn inflight_admission_self_heals_leaked_marks() {
+        let mut map = std::collections::HashMap::new();
+        let t0 = std::time::Instant::now();
+        assert!(matches!(
+            admit_restart_inflight(&mut map, "s1", t0),
+            InflightAdmit::Fresh
+        ));
+        // (elapsed, expected refusal?); refusal inside TTL, self-heal past it.
+        let in_ttl = t0 + RESTART_INFLIGHT_TTL / 2;
+        match admit_restart_inflight(&mut map, "s1", in_ttl) {
+            InflightAdmit::AlreadyRestarting { age_secs } => {
+                assert_eq!(age_secs, (RESTART_INFLIGHT_TTL / 2).as_secs());
+            }
+            _ => panic!("in-TTL repeat must refuse"),
+        }
+        let past_ttl = t0 + RESTART_INFLIGHT_TTL * 2;
+        match admit_restart_inflight(&mut map, "s1", past_ttl) {
+            InflightAdmit::StaleReplaced { age_secs } => {
+                assert_eq!(age_secs, (RESTART_INFLIGHT_TTL * 2).as_secs());
+            }
+            _ => panic!("past-TTL repeat must self-heal"),
+        }
+        // The replaced mark is fresh again: a third POST right after refuses.
+        assert!(matches!(
+            admit_restart_inflight(&mut map, "s1", past_ttl),
+            InflightAdmit::AlreadyRestarting { .. }
+        ));
     }
 
     /// Success carries the profile the cascade ACTUALLY used — after a
@@ -14301,7 +14535,7 @@ mod restart_status_tests {
     /// proof the rebind landed.
     #[test]
     fn success_names_the_profile_the_cascade_used() {
-        let body = restart_status_body(false, Some(&done(true, None, "cay-main")));
+        let body = restart_status_body(None, Some(&done(true, None, "cay-main")));
         assert_eq!("done", body["state"].as_str().unwrap());
         assert_eq!(Some(true), body["ok"].as_bool());
         assert_eq!("cay-main", body["profile"].as_str().unwrap());
@@ -14312,7 +14546,7 @@ mod restart_status_tests {
     #[test]
     fn failure_carries_the_cascade_error() {
         let body = restart_status_body(
-            false,
+            None,
             Some(&done(false, Some("session x no longer exists"), "gna-main")),
         );
         assert_eq!("done", body["state"].as_str().unwrap());
@@ -14324,7 +14558,7 @@ mod restart_status_tests {
     /// fabricated success or failure.
     #[test]
     fn absent_record_reads_unknown() {
-        let body = restart_status_body(false, None);
+        let body = restart_status_body(None, None);
         assert_eq!("unknown", body["state"].as_str().unwrap());
     }
 }

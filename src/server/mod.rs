@@ -439,11 +439,15 @@ pub struct AppState {
     /// permit ages out of suppression and trips a phantom `Status::Error`.
     pub recovery_pending: crate::session::recovery::RecoveryPending,
     /// Session ids with an in-flight daemon-owned restart cascade
-    /// (`POST /api/sessions/{id}/restart`). A repeat POST while the detached
-    /// cascade is still running returns 202 `already_restarting` instead of
-    /// racing a second kill+start against the first. Synchronous mutex:
-    /// critical sections are tiny and never span an `await`.
-    pub restart_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// (`POST /api/sessions/{id}/restart`), each with the instant its mark
+    /// was taken. A repeat POST while the detached cascade is still running
+    /// returns 202 `already_restarting` instead of racing a second kill+start
+    /// against the first but a mark older than the admission TTL is treated
+    /// as leaked (a cascade that died without its finish path) and replaced,
+    /// so a vanished cascade can never wedge the endpoint into silent
+    /// `already_restarting` forever (WO#1527). Synchronous mutex: critical
+    /// sections are tiny and never span an `await`.
+    pub restart_inflight: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Terminal outcome of the LAST daemon-owned restart cascade per session
     /// id (WO#1502). The `status` a poller samples from the list is overwritten
     /// within ~500ms by the hook poller, so a CLI watching it can read a
@@ -1286,7 +1290,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         delete_epoch: std::sync::atomic::AtomicU64::new(0),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
-        restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        restart_inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
         restart_outcomes: std::sync::Mutex::new(std::collections::HashMap::new()),
         power: Arc::new(power::PowerRegistry::load_from_app_dir()),
         restart_budget: Arc::new(restart_budget::RestartBudget::new()),
@@ -6721,7 +6725,7 @@ pub mod test_support {
             recently_restarted: crate::session::recovery::new_recently_restarted(),
             delete_epoch: std::sync::atomic::AtomicU64::new(0),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
-            restart_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            restart_inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
             restart_outcomes: std::sync::Mutex::new(std::collections::HashMap::new()),
             power: Arc::new(power::PowerRegistry::ephemeral()),
             restart_budget: Arc::new(restart_budget::RestartBudget::new()),

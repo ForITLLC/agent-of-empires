@@ -2246,7 +2246,22 @@ async fn try_daemon_restart(session_id: &str, title: &str) -> Result<bool> {
             if let Ok(body) = client.restart_status(session_id).await {
                 // Anything other than "done" ("in_flight", "unknown" after a
                 // daemon bounce mid-cascade, or an unrecognized shape) keeps
-                // waiting out the deadline.
+                // waiting out the deadline, except "stale", the daemon's
+                // admission that the owning cascade died without finishing
+                // (WO#1527): waiting on that would never resolve, so fail
+                // loudly with the recovery hint.
+                if body.get("state").and_then(|v| v.as_str()) == Some("stale") {
+                    let age = body
+                        .get("age_seconds")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    bail!(
+                        "Daemon-side restart for {title} is wedged: its in-flight mark is \
+                         {age}s old and the owning cascade died without finishing. \
+                         Re-run `aoe session restart`; the daemon self-heals the stale \
+                         mark on the next request (WO#1527)."
+                    );
+                }
                 if body.get("state").and_then(|v| v.as_str()) == Some("done") {
                     if body.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                         let profile = body
