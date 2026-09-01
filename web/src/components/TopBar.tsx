@@ -34,6 +34,9 @@ interface Props {
    *  the port is not visible in the window chrome. Driven by
    *  `ServerAbout.build_flavor === "debug"`. See #1055. */
   isDevBuild: boolean;
+  /** Operator-set instance label (`[web] instance_label`), rendered next to
+   *  the wordmark so people running several daemons can tell them apart. */
+  instanceLabel: string | null;
   /** Opens the tip-of-the-day modal; wired into the overflow menu so tips are
    *  re-readable any time, like GIMP/DBeaver's Help menu entry. */
   onOpenTips: () => void;
@@ -66,6 +69,7 @@ export function TopBar({
   loginRequired,
   isOffline,
   isDevBuild,
+  instanceLabel,
   onOpenTips,
   onGoDashboard,
   sidebarColumnVisible,
@@ -132,6 +136,14 @@ export function TopBar({
               links to the dashboard. Mobile keeps it, since the zone only takes
               the column width from md up. See #2288. */}
           <span className={`font-mono text-xs leading-none truncate ${hideWordmark ? "md:hidden" : ""}`}>aoe</span>
+          {instanceLabel && (
+            <span
+              className={`font-mono text-xs leading-none truncate text-text-dim ${hideWordmark ? "md:hidden" : ""}`}
+              title="Instance label ([web] instance_label)"
+            >
+              {instanceLabel}
+            </span>
+          )}
         </button>
       </div>
 

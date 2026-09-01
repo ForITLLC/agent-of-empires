@@ -1458,6 +1458,10 @@ pub struct ServerAbout {
     /// debug (port 8081) and release (port 8080) instances apart at
     /// a glance, including PWA installs where the port disappears
     /// from the window chrome. See #1055.
+    /// Operator-set label naming this server instance (`[web]
+    /// instance_label`). The dashboard shows it in the header and page
+    /// title so multiple daemons are distinguishable.
+    pub instance_label: Option<String>,
     pub build_flavor: &'static str,
     /// Content-hashed entry bundle name (`index-<hash>.js`) of the
     /// embedded dashboard build. The client compares this against its
@@ -1501,6 +1505,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         acp_replay_events,
         acp_compaction_reminder,
         acp_compaction_reminder_percent,
+        instance_label: state.web_config.instance_label.clone(),
         build_flavor: if cfg!(debug_assertions) {
             "debug"
         } else {
