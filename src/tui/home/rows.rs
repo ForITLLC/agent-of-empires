@@ -131,6 +131,17 @@ impl HomeView {
     }
 
     pub(in crate::tui) fn build_flat_items(&self) -> Vec<Item> {
+        // Single funnel for every view: build the natural flow, then hoist the
+        // AoE-Commander row to the absolute top so it pins above ungrouped
+        // sessions, every group and the Archived section in every sort order
+        // and grouping mode. The full instance set (not a profile-filtered
+        // slice) keeps the commander visible in views that would hide it.
+        let mut items = self.build_flat_items_unpinned();
+        pin_commander_first(&mut items, self.instances.values());
+        items
+    }
+
+    fn build_flat_items_unpinned(&self) -> Vec<Item> {
         // Project/org grouping keeps headers under every sort order, Attention included.
         match self.group_by {
             GroupByMode::Project => return self.build_flat_items_by_project(),
