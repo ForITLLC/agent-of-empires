@@ -20,6 +20,7 @@ pub mod plugin;
 pub mod profile;
 pub mod project;
 pub mod ps;
+pub mod relay;
 pub mod remove;
 pub mod send;
 pub mod serve;

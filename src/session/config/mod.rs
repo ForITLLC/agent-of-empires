@@ -71,6 +71,9 @@ pub struct Config {
     pub auth: AuthConfig,
 
     #[serde(default)]
+    pub relay: RelayConfig,
+
+    #[serde(default)]
     pub acp: AcpConfig,
 
     #[serde(default)]
@@ -1992,6 +1995,59 @@ impl Default for AuthConfig {
             persist_sessions: true,
         }
     }
+}
+
+/// Cross-board relay: lets a peer aoe daemon (another "board") deliver a
+/// message into a session on this board over HTTP without sharing this
+/// daemon's own auth factors. Ingress stays off until `secret_file` names a
+/// readable, non-empty secret; `POST /api/relay` returns 404 until then, so
+/// an unconfigured daemon exposes nothing. Outbound, `aoe relay <board>
+/// <message>` reads `boards` for the peer's URL and secret.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RelayConfig {
+    /// Path to a file holding this board's relay ingress secret (whitespace
+    /// trimmed). A file rather than an inline value keeps the secret out of
+    /// config.toml, which users paste into issue reports. No `~` expansion;
+    /// use an absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_file: Option<String>,
+
+    /// Title of the session that receives relays with no explicit target.
+    /// Empty means the default, "AoE-Commander". Matched exactly against
+    /// session titles on this board.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub commander_title: String,
+
+    /// Permit inbound relays that name an explicit `to` session other than
+    /// the commander title. Off by default: cross-board traffic is
+    /// commander-to-commander unless this board opts in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_worker_targets: bool,
+
+    /// Name this board announces on outbound relays; the receiving session
+    /// sees it in the `[relay:<name>]` provenance prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_name: Option<String>,
+
+    /// Peer boards addressable by `aoe relay <name> <message>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boards: Vec<RelayBoard>,
+}
+
+/// One peer daemon reachable from this machine, for the outbound half of the
+/// relay (`aoe relay <name> <message>`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RelayBoard {
+    /// Name used on the CLI: `aoe relay <name> <message>`.
+    #[serde(default)]
+    pub name: String,
+    /// Base URL of the peer daemon (e.g. `https://board.ts.net`); the CLI
+    /// posts to `<url>/api/relay`.
+    #[serde(default)]
+    pub url: String,
+    /// Path to a file holding the peer's relay ingress secret.
+    #[serde(default)]
+    pub secret_file: String,
 }
 
 /// Serde default for `Config.default_profile`. Empty means "not explicitly

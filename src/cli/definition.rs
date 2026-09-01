@@ -21,6 +21,7 @@ use super::plugin::PluginCommands;
 use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
 use super::ps::PsArgs;
+use super::relay::RelayArgs;
 use super::remove::RemoveArgs;
 use super::send::SendArgs;
 use super::serve::ServeArgs;
@@ -99,6 +100,9 @@ pub enum Commands {
 
     /// Send a message to a running agent session
     Send(SendArgs),
+
+    /// Relay a message to a peer board's daemon (cross-board messaging)
+    Relay(RelayArgs),
 
     /// Show session status summary
     Status(StatusArgs),
@@ -310,6 +314,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::LogLevel(_) => "log_level",
         Commands::Remove(_) => "remove",
         Commands::Send(_) => "send",
+        Commands::Relay(_) => "relay",
         Commands::Status(_) => "status",
         Commands::Killall(_) => "killall",
         // Hidden trap; never a user action, never counted.
