@@ -41,6 +41,9 @@ interface Props {
    *  (port 8081 / `aoe_dev_` tmux / `~/.agent-of-empires-dev/`) are visually distinct from release builds at a
    *  glance, including in PWA installs where the port is not visible in the window chrome. */
   isDevBuild: boolean;
+  /** Operator-set instance label (`[web] instance_label`), rendered next to
+   *  the wordmark so people running several daemons can tell them apart. */
+  instanceLabel: string | null;
   /** Opens the tip-of-the-day modal; wired into the overflow menu so tips are
    *  re-readable any time, like GIMP/DBeaver's Help menu entry. */
   onOpenTips: () => void;
@@ -75,6 +78,7 @@ export function TopBar({
   loginRequired,
   isOffline,
   isDevBuild,
+  instanceLabel,
   onOpenTips,
   onGoDashboard,
   sidebarColumnVisible,
@@ -169,6 +173,14 @@ export function TopBar({
           {/* This zone matches the sidebar column, so a compact rail leaves no room for the wordmark next to the
              toggle and the logo: it would sit flush against the divider and read as clipped. */}
           <span className={`font-mono text-xs leading-none truncate ${hideWordmark ? "md:hidden" : ""}`}>aoe</span>
+          {instanceLabel && (
+            <span
+              className={`font-mono text-xs leading-none truncate text-text-dim ${hideWordmark ? "md:hidden" : ""}`}
+              title="Instance label ([web] instance_label)"
+            >
+              {instanceLabel}
+            </span>
+          )}
         </button>
       </div>
 
