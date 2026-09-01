@@ -866,6 +866,10 @@ export interface ServerAbout {
   behind_tunnel: boolean;
   /** CityHall client mode: a locked-down composer-only client, enforced server-side too. */
   cityhall_mode: boolean;
+  /** Operator-set label naming this server instance (`[web]
+   *  instance_label`); shown in the header and page title so multiple
+   *  daemons are distinguishable. */
+  instance_label?: string | null;
   profile: string;
   acp_show_tool_durations: boolean;
   /** Per-session event log retention cap; 0 means unlimited. */

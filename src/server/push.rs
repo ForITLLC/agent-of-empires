@@ -1292,6 +1292,7 @@ mod tests {
             notify_on_idle: false, // globally off
             notify_on_error: true,
             notify_on_wake_fire: true,
+            instance_label: None,
         };
 
         // No instance (session not in state): fall back to web defaults.

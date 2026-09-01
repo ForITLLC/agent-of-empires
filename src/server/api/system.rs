@@ -1368,6 +1368,10 @@ pub struct ServerAbout {
     /// Resolved `acp.compaction_reminder_percent`: the context-window
     /// percentage at which the reminder appears.
     pub acp_compaction_reminder_percent: u8,
+    /// Operator-set label naming this server instance (`[web]
+    /// instance_label`). The dashboard shows it in the header and page
+    /// title so multiple daemons are distinguishable.
+    pub instance_label: Option<String>,
     /// `"debug"` when built with `debug_assertions`, else `"release"`. The web
     /// UI renders a DEV badge from it so concurrent debug (8081) and release
     /// (8080) instances are distinguishable, PWA installs included.
@@ -1412,6 +1416,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         acp_replay_events,
         acp_compaction_reminder,
         acp_compaction_reminder_percent,
+        instance_label: state.web_config.instance_label.clone(),
         build_flavor: if cfg!(debug_assertions) {
             "debug"
         } else {
