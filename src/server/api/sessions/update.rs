@@ -452,6 +452,205 @@ pub async fn update_session_diff_base(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+// --- Per-session goal ---
+//
+// `GET /api/sessions/{id}/goal` reads the free-text objective for a session;
+// `PATCH /api/sessions/{id}/goal` sets or clears it. The goal persists on the
+// session record (survives restart) and also surfaces on the `/api/sessions`
+// list via `SessionResponse.goal`, so a manager or the Commander MCP layer can
+// see and steer what each worker is meant to be doing. See per-dev WO #70.
+
+#[derive(Deserialize)]
+pub struct UpdateGoalBody {
+    /// Whether the caller wrote the field at all is load bearing, so this is a
+    /// nested option: the outer `None` means `goal` was absent from the body,
+    /// `Some(None)` is an explicit `null`, `Some(Some(s))` is a string. An
+    /// absent field used to deserialize to the same value as an explicit clear,
+    /// so a malformed PATCH silently erased the record. See per-dev WO #937 A6.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub goal: Option<Option<String>>,
+}
+
+fn deserialize_present<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<String> as serde::Deserialize>::deserialize(de).map(Some)
+}
+
+/// Largest goal the API accepts on a write, in characters. Reads are not
+/// capped: a record written before this bound existed still serves in full, so
+/// raising or lowering the cap never destroys stored text. A caller over the
+/// bound gets a 400 naming both lengths and rolls its own text over by
+/// trimming; the API never truncates on the caller's behalf, because a
+/// silently shortened objective is the same class of defect as a silently
+/// cleared one. See per-dev WO #937 A5.
+pub const GOAL_MAX_CHARS: usize = 16_384;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GoalUpdate {
+    Set(String),
+    Clear,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GoalUpdateError {
+    /// The body carried no `goal` field. Refused rather than treated as a clear.
+    Omitted,
+    TooLong {
+        len: usize,
+        max: usize,
+    },
+}
+
+pub(crate) fn goal_update_from_body(body: &UpdateGoalBody) -> Result<GoalUpdate, GoalUpdateError> {
+    // The outer `None` is an absent field, the inner one an explicit null. Only
+    // the second asks for a clear; the first is a malformed request that used to
+    // erase the record with a 200. See per-dev WO #937 A6.
+    let Some(value) = body.goal.as_ref() else {
+        return Err(GoalUpdateError::Omitted);
+    };
+    let Some(goal) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(GoalUpdate::Clear);
+    };
+    // Characters, not bytes; a non-ASCII goal is not shorter than it reads.
+    let len = goal.chars().count();
+    if len > GOAL_MAX_CHARS {
+        return Err(GoalUpdateError::TooLong {
+            len,
+            max: GOAL_MAX_CHARS,
+        });
+    }
+    Ok(GoalUpdate::Set(goal.to_string()))
+}
+
+pub async fn get_session_goal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let instances = state.instances.read().await;
+    let Some(inst) = instances.iter().find(|i| i.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Session not found" })),
+        )
+            .into_response();
+    };
+    // `goal_len` lets a caller size the record before reading it. A goal is
+    // free text with no bound before WO #937 A5, and a large one overflows the
+    // consumer's own result limits, so the length has to be readable on its
+    // own. See per-dev WO #937 A5.
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": inst.id,
+            "goal": inst.goal,
+            "goal_len": inst.goal.as_deref().map(str::chars).map(Iterator::count).unwrap_or(0),
+            "goal_max": GOAL_MAX_CHARS,
+        })),
+    )
+        .into_response()
+}
+
+pub async fn set_session_goal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateGoalBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        inst.source_profile.clone()
+    };
+
+    let new_goal = match goal_update_from_body(&body) {
+        Ok(GoalUpdate::Set(goal)) => Some(goal),
+        Ok(GoalUpdate::Clear) => None,
+        Err(GoalUpdateError::Omitted) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "goal_omitted",
+                    "message": "body must carry a `goal` field; send null or \"\" to clear it"
+                })),
+            )
+                .into_response();
+        }
+        Err(GoalUpdateError::TooLong { len, max }) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "goal_too_long",
+                    "message": format!("goal is {len} characters, the maximum is {max}"),
+                    "len": len,
+                    "max": max
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Persist first; only mutate memory once disk is durable. See #1589.
+    let persist_id = id.clone();
+    let persist_goal = new_goal.clone();
+    if persist_session_update(
+        profile,
+        "goal update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.goal = persist_goal;
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::error!(
+            target: "http.api.sessions",
+            session = %id,
+            "goal update: instance vanished after persist"
+        );
+        return persist_failed_response();
+    };
+    inst.goal = new_goal;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "id": inst.id, "goal": inst.goal })),
+    )
+        .into_response()
+}
+
 // --- Triage: pin / archive / snooze ---
 //
 // Three sibling endpoints surface the existing `Instance::pin`, `archive`,

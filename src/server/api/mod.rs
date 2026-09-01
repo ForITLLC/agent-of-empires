@@ -58,6 +58,7 @@ pub use sessions::{
     update_session_color, update_session_diff_base, update_session_group,
     update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
     update_workspace_ordering, OutputQuery, SendMessageRequest,
+    get_session_goal, set_session_goal,
 };
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
@@ -338,6 +339,7 @@ mod tests {
                     "update_session_group",
                     "update_session_notifications",
                     "update_session_diff_base",
+                    "set_session_goal",
                 ],
             ),
             (
@@ -571,6 +573,7 @@ mod tests {
                     "update_session_group",
                     "update_session_notifications",
                     "update_session_diff_base",
+                    "set_session_goal",
                 ],
             ),
             (

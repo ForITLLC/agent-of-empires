@@ -219,6 +219,9 @@ pub struct SessionResponse {
     /// default, and auto-detection. See #970.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
+    /// Fleet per-session objective, omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
     #[serde(default)]
     pub is_sandboxed: bool,
     /// True when the session was created with `--scratch`; the
