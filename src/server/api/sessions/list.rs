@@ -583,6 +583,7 @@ mod workspace_ordering_tests {
             main_repo_path: None,
             base_branch: None,
             base_branch_override: None,
+            goal: None,
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,

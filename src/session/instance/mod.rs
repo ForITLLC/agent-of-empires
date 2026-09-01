@@ -323,6 +323,16 @@ pub struct Instance {
     /// Position within its group under `SortOrder::Custom`. `None` sorts last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_index: Option<u32>,
+
+    /// Free-text per-session goal or objective, set via `PATCH
+    /// /api/sessions/{id}/goal` and read back via `GET`. Surfaced on the
+    /// session list so a manager can see what each worker is meant to be
+    /// doing at a glance. Persisted alongside the session record; `None`
+    /// when unset. Distinct from `title` (a short label) and `status`
+    /// (lifecycle state): the goal is the human readable objective the
+    /// worker is accountable for. See per-dev WO #70.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
     #[serde(default, skip_serializing_if = "View::is_terminal")]
     pub view: View,
     #[serde(default, skip_serializing_if = "Option::is_none")]
