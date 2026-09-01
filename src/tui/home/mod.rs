@@ -43,8 +43,9 @@ use tui_input::Input;
 use crate::session::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
-    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
-    DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance, Item, Storage,
+    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, pin_commander_first,
+    resolve_config_or_warn, DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance,
+    Item, Storage,
 };
 use crate::tmux::AvailableTools;
 
