@@ -127,6 +127,16 @@ impl Instance {
         self.idle_dormant_since = None;
     }
 
+    /// True for the single fleet-manager session ("AoE-Commander"). Used to
+    /// pin it to the absolute top of every sidebar view regardless of status
+    /// tier or group membership (see `HomeView::build_flat_items`).
+    /// `favorite`/`pinned_at` only pin within a status tier and sink when the
+    /// row goes idle; the commander must stay top-visible in every state.
+    /// Title-based so it tracks the session the user sees as the commander.
+    pub fn is_commander(&self) -> bool {
+        self.title == "AoE-Commander"
+    }
+
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
     }
