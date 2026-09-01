@@ -3634,3 +3634,76 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
         "inherited trust needs no new record"
     );
 }
+
+fn parse_goal_body(json: &str) -> UpdateGoalBody {
+    serde_json::from_str(json).expect("body parses")
+}
+
+#[test]
+fn omitted_goal_field_is_refused_not_treated_as_a_clear() {
+    // per-dev WO #937 A6: a PATCH whose body never mentions `goal` used to
+    // deserialize identically to an explicit clear, so a malformed request
+    // erased the record with a 200. Absence must be its own answer.
+    assert_eq!(
+        goal_update_from_body(&parse_goal_body("{}")),
+        Err(GoalUpdateError::Omitted)
+    );
+}
+
+#[test]
+fn explicit_null_and_blank_still_clear_the_goal() {
+    for body in ["{\"goal\":null}", "{\"goal\":\"\"}", "{\"goal\":\"   \"}"] {
+        assert_eq!(
+            goal_update_from_body(&parse_goal_body(body)),
+            Ok(GoalUpdate::Clear),
+            "{body} must clear"
+        );
+    }
+}
+
+#[test]
+fn a_goal_is_stored_trimmed() {
+    assert_eq!(
+        goal_update_from_body(&parse_goal_body("{\"goal\":\"  ship it  \"}")),
+        Ok(GoalUpdate::Set("ship it".to_string()))
+    );
+}
+
+#[test]
+fn a_goal_over_the_cap_is_refused_with_both_lengths() {
+    // per-dev WO #937 A5: goals were unbounded, and a 90k-character record
+    // overflowed its own readers. The write is refused, never truncated.
+    let long = "g".repeat(GOAL_MAX_CHARS + 1);
+    assert_eq!(
+        goal_update_from_body(&parse_goal_body(
+            &serde_json::json!({ "goal": long }).to_string()
+        )),
+        Err(GoalUpdateError::TooLong {
+            len: GOAL_MAX_CHARS + 1,
+            max: GOAL_MAX_CHARS,
+        })
+    );
+}
+
+#[test]
+fn a_goal_exactly_at_the_cap_is_accepted() {
+    let at_cap = "g".repeat(GOAL_MAX_CHARS);
+    assert_eq!(
+        goal_update_from_body(&parse_goal_body(
+            &serde_json::json!({ "goal": at_cap }).to_string()
+        )),
+        Ok(GoalUpdate::Set("g".repeat(GOAL_MAX_CHARS)))
+    );
+}
+
+#[test]
+fn the_cap_counts_characters_not_bytes() {
+    // A multi-byte goal at the character cap is still under it; counting
+    // bytes would reject a legitimate record for being non-ASCII.
+    let at_cap = "é".repeat(GOAL_MAX_CHARS);
+    assert!(at_cap.len() > GOAL_MAX_CHARS, "fixture must be multi-byte");
+    assert!(goal_update_from_body(&parse_goal_body(
+        &serde_json::json!({ "goal": at_cap }).to_string()
+    ))
+    .is_ok());
+}

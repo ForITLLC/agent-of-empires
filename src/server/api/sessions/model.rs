@@ -42,6 +42,12 @@ pub struct SessionResponse {
     /// default, and auto-detection. See #970.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
+    /// Free-text per-session goal, set via `PATCH /api/sessions/{id}/goal`
+    /// and read via `GET /api/sessions/{id}/goal`. Omitted when unset. Lets
+    /// the web sidebar and MCP callers read a worker's objective off the
+    /// session list without a second round trip. See per-dev WO #70.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
     pub is_sandboxed: bool,
     /// True when the session was created with `--scratch`; the
     /// `project_path` points at an auto-provisioned directory under
@@ -364,6 +370,7 @@ impl SessionResponse {
                 .as_ref()
                 .and_then(|w| w.base_branch.clone()),
             base_branch_override: inst.base_branch_override.clone(),
+            goal: inst.goal.clone(),
             is_sandboxed: inst.is_sandboxed(),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),

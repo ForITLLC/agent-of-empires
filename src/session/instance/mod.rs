@@ -531,6 +531,16 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
 
+    /// Free-text per-session goal or objective, set via `PATCH
+    /// /api/sessions/{id}/goal` and read back via `GET`. Surfaced on the
+    /// session list so a manager can see what each worker is meant to be
+    /// doing at a glance. Persisted alongside the session record; `None`
+    /// when unset. Distinct from `title` (a short label) and `status`
+    /// (lifecycle state): the goal is the human readable objective the
+    /// worker is accountable for. See per-dev WO #70.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+
     /// How this session is rendered: `Structured` (ACP native rendering) or
     /// `Terminal` (raw tmux pane). When `Structured`, aoe spawns an ACP agent
     /// subprocess and renders structured events natively; tmux integration is
