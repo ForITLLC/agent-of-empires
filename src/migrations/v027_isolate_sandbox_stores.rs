@@ -2219,7 +2219,7 @@ mod tests {
             fs::read_to_string(app.join(".schema_version"))
                 .unwrap()
                 .trim(),
-            "27"
+            super::super::CURRENT_VERSION.to_string()
         );
         assert!(!super::super::has_pending_migrations());
         assert!(transition_may_be_pending(&app).unwrap());
