@@ -709,11 +709,23 @@ pub(crate) fn profile_short_code(profile: &str) -> String {
     let code: String = match segments.as_slice() {
         [] => String::new(),
         [single] => single.chars().take(3).collect(),
-        many => many
-            .iter()
-            .filter_map(|s| s.chars().next())
-            .take(4)
-            .collect(),
+        [lead, rest @ ..] => {
+            // Keep a short lead segment whole (`gna-main` -> `gnam`,
+            // `bsc-main`/`bso-main` -> `bscm`/`bsom`) so sibling profiles
+            // that share an initial stay distinguishable at a glance; a
+            // longer lead still contributes its initial only
+            // (`forit-backup` -> `fb`).
+            let lead_part: String = if lead.chars().count() <= 3 {
+                (*lead).to_string()
+            } else {
+                lead.chars().take(1).collect()
+            };
+            lead_part
+                .chars()
+                .chain(rest.iter().filter_map(|s| s.chars().next()))
+                .take(4)
+                .collect()
+        }
     };
     code.to_lowercase()
 }
@@ -4789,7 +4801,19 @@ mod tests {
     fn profile_short_code_multi_segment_takes_initials() {
         assert_eq!(profile_short_code("forit-backup"), "fb");
         assert_eq!(profile_short_code("pivot-main"), "pm");
-        assert_eq!(profile_short_code("wma-work"), "ww");
+        assert_eq!(profile_short_code("connect_airlines-work"), "caw");
+    }
+
+    #[test]
+    fn profile_short_code_keeps_short_lead_segment_whole() {
+        assert_eq!(profile_short_code("gna-main"), "gnam");
+        assert_eq!(profile_short_code("bsc-main"), "bscm");
+        assert_eq!(profile_short_code("bso-main"), "bsom");
+        assert_eq!(profile_short_code("RAS-Main"), "rasm");
+        assert_eq!(profile_short_code("aoe-fiw"), "aoef");
+        assert_eq!(profile_short_code("wma-work"), "wmaw");
+        assert_eq!(profile_short_code("p9-main"), "p9m");
+        assert_eq!(profile_short_code("bp-main"), "bpm");
     }
 
     #[test]
