@@ -997,6 +997,14 @@ function AppContent({
   // the tour gates auto-launch on an explicit loaded flag instead.
   const [serverAboutLoaded, setServerAboutLoaded] = useState(false);
 
+  // Reflect the operator-set instance label into the page title so browser
+  // tabs / PWA windows for different daemons are tellable apart. Only set
+  // when a label is configured; otherwise the built index.html title stands.
+  useEffect(() => {
+    const label = serverAbout?.instance_label;
+    if (label) document.title = `${label} — Agent of Empires`;
+  }, [serverAbout?.instance_label]);
+
   const refreshServerAbout = useCallback(async () => {
     try {
       const about = await fetchAbout();
@@ -2186,6 +2194,7 @@ function AppContent({
             loginRequired={loginRequired}
             isOffline={!!error}
             isDevBuild={isDebugBuild(serverAbout)}
+            instanceLabel={serverAbout?.instance_label ?? null}
             onOpenTips={tips.open}
             onGoDashboard={handleGoDashboard}
             sidebarColumnVisible={!showSettings && sidebarOpen}
