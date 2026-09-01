@@ -66,6 +66,7 @@ impl Instance {
             idempotency_key: None,
             base_branch_override: None,
             color: None,
+            goal: None,
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
