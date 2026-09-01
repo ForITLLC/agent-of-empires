@@ -740,6 +740,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         push: push_state,
         push_enabled,
         web_config: config.web.clone(),
+        relay: crate::server::state::RelayIngress::from_config(&config.relay),
         web_presence: std::sync::Mutex::new(std::collections::HashMap::new()),
         sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
         telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),

@@ -213,6 +213,16 @@ fn normalize_path(path: &str) -> &str {
 /// token-with-passphrase branch of `auth_middleware` and by
 /// `run_passphrase_wall` so a new bootstrap path only needs to be
 /// added once.
+/// Whether a request is the cross-board relay ingress. `POST /api/relay`
+/// authenticates with its own scoped bearer secret, enforced in the handler
+/// (404 unconfigured, 401 mismatch with rate-limiter failure recording), so
+/// `auth_middleware` exempts it from the token gate and the passphrase wall.
+/// POST-only: the route registers no other method, and a bare GET should
+/// keep falling through to the SPA fallback like any unknown path.
+pub(crate) fn is_relay_ingress(path: &str) -> bool {
+    path == "/api/relay"
+}
+
 fn is_login_session_exempt(path: &str) -> bool {
     path == "/"
         || path == "/login"
@@ -660,6 +670,24 @@ async fn run_passphrase_wall(
     response
 }
 
+/// 429 with `Retry-After` for a locked-out client IP. Shared by the main
+/// token/passphrase path and the relay-ingress carve-out so both surfaces
+/// present the same lockout contract.
+fn rate_limited_response(remaining_secs: u64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("Retry-After", remaining_secs.to_string())],
+        axum::Json(serde_json::json!({
+            "error": "rate_limited",
+            "message": format!(
+                "Too many failed attempts. Try again in {} seconds.",
+                remaining_secs
+            )
+        })),
+    )
+        .into_response()
+}
+
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -681,6 +709,29 @@ pub async fn auth_middleware(
         && state.login_manager.is_enabled();
     if !wall_covers_loopback && is_local_trusted(client_ip) {
         request.extensions_mut().insert(LoopbackTrusted);
+    }
+
+    // Cross-board relay ingress: authenticated by its own scoped bearer
+    // secret inside the handler, so it must not require this daemon's token
+    // or a passphrase login session — a peer board holds neither. The
+    // rate-limit lockout still runs first so a peer (or an attacker) probing
+    // the relay secret shares the same lockout budget as failed logins; the
+    // handler records failures into the same limiter. The zeroed token hash
+    // mirrors the no-auth path so extension-extracting handlers succeed.
+    if request.method() == axum::http::Method::POST && is_relay_ingress(request.uri().path()) {
+        if let Some(remaining_secs) = state.rate_limiter.check_locked(client_ip).await {
+            tracing::warn!(
+                target: "auth.rate_limit",
+                ip = %client_ip,
+                remaining_secs,
+                "rejecting relay request from locked-out IP"
+            );
+            return rate_limited_response(remaining_secs);
+        }
+        request
+            .extensions_mut()
+            .insert(AuthenticatedTokenHash([0u8; 32]));
+        return next.run(request).await;
     }
 
     // Trace structured view ws specifically so we can see whether the
@@ -746,18 +797,7 @@ pub async fn auth_middleware(
             remaining_secs,
             "rejecting request from locked-out IP"
         );
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("Retry-After", remaining_secs.to_string())],
-            axum::Json(serde_json::json!({
-                "error": "rate_limited",
-                "message": format!(
-                    "Too many failed attempts. Try again in {} seconds.",
-                    remaining_secs
-                )
-            })),
-        )
-            .into_response();
+        return rate_limited_response(remaining_secs);
     }
 
     // Steady-state path: a bound device authenticates with its
@@ -1065,6 +1105,16 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, tracing::Level::DEBUG);
         assert_eq!(events[0].1, "auth");
+    }
+
+    #[test]
+    fn relay_ingress_is_exactly_the_relay_path() {
+        assert!(is_relay_ingress("/api/relay"));
+        // No prefix matching: sub-paths and lookalikes stay behind auth.
+        assert!(!is_relay_ingress("/api/relay/"));
+        assert!(!is_relay_ingress("/api/relays"));
+        assert!(!is_relay_ingress("/api/relay/x"));
+        assert!(!is_relay_ingress("/relay"));
     }
 
     #[test]
