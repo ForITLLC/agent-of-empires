@@ -25,6 +25,7 @@ function renderTopBar(
   overrides: {
     isDevBuild?: boolean;
     isOffline?: boolean;
+    instanceLabel?: string | null;
     activeWorkspace?: Workspace;
     activeSession?: SessionResponse | null;
     onOpenTips?: () => void;
@@ -48,6 +49,7 @@ function renderTopBar(
       loginRequired={false}
       isOffline={overrides.isOffline ?? false}
       isDevBuild={overrides.isDevBuild ?? false}
+      instanceLabel={overrides.instanceLabel ?? null}
       onOpenTips={overrides.onOpenTips ?? vi.fn()}
       onGoDashboard={vi.fn()}
       sidebarColumnVisible={false}
@@ -70,6 +72,16 @@ describe("TopBar", () => {
     });
     expect(queryByLabelText("Debug build")).toBeNull();
     expect(queryByText("DEV")).toBeNull();
+  });
+
+  it("renders the instance label next to the wordmark when configured", () => {
+    const { getByText } = renderTopBar({ instanceLabel: "office rack" });
+    expect(getByText("office rack")).toBeTruthy();
+  });
+
+  it("renders no instance label when none is configured", () => {
+    const { queryByTitle } = renderTopBar({ instanceLabel: null });
+    expect(queryByTitle("Instance label ([web] instance_label)")).toBeNull();
   });
 
   it("does not render the workspace/repo breadcrumb even with an active workspace and session", () => {
