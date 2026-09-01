@@ -1222,7 +1222,14 @@ impl HomeView {
         let profile = self.active_profile_display();
         let mut title = match &self.view_mode {
             ViewMode::Structured => {
-                compose_list_title("aoe", profile, self.group_by, self.sort_order)
+                // Board identity up top: with `[web] instance_label` set the
+                // title reads "aoe — <label>" so this board is unmistakable
+                // when several dashboards are open side by side.
+                let prefix = match self.board_banner.as_deref().map(str::trim) {
+                    Some(label) if !label.is_empty() => format!("aoe — {label}"),
+                    _ => "aoe".to_string(),
+                };
+                compose_list_title(&prefix, profile, self.group_by, self.sort_order)
             }
             ViewMode::Terminal => {
                 compose_list_title("Terminals", profile, self.group_by, self.sort_order)

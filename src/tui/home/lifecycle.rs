@@ -196,6 +196,7 @@ impl HomeView {
                 != crate::session::config::TmuxSettingMode::Disabled,
             hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks::default(),
             vt_live_enabled: resolved.tmux.vt_live,
+            board_banner: resolved.web.instance_label.clone(),
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
                 .as_ref()
