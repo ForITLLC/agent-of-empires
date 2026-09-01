@@ -151,6 +151,11 @@ pub struct HomeView {
     pub(super) agent_clipboard_forward: bool,
     pub(super) hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks,
     pub(super) vt_live_enabled: bool,
+    /// Optional board identity from `[web] instance_label` ("office rack",
+    /// "home mini"), rendered into the list-pane title so someone attached to
+    /// several boards can tell which one they are looking at. Cached at
+    /// construction + config refresh like the other config-derived fields.
+    pub(super) board_banner: Option<String>,
     pub(super) profile_default_attach_mode: crate::session::AttachMode,
     pub(super) project_group_collapsed: HashMap<String, bool>,
     pub(super) org_group_collapsed: HashMap<String, bool>,
