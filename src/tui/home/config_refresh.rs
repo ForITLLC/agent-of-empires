@@ -102,6 +102,7 @@ impl HomeView {
         self.agent_clipboard_forward =
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;
+        self.board_banner = config.web.instance_label.clone();
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_vt_enabled(
                 self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),

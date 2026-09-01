@@ -206,6 +206,11 @@ pub struct HomeView {
     /// Cached at construction + config refresh and pushed into the capture
     /// worker (`set_vt_enabled`), so a settings toggle applies in place.
     pub(super) vt_live_enabled: bool,
+    /// Optional board identity from `[web] instance_label` ("office rack",
+    /// "home mini"), rendered into the list-pane title so someone attached to
+    /// several boards can tell which one they are looking at. Cached at
+    /// construction + config refresh like the other config-derived fields.
+    pub(super) board_banner: Option<String>,
     /// Active profile's `default_attach_mode`, cached at construction and
     /// refreshed by `refresh_from_config` / `switch_profile`. The help
     /// overlay falls back to this when no session row is selected so the

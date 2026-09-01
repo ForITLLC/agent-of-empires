@@ -195,6 +195,7 @@ impl HomeView {
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
             vt_live_enabled: resolved.tmux.vt_live,
+            board_banner: resolved.web.instance_label.clone(),
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
                 .as_ref()
