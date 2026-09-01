@@ -145,6 +145,9 @@ pub struct SessionResponse {
     /// Overrides `base_branch`, the profile default, and auto-detection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
+    /// Fleet per-session objective, omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
     #[serde(default)]
     pub is_sandboxed: bool,
     #[serde(default)]
