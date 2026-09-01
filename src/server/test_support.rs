@@ -126,6 +126,7 @@ fn build_test_app_state_impl(
         push: None,
         push_enabled: false,
         web_config: crate::session::config::WebConfig::default(),
+        relay: None,
         web_presence: std::sync::Mutex::new(HashMap::new()),
         sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
         telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
