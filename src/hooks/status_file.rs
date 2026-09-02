@@ -8,9 +8,12 @@
 
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::Result;
+use regex::Regex;
+use uuid::Uuid;
 
 use crate::session::Status;
 
@@ -191,6 +194,145 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
         }
     }
     true
+}
+
+/// Every key the `attention-urgent` writer stamps alongside `urgent`. An ack
+/// strips all of them so a later [`read_hook_urgent`] can never see a
+/// half-cleared flag.
+const URGENT_KEYS: [&str; 5] = [
+    "urgent",
+    "urgent_reason",
+    "urgent_set_at",
+    "urgent_expires_at",
+    "urgent_kind",
+];
+
+/// Urgent kinds that resolve OUT-OF-BAND — a browser sign-in (`auth`), a
+/// rate-cap reset (`cap`), an API overload that auto-resumes (`overload`), a
+/// gateway restart (`mcp`) — rather than by the agent receiving its next
+/// message. Machine traffic (fleet dispatches, loop ticks, harness
+/// continuations) must not wipe them before a human has seen the row; only a
+/// message that reads as genuine human input, or expiry, clears them. Mirrors
+/// the `claude-attention-signal-hook.py` `_clear_urgent` contract.
+const STICKY_URGENT_KINDS: [&str; 4] = ["auth", "cap", "overload", "mcp"];
+
+/// A message starting with one of these is a harness continuation, not a
+/// human prompt.
+const HARNESS_PREFIXES: [&str; 7] = [
+    "<system-reminder>",
+    "Stop hook feedback:",
+    "<command-name>",
+    "<local-command",
+    "<task-notification",
+    "# Autonomous loop check",
+    "<<autonomous-loop",
+];
+
+/// Fleet-protocol markers: a message carrying one was machine-composed.
+const FLEET_MARKERS: [&str; 2] = ["-- FLEET-AUTH v1 --", "SELF-HARDENING PROBE"];
+
+/// Peer/agent signature line, e.g. `— AoE-Commander (e284618842464176)`: a
+/// message that ends a line with one was composed by another agent.
+static FLEET_SIG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*[—–-]{1,2}\s*\S[^\n(]{0,60}\(([0-9a-f]{6,32})\)\s*$")
+        .expect("fleet signature regex is valid")
+});
+
+/// True when `text` reads as a genuine human prompt rather than harness or
+/// fleet traffic. Conservative: empty or unclassifiable → `false`, so sticky
+/// urgents survive.
+pub fn is_human_prompt(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    if HARNESS_PREFIXES.iter().any(|p| text.starts_with(p)) {
+        return false;
+    }
+    if FLEET_MARKERS.iter().any(|m| text.contains(m)) {
+        return false;
+    }
+    if FLEET_SIG_RE.is_match(text) {
+        return false;
+    }
+    true
+}
+
+/// Outcome of [`ack_hook_urgent_on_send`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrgentAck {
+    /// No urgent flag was set (or no attention file exists).
+    Absent,
+    /// A sticky urgent kind is unexpired and the message is machine traffic:
+    /// the flag was left intact.
+    Kept,
+    /// The urgent fields were stripped.
+    Cleared,
+}
+
+impl UrgentAck {
+    /// Wire form for API responses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UrgentAck::Absent => "absent",
+            UrgentAck::Kept => "kept",
+            UrgentAck::Cleared => "cleared",
+        }
+    }
+}
+
+/// Acknowledge a session's urgent flag when a message is delivered to it.
+///
+/// Delivering a message is the authoritative "someone is handling this":
+/// a non-sticky urgent clears on any delivery; a [`STICKY_URGENT_KINDS`]
+/// flag clears only when the message is genuine human input
+/// ([`is_human_prompt`]) or the flag has already expired. The tier/reason
+/// fields are untouched. Fail-open: a read, parse, or write failure leaves
+/// the file as it was — a send must never fail on attention bookkeeping.
+pub fn ack_hook_urgent_on_send(instance_id: &str, message: &str) -> UrgentAck {
+    let Ok(Some(dir)) = dir_guard::open_instance_dir_read_only(instance_id) else {
+        return UrgentAck::Absent;
+    };
+    let Ok(Some(bytes)) =
+        dir_guard::read_file_at(dir.as_fd(), "attention.json", ATTENTION_FILE_READ_CAP)
+    else {
+        return UrgentAck::Absent;
+    };
+    let Ok(serde_json::Value::Object(mut payload)) =
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+    else {
+        return UrgentAck::Absent;
+    };
+    if !payload
+        .get("urgent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return UrgentAck::Absent;
+    }
+    let kind = payload
+        .get("urgent_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if STICKY_URGENT_KINDS.contains(&kind) {
+        let expires = payload.get("urgent_expires_at").and_then(|v| v.as_f64());
+        let now = crate::util::now_secs() as f64;
+        if matches!(expires, Some(exp) if exp > now) && !is_human_prompt(message) {
+            return UrgentAck::Kept;
+        }
+    }
+    for key in URGENT_KEYS {
+        payload.remove(key);
+    }
+    let body = serde_json::Value::Object(payload).to_string();
+    match dir_guard::write_atomic(dir.as_fd(), "attention.json", body.as_bytes()) {
+        Ok(()) => UrgentAck::Cleared,
+        Err(e) => {
+            tracing::warn!(target: "hooks.status",
+                "ack_hook_urgent_on_send: {} left as-is: {}", instance_id, e);
+            UrgentAck::Kept
+        }
+    }
 }
 
 /// Remove the hook status directory for a given instance (cleanup on stop/delete).
@@ -562,5 +704,188 @@ mod tests {
         let (_g, _, _tmp) = BaseGuard::ready();
         cleanup_hook_status_dir("../etc");
         cleanup_hook_status_dir("");
+    }
+
+    // ── ack_hook_urgent_on_send / is_human_prompt (WO#1641 item 2) ─────────
+
+    const COMMANDER_MSG: &str =
+        "WORK ORDER #1: rebuild the thing.\n— AoE-Commander (e284618842464176)";
+    const HUMAN_MSG: &str = "hey can you look at the failing deploy";
+
+    fn read_attention_json(instance_id: &str) -> serde_json::Value {
+        let dir = dir_guard::open_instance_dir(instance_id).unwrap();
+        let bytes = dir_guard::read_file_at(dir.as_fd(), "attention.json", ATTENTION_FILE_READ_CAP)
+            .unwrap()
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn urgent_body(kind: Option<&str>, expires_at: i64) -> String {
+        let kind = kind
+            .map(|k| format!(",\"urgent_kind\":\"{k}\""))
+            .unwrap_or_default();
+        format!(
+            "{{\"tier\":3,\"reason\":\"needs_input\",\"urgent\":true,\"urgent_reason\":\"r\",\
+             \"urgent_set_at\":1,\"urgent_expires_at\":{expires_at}{kind}}}"
+        )
+    }
+
+    fn future() -> i64 {
+        crate::util::now_secs() as i64 + 600
+    }
+
+    #[test]
+    fn is_human_prompt_classifies_machine_traffic() {
+        assert!(is_human_prompt(HUMAN_MSG));
+        assert!(is_human_prompt("call me at (555) 1234 — thanks"));
+        assert!(!is_human_prompt(""));
+        assert!(!is_human_prompt("   \n"));
+        assert!(!is_human_prompt(
+            "<system-reminder>continue</system-reminder>"
+        ));
+        assert!(!is_human_prompt("Stop hook feedback: open tasks remain"));
+        assert!(!is_human_prompt(
+            "<task-notification>done</task-notification>"
+        ));
+        assert!(!is_human_prompt("# Autonomous loop check\nstill going"));
+        assert!(!is_human_prompt("probe body\n-- FLEET-AUTH v1 --\nsig=abc"));
+        assert!(!is_human_prompt("SELF-HARDENING PROBE: run tests"));
+        assert!(!is_human_prompt(COMMANDER_MSG));
+        assert!(!is_human_prompt(
+            "STATUS: shipped\n- for-dev (1f5a22dc28d84abd)"
+        ));
+        assert!(!is_human_prompt("– per-Dev (abcdef)"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn ack_clears_plain_urgent_on_any_send() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_attention_json("ack_plain", &urgent_body(None, future()));
+        assert!(read_hook_urgent("ack_plain"));
+        assert_eq!(
+            ack_hook_urgent_on_send("ack_plain", COMMANDER_MSG),
+            UrgentAck::Cleared
+        );
+        assert!(!read_hook_urgent("ack_plain"));
+        let v = read_attention_json("ack_plain");
+        assert_eq!(v["tier"], 3, "tier survives the ack: {v}");
+        assert_eq!(v["reason"], "needs_input");
+        for key in URGENT_KEYS {
+            assert!(v.get(key).is_none(), "{key} still present: {v}");
+        }
+        // Idempotent: a second send finds nothing to clear.
+        assert_eq!(
+            ack_hook_urgent_on_send("ack_plain", HUMAN_MSG),
+            UrgentAck::Absent
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn ack_keeps_unexpired_sticky_kind_for_machine_traffic() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        for kind in STICKY_URGENT_KINDS {
+            let id = format!("ack_sticky_{kind}");
+            let body = urgent_body(Some(kind), future());
+            write_attention_json(&id, &body);
+            assert_eq!(
+                ack_hook_urgent_on_send(&id, COMMANDER_MSG),
+                UrgentAck::Kept,
+                "{kind}"
+            );
+            assert_eq!(
+                ack_hook_urgent_on_send(&id, "<system-reminder>continue</system-reminder>"),
+                UrgentAck::Kept,
+                "{kind}"
+            );
+            assert!(read_hook_urgent(&id), "{kind} flag must survive");
+            let dir = dir_guard::open_instance_dir(&id).unwrap();
+            let raw =
+                dir_guard::read_file_at(dir.as_fd(), "attention.json", ATTENTION_FILE_READ_CAP)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(raw, body.as_bytes(), "{kind}: file must be byte-identical");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn ack_clears_sticky_kind_for_human_prompt() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_attention_json("ack_sticky_human", &urgent_body(Some("cap"), future()));
+        assert_eq!(
+            ack_hook_urgent_on_send("ack_sticky_human", HUMAN_MSG),
+            UrgentAck::Cleared
+        );
+        assert!(!read_hook_urgent("ack_sticky_human"));
+        assert!(read_attention_json("ack_sticky_human")
+            .get("urgent_kind")
+            .is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn ack_clears_expired_sticky_kind_for_machine_traffic() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_attention_json("ack_sticky_expired", &urgent_body(Some("mcp"), 1));
+        assert_eq!(
+            ack_hook_urgent_on_send("ack_sticky_expired", COMMANDER_MSG),
+            UrgentAck::Cleared
+        );
+        assert!(read_attention_json("ack_sticky_expired")
+            .get("urgent")
+            .is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn ack_non_sticky_kind_clears_for_machine_traffic() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        // "throttle" self-heals on retry; it is deliberately NOT sticky.
+        write_attention_json("ack_throttle", &urgent_body(Some("throttle"), future()));
+        assert_eq!(
+            ack_hook_urgent_on_send("ack_throttle", COMMANDER_MSG),
+            UrgentAck::Cleared
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn ack_is_absent_without_a_flag() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert_eq!(
+            ack_hook_urgent_on_send("ack_missing", HUMAN_MSG),
+            UrgentAck::Absent
+        );
+        write_attention_json("ack_tier_only", r#"{"tier":2,"reason":"idle"}"#);
+        assert_eq!(
+            ack_hook_urgent_on_send("ack_tier_only", HUMAN_MSG),
+            UrgentAck::Absent
+        );
+        assert_eq!(
+            read_attention_json("ack_tier_only"),
+            serde_json::json!({"tier":2,"reason":"idle"})
+        );
+        write_attention_json("ack_false", r#"{"tier":2,"urgent":false}"#);
+        assert_eq!(
+            ack_hook_urgent_on_send("ack_false", HUMAN_MSG),
+            UrgentAck::Absent
+        );
+        write_attention_json("ack_garbage", "not json");
+        assert_eq!(
+            ack_hook_urgent_on_send("ack_garbage", HUMAN_MSG),
+            UrgentAck::Absent
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn ack_rejects_unsafe_id() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert_eq!(
+            ack_hook_urgent_on_send("../etc", HUMAN_MSG),
+            UrgentAck::Absent
+        );
     }
 }

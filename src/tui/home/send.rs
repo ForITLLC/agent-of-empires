@@ -175,6 +175,12 @@ impl HomeView {
             ));
             return;
         }
+        // A message typed to the AGENT acknowledges its urgent flag (a shell
+        // in the paired terminal pane does not). Sticky kinds survive machine
+        // traffic — see `hooks::ack_hook_urgent_on_send`.
+        if matches!(target, live_send::LiveSendTarget::Agent) {
+            crate::hooks::ack_hook_urgent_on_send(session_id, message);
+        }
         self.stamp_last_accessed(session_id);
         if let Err(e) = self.save() {
             tracing::error!("Failed to save after send: {}", e);

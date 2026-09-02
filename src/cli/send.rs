@@ -86,6 +86,10 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
 
     let delay = crate::agents::send_keys_enter_delay(&tool);
     tmux_session.send_keys_with_delay(&args.message, delay)?;
+    // Delivered: acknowledge the hook-written urgent flag (sticky kinds
+    // survive machine traffic — see `hooks::ack_hook_urgent_on_send`).
+    let urgent_ack = crate::hooks::ack_hook_urgent_on_send(&session_id, &args.message);
+    tracing::debug!(session = %session_id, ack = urgent_ack.as_str(), "send: urgent ack");
 
     // Stamp last_accessed_at so the "last activity" column reflects user
     // interaction, and remap the status to Running. The agent has just been
