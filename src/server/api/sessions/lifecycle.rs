@@ -1771,6 +1771,61 @@ async fn run_detached_restart(state: Arc<AppState>, id: String) {
         return;
     };
 
+    // A cross-profile record relocation (`aoe session move`) rewrites the
+    // target and source `sessions.json` and then asks for this restart. The
+    // in-memory snapshot can still carry the OLD `source_profile`: the disk
+    // reload that would re-home it is debounced (or dropped by the
+    // create/delete epoch guard) and lands seconds later. Cascading from the
+    // stale snapshot fails inside `acquire_lifecycle_reservation` with
+    // "session no longer exists" (the id is gone from the old file) and,
+    // worse, leaves the pane running under the OLD account. So check the
+    // record against disk first and re-home the snapshot when it has moved.
+    let instance = {
+        let rehome_id = id.clone();
+        let candidate = instance.clone();
+        match tokio::task::spawn_blocking(move || rehome_from_disk(&rehome_id, candidate)).await {
+            Ok(Rehome::Same(inst)) => inst,
+            Ok(Rehome::Moved { from, to, inst }) => {
+                tracing::info!(
+                    target: "server.lifecycle",
+                    verb = "restart",
+                    session = %id,
+                    from = %from,
+                    to = %to,
+                    "restart: record re-homed on disk since the last reload; \
+                     cascading under the new profile"
+                );
+                // Fix the live row too, so restart-status and any follow-up
+                // verb see the right profile without waiting for the reload.
+                let mut instances = state.instances.write().await;
+                if let Some(row) = instances.iter_mut().find(|i| i.id == id) {
+                    row.source_profile = to;
+                }
+                inst
+            }
+            Ok(Rehome::Gone { from, inst }) => {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    last_known_profile = %from,
+                    "detached restart: id is in no profile's sessions.json; \
+                     cascading from the in-memory snapshot (the lifecycle \
+                     reservation reports the outcome)"
+                );
+                inst
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    "detached restart: disk re-home check failed ({join_err}); \
+                     cascading from the in-memory snapshot"
+                );
+                instance
+            }
+        }
+    };
+
     let profile = instance.source_profile.clone();
     let sync_base = instance.clone();
 
@@ -1909,6 +1964,60 @@ async fn run_detached_restart(state: Arc<AppState>, id: String) {
     finish_detached_restart(&state, &id).await;
 }
 
+/// Where a restart snapshot's record actually lives on disk, relative to the
+/// profile the snapshot remembers.
+pub(crate) enum Rehome {
+    /// The record is still in the snapshot's profile.
+    Same(Instance),
+    /// The record was relocated; `inst.source_profile` is now `to`.
+    Moved {
+        from: String,
+        to: String,
+        inst: Instance,
+    },
+    /// No profile's `sessions.json` carries the id.
+    Gone { from: String, inst: Instance },
+}
+
+#[cfg(test)]
+impl Rehome {
+    fn kind(&self) -> &'static str {
+        match self {
+            Rehome::Same(_) => "Same",
+            Rehome::Moved { .. } => "Moved",
+            Rehome::Gone { .. } => "Gone",
+        }
+    }
+}
+
+/// Does `profile`'s `sessions.json` carry `id`? Unreadable storage reads as
+/// "no": the caller then scans the other profiles and, finding nothing,
+/// keeps the snapshot it had.
+fn profile_holds_session(profile: &str, id: &str) -> bool {
+    crate::session::Storage::new_unwatched(profile)
+        .and_then(|s| s.load())
+        .map(|v| v.iter().any(|i| i.id == id))
+        .unwrap_or(false)
+}
+
+/// Re-home a restart snapshot whose record was relocated across profiles
+/// after the last disk reload (`aoe session move`). Blocking file IO: call
+/// it from `spawn_blocking`.
+pub(crate) fn rehome_from_disk(id: &str, mut inst: Instance) -> Rehome {
+    let from = inst.source_profile.clone();
+    if profile_holds_session(&from, id) {
+        return Rehome::Same(inst);
+    }
+    let profiles = crate::session::list_profiles().unwrap_or_default();
+    for p in profiles {
+        if p != from && profile_holds_session(&p, id) {
+            inst.source_profile = p.clone();
+            return Rehome::Moved { from, to: p, inst };
+        }
+    }
+    Rehome::Gone { from, inst }
+}
+
 fn record_restart_outcome(
     state: &Arc<AppState>,
     id: &str,
@@ -1987,4 +2096,85 @@ async fn finish_detached_restart(state: &Arc<AppState>, id: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(id);
+}
+
+#[cfg(test)]
+mod restart_rehome_tests {
+    use super::{rehome_from_disk, Rehome};
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    fn temp_home() -> tempfile::TempDir {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        temp
+    }
+
+    fn seed(profile: &str, id: &str) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new("probe", "/tmp/probe");
+        inst.id = id.to_string();
+        storage
+            .update(|i, _g| {
+                i.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn snapshot(id: &str, profile: &str) -> Instance {
+        let mut inst = Instance::new("probe", "/tmp/probe");
+        inst.id = id.to_string();
+        inst.source_profile = profile.to_string();
+        inst
+    }
+
+    // THE BUG: `aoe session move` relocated the record (p9 -> backup) and
+    // POSTed the restart before the daemon reloaded from disk. The snapshot
+    // still said p9, the cascade looked the id up in p9's file, failed with
+    // "session no longer exists", and the pane kept running on the OLD
+    // account. The re-home must follow the record to the profile that holds
+    // it and rewrite `source_profile` so the cascade binds the new account.
+    #[test]
+    #[serial]
+    fn moved_record_is_rehomed_to_the_profile_that_holds_it() {
+        let _home = temp_home();
+        seed("rehome-backup", "mv000001");
+        match rehome_from_disk("mv000001", snapshot("mv000001", "rehome-p9")) {
+            Rehome::Moved { from, to, inst } => {
+                assert_eq!(from, "rehome-p9");
+                assert_eq!(to, "rehome-backup");
+                assert_eq!(inst.source_profile, "rehome-backup");
+            }
+            other => panic!("expected Moved, got {}", other.kind()),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn record_still_in_its_profile_is_left_alone() {
+        let _home = temp_home();
+        seed("rehome-same", "mv000002");
+        match rehome_from_disk("mv000002", snapshot("mv000002", "rehome-same")) {
+            Rehome::Same(inst) => assert_eq!(inst.source_profile, "rehome-same"),
+            other => panic!("expected Same, got {}", other.kind()),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn record_in_no_profile_reports_gone_with_the_last_known_profile() {
+        let _home = temp_home();
+        seed("rehome-other", "mv999999");
+        match rehome_from_disk("mv000003", snapshot("mv000003", "rehome-lost")) {
+            Rehome::Gone { from, inst } => {
+                assert_eq!(from, "rehome-lost");
+                assert_eq!(inst.source_profile, "rehome-lost");
+            }
+            other => panic!("expected Gone, got {}", other.kind()),
+        }
+    }
 }
