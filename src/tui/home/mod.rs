@@ -705,6 +705,12 @@ pub struct HomeView {
     /// agents with a bottom-anchored input box (claude) visibly jump right as
     /// live mode opened. See `passive_resize_step`.
     pub(super) preview_pane_pending: Option<(String, u16, u16)>,
+    /// `(session_id, cols, rows)` whose passive resize last yielded to a real
+    /// tmux client or an active size owner, and when. The yield is sticky
+    /// while the user stays attached, and re-asking tmux costs forks on the
+    /// render thread, so the same geometry backs off before asking again.
+    /// See `passive_resize_probe_due`.
+    pub(super) preview_pane_yielded: Option<((String, u16, u16), Instant)>,
     /// Pasted text captured at the home view that we couldn't immediately
     /// route (no session selected, cursor on a group header, etc.). Drained
     /// into the next compose dialog the user opens, so voice/dictation never
@@ -2300,6 +2306,7 @@ impl HomeView {
             footer_hover: None,
             preview_pane_synced: None,
             preview_pane_pending: None,
+            preview_pane_yielded: None,
             pending_paste: None,
             pending_attach_after_warning: None,
             pending_stop_session: None,
@@ -5096,6 +5103,7 @@ impl HomeView {
     /// leaving live mode hands the resize off and back).
     pub(super) fn clear_preview_pane_sync(&mut self) {
         self.preview_pane_synced = None;
+        self.preview_pane_yielded = None;
     }
 
     /// Expand the synthetic Archived section if it is collapsed, persisting
@@ -6461,6 +6469,7 @@ impl HomeView {
         // Live mode takes over the pane's size from here; drop the non-live
         // preview dedup so exiting re-asserts the preview geometry cleanly.
         self.preview_pane_synced = None;
+        self.preview_pane_yielded = None;
         self.stamp_last_accessed(session_id);
         Ok(())
     }

@@ -300,6 +300,27 @@ fn passive_resize_step(
     }
 }
 
+/// How long a `Fire` that yielded to a real tmux client or a size owner waits
+/// before asking tmux again. The yield is sticky for as long as the user stays
+/// attached, and each ask is one to three tmux forks on the render thread, so
+/// without a backoff a selected-but-attached session cost that per frame.
+const PASSIVE_RESIZE_YIELD_RETRY: Duration = Duration::from_secs(1);
+
+/// Whether a `Fire` may probe tmux now, given the last yield for the same
+/// geometry. A yield for a different geometry (new selection, new size) never
+/// holds this one back; the backoff only rate-limits re-asking the exact
+/// question tmux just answered "someone else is driving this" to.
+fn passive_resize_probe_due(
+    want: &(String, u16, u16),
+    yielded: Option<&((String, u16, u16), Instant)>,
+    now: Instant,
+) -> bool {
+    match yielded {
+        Some((geo, at)) if geo == want => now.duration_since(*at) >= PASSIVE_RESIZE_YIELD_RETRY,
+        _ => true,
+    }
+}
+
 /// Clamp the user's preview scroll offset to what the freshly captured pane
 /// can actually render. Prevents the offset from drifting into "phantom"
 /// territory (M3 from the multi-AI review) when tmux history is shorter than
@@ -2238,11 +2259,24 @@ impl HomeView {
                             // against `has_active_size_owner`'s two, and being
                             // attached is the sticky state here (the skip leaves
                             // the pending slot armed, so this block re-runs every
-                            // poll for as long as the user stays attached).
-                            if !session.is_attached() && !session.has_active_size_owner() {
-                                session.resize_window(width, height);
-                                self.preview_pane_synced = Some(want);
-                                self.preview_pane_pending = None;
+                            // poll for as long as the user stays attached). Each
+                            // ask forks tmux on the render thread, so a yield is
+                            // remembered and the same geometry waits
+                            // `PASSIVE_RESIZE_YIELD_RETRY` before asking again.
+                            let now = Instant::now();
+                            if passive_resize_probe_due(
+                                &want,
+                                self.preview_pane_yielded.as_ref(),
+                                now,
+                            ) {
+                                if !session.is_attached() && !session.has_active_size_owner() {
+                                    session.resize_window(width, height);
+                                    self.preview_pane_synced = Some(want);
+                                    self.preview_pane_pending = None;
+                                    self.preview_pane_yielded = None;
+                                } else {
+                                    self.preview_pane_yielded = Some((want, now));
+                                }
                             }
                         }
                     }
@@ -3692,13 +3726,16 @@ impl HomeView {
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
 
         // Serve indicator: shown only when the `aoe serve` daemon is live.
-        // The TUI does not own the daemon, so we probe the PID file each
-        // render. Mode comes from a PID-keyed cache so we don't read the
-        // serve.mode file from disk on every frame.
+        // The TUI does not own the daemon, so it probes the PID file, but
+        // through a short-TTL memo: the uncached probe verifies the process
+        // identity with a `ps` fork on macOS, and doing that on every frame
+        // was a synchronous spawn on the render thread per keystroke. Mode
+        // comes from a PID-keyed cache so we don't read the serve.mode file
+        // from disk on every frame either.
         #[cfg(feature = "serve")]
         {
             let mode_label = crate::cli::serve::cached_serve_mode_label();
-            if crate::cli::serve::daemon_pid().is_some() {
+            if crate::cli::serve::cached_daemon_pid().is_some() {
                 let label = match mode_label {
                     Some(m) => format!(" \u{25CF} Serving ({}) ", m),
                     None => " \u{25CF} Serving ".to_string(),
@@ -4142,6 +4179,32 @@ mod tests {
             passive_resize_step(&want, None, Some(&want)),
             PassiveResizeStep::Fire,
         );
+    }
+
+    #[test]
+    fn passive_resize_yield_backs_off_same_geometry_only() {
+        // After a Fire yielded to an attached client, the same geometry must
+        // not re-probe tmux until the retry window elapses; a different
+        // geometry (other session, or a resize) probes immediately.
+        let want = geo("a", 141, 43);
+        let t0 = Instant::now();
+        let yielded = (want.clone(), t0);
+        let cases = [
+            // (label, want, yielded, elapsed ms, expected)
+            ("no prior yield", &want, None, 0, true),
+            ("just yielded", &want, Some(&yielded), 0, false),
+            ("inside window", &want, Some(&yielded), 999, false),
+            ("window elapsed", &want, Some(&yielded), 1000, true),
+            ("other session", &geo("b", 141, 43), Some(&yielded), 0, true),
+            ("other size", &geo("a", 141, 40), Some(&yielded), 0, true),
+        ];
+        for (label, want, yielded, ms, expected) in cases {
+            assert_eq!(
+                passive_resize_probe_due(want, yielded, t0 + Duration::from_millis(ms)),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     #[test]

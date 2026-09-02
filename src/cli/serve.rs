@@ -671,7 +671,7 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
 pub fn cached_serve_mode_label() -> Option<&'static str> {
     static CACHE: Mutex<Option<(u32, Option<&'static str>)>> = Mutex::new(None);
 
-    let pid = daemon_pid()?;
+    let pid = cached_daemon_pid()?;
     if let Ok(mut guard) = CACHE.lock() {
         if let Some((cached_pid, cached_label)) = *guard {
             if cached_pid == pid {
@@ -880,6 +880,63 @@ pub fn daemon_pid() -> Option<u32> {
     match daemon_status() {
         DaemonStatus::Verified(pid) => Some(pid),
         DaemonStatus::Absent | DaemonStatus::Unverified => None,
+    }
+}
+
+/// How long the status bar trusts a `daemon_pid` answer before probing
+/// again. A daemon start or stop shows up in the indicator at most this
+/// late; the probe itself is the expensive part being amortized.
+const DAEMON_PID_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Time-bounded memo of a probe result. `daemon_pid` verifies the PID file
+/// against the live process, which on macOS forks `ps` (`/proc` does the
+/// same job for free on Linux). The status bar asks on every frame, so an
+/// uncached probe put a synchronous process spawn on the render thread per
+/// keystroke (~30-50ms each under load); memoizing for a short TTL keeps
+/// the indicator live without paying that per frame.
+struct ProbeMemo<T> {
+    probed_at: std::time::Instant,
+    value: T,
+}
+
+impl<T: Copy> ProbeMemo<T> {
+    /// Return the memoized value if it is younger than `ttl` at `now`,
+    /// otherwise call `probe`, remember its answer, and return it.
+    fn get_or_probe(
+        slot: &mut Option<Self>,
+        now: std::time::Instant,
+        ttl: std::time::Duration,
+        probe: impl FnOnce() -> T,
+    ) -> T {
+        if let Some(memo) = slot.as_ref() {
+            if now.duration_since(memo.probed_at) < ttl {
+                return memo.value;
+            }
+        }
+        let value = probe();
+        *slot = Some(Self {
+            probed_at: now,
+            value,
+        });
+        value
+    }
+}
+
+/// `daemon_pid` for per-frame callers: at most one real probe per
+/// `DAEMON_PID_PROBE_TTL`. Control paths (`--stop`, `--restart`, spawn) keep
+/// calling the uncached `daemon_pid`, since they act on the answer.
+pub fn cached_daemon_pid() -> Option<u32> {
+    static MEMO: Mutex<Option<ProbeMemo<Option<u32>>>> = Mutex::new(None);
+    match MEMO.lock() {
+        Ok(mut slot) => ProbeMemo::get_or_probe(
+            &mut slot,
+            std::time::Instant::now(),
+            DAEMON_PID_PROBE_TTL,
+            daemon_pid,
+        ),
+        // Poisoned only if a probe panicked under the lock; fall back to an
+        // uncached probe so the indicator keeps working.
+        Err(_) => daemon_pid(),
     }
 }
 
@@ -1633,6 +1690,37 @@ fn print_local_status() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_memo_probes_once_per_ttl() {
+        // The status bar asks every frame; the memo must answer from the
+        // last probe inside the TTL and re-probe only once it expires. A
+        // changed answer after expiry (daemon stopped) must replace the
+        // memo rather than stick.
+        use std::time::{Duration, Instant};
+        let ttl = Duration::from_secs(1);
+        let t0 = Instant::now();
+        let mut slot: Option<ProbeMemo<Option<u32>>> = None;
+        let mut probes = 0u32;
+        // (elapsed ms, probe answer if called, expected value, expected probe count)
+        let cases = [
+            (0, Some(42), Some(42), 1),
+            (10, Some(99), Some(42), 1),
+            (999, Some(99), Some(42), 1),
+            (1000, None, None, 2),
+            (1500, Some(7), None, 2),
+            (2001, Some(7), Some(7), 3),
+        ];
+        for (ms, answer, expected, expected_probes) in cases {
+            let got =
+                ProbeMemo::get_or_probe(&mut slot, t0 + Duration::from_millis(ms), ttl, || {
+                    probes += 1;
+                    answer
+                });
+            assert_eq!(got, expected, "at {ms}ms");
+            assert_eq!(probes, expected_probes, "probe count at {ms}ms");
+        }
+    }
 
     #[test]
     fn cloudflared_skipped_when_tailscale_available_and_default_flags() {
