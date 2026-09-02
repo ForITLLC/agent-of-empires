@@ -626,14 +626,84 @@ async fn move_session(args: MoveArgs) -> Result<()> {
     // Re-bind the live account by restarting under the target profile. The
     // restart path re-resolves CLAUDE_CONFIG_DIR from source_profile=target.
     println!("  Re-binding live account under '{}'...", target);
-    restart_session(
+    let expected = extract_config_dir(
+        &crate::session::profile_config::resolve_config_or_warn(&target).environment,
+    );
+    if let Err(e) = restart_session(
         &target,
         SessionIdArgs {
             identifier: id.clone(),
         },
     )
-    .await?;
+    .await
+    {
+        bail!(
+            "{}",
+            move_incomplete_message(
+                &title,
+                &id,
+                &owner,
+                &target,
+                None,
+                &format!("restart failed: {e}"),
+            )
+        );
+    }
+
+    // Moving the record is not the move. Verify the LIVE binding: the pane's
+    // own CLAUDE_CONFIG_DIR must now be the target profile's. A restart that
+    // reported success but left the old pane in place (a daemon cascading
+    // from a stale snapshot) keeps spending the SOURCE account and must never
+    // pass silently. An unreadable pane env fails safe to "not diverged", as
+    // in the pre-move check.
+    let live = live_config_dir(&moved);
+    if config_dir_diverged(live.as_deref(), expected.as_deref()) {
+        bail!(
+            "{}",
+            move_incomplete_message(
+                &title,
+                &id,
+                &owner,
+                &target,
+                live.as_deref(),
+                "the live pane's CLAUDE_CONFIG_DIR is not the target profile's",
+            )
+        );
+    }
+    match live {
+        Some(l) => println!(
+            "✓ Live account re-bound: '{}' ({}) runs under '{}' (CLAUDE_CONFIG_DIR={}).",
+            title, id, target, l
+        ),
+        None => println!(
+            "✓ Restarted under '{}' (live CLAUDE_CONFIG_DIR not readable from here; \
+             confirm with `aoe -p {} list`).",
+            target, target
+        ),
+    }
     Ok(())
+}
+
+/// The one message a failed re-bind prints. Loud on purpose: the record is
+/// already in `target`, but the pane is (or may be) still running under
+/// `source`, i.e. still spending that account, until the operator runs the
+/// restart named here.
+fn move_incomplete_message(
+    title: &str,
+    id: &str,
+    source: &str,
+    target: &str,
+    live: Option<&str>,
+    why: &str,
+) -> String {
+    let live_part = live
+        .map(|l| format!(" (live CLAUDE_CONFIG_DIR={l})"))
+        .unwrap_or_default();
+    format!(
+        "MOVE INCOMPLETE: the record for '{title}' ({id}) now lives in profile '{target}', \
+         but its live pane is STILL running under '{source}'{live_part}: {why}. \
+         The old account keeps being used until you run:\n  aoe -p {target} session restart {id}"
+    )
 }
 
 async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -3240,7 +3310,7 @@ mod move_lookup_tests {
 
 #[cfg(test)]
 mod move_divergence_tests {
-    use super::{config_dir_diverged, extract_config_dir};
+    use super::{config_dir_diverged, extract_config_dir, move_incomplete_message};
 
     const FORIT_MAIN: &str = "/Users/me/.claude-accounts/forit-main";
     const FORIT_BACKUP: &str = "/Users/me/.claude-accounts/forit-backup";
@@ -3285,6 +3355,30 @@ mod move_divergence_tests {
         assert!(!config_dir_diverged(None, Some(FORIT_MAIN)));
         assert!(!config_dir_diverged(Some(FORIT_BACKUP), None));
         assert!(!config_dir_diverged(None, None));
+    }
+
+    // WO#1669: a move whose re-bind did not take must say so in the terms
+    // that matter (which account is still being spent) and name the exact
+    // recovery command, never a bare "session no longer exists".
+    #[test]
+    fn move_incomplete_message_names_the_source_account_and_the_recovery_command() {
+        let msg = move_incomplete_message(
+            "for-Probe",
+            "0656af429bce4028",
+            "p9-main",
+            "forit-backup",
+            Some(FORIT_MAIN),
+            "restart failed: session 0656af429bce4028 no longer exists",
+        );
+        assert!(msg.starts_with("MOVE INCOMPLETE"), "{msg}");
+        assert!(msg.contains("STILL running under 'p9-main'"), "{msg}");
+        assert!(msg.contains(FORIT_MAIN), "{msg}");
+        assert!(
+            msg.contains("aoe -p forit-backup session restart 0656af429bce4028"),
+            "{msg}"
+        );
+        let no_live = move_incomplete_message("t", "id1", "a", "b", None, "why");
+        assert!(!no_live.contains("live CLAUDE_CONFIG_DIR="), "{no_live}");
     }
 }
 
