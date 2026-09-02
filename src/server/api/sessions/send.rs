@@ -27,8 +27,13 @@ enum SendKeysError {
     Tmux(anyhow::Error),
 }
 
-type SendKeysResult =
-    Result<(EnsureReadyOutcome, Instance), Box<(Instance, EnsureReadyOutcome, SendKeysError)>>;
+/// Ok carries the urgent-flag acknowledgement so the response can say
+/// whether delivery cleared (`cleared`), preserved (`kept`) or found no
+/// (`absent`) urgent flag — see `hooks::ack_hook_urgent_on_send`.
+type SendKeysResult = Result<
+    (EnsureReadyOutcome, Instance, crate::hooks::UrgentAck),
+    Box<(Instance, EnsureReadyOutcome, SendKeysError)>,
+>;
 
 pub async fn send_message(
     State(state): State<Arc<AppState>>,
@@ -122,13 +127,19 @@ pub async fn send_message(
         if let Err(e) = tmux_session.send_keys_with_delay(&message, delay) {
             return Err(Box::new((inst_owned, outcome, SendKeysError::Tmux(e))));
         }
-        Ok((outcome, inst_owned))
+        // Delivery is the authoritative "someone is handling this": clear the
+        // hook-written urgent flag here, on the daemon, so every sender (TUI,
+        // CLI, web, relay, Commander) acks it the same way regardless of the
+        // target session's own hooks. Sticky kinds survive machine traffic
+        // (see `hooks::ack_hook_urgent_on_send`).
+        let urgent_ack = crate::hooks::ack_hook_urgent_on_send(&inst_owned.id, &message);
+        Ok((outcome, inst_owned, urgent_ack))
     })
     .await;
 
     match send_result {
-        Ok(Ok((outcome, started))) => {
-            let body = serde_json::json!({"sent": true});
+        Ok(Ok((outcome, started, urgent_ack))) => {
+            let body = serde_json::json!({"sent": true, "urgent_ack": urgent_ack.as_str()});
             // ensure_pane_ready mutated `started` on the clone, so sync it back
             // or a rapid follow-up generates a fresh `agent_session_id` and
             // orphans the prior Claude conversation. See `apply_post_restart_sync`.
