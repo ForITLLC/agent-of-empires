@@ -10307,7 +10307,10 @@ mod tests {
             .into_response();
             let Json(envelope) = list_sessions(
                 State(state.clone()),
-                axum::extract::Query(ListSessionsQuery { state: None, full: false }),
+                axum::extract::Query(ListSessionsQuery {
+                    state: None,
+                    full: false,
+                }),
             )
             .await;
             let badge = envelope.mcp_surface.expect("badge set on envelope");
@@ -10322,7 +10325,10 @@ mod tests {
             .into_response();
             let Json(envelope) = list_sessions(
                 State(state),
-                axum::extract::Query(ListSessionsQuery { state: None, full: false }),
+                axum::extract::Query(ListSessionsQuery {
+                    state: None,
+                    full: false,
+                }),
             )
             .await;
             assert!(
@@ -10556,7 +10562,10 @@ mod tests {
         LIST_SESSIONS_RESOLVER_MISSES.store(0, Ordering::Relaxed);
         let _envelope = list_sessions(
             axum::extract::State(state.clone()),
-            axum::extract::Query(ListSessionsQuery { state: None, full: false }),
+            axum::extract::Query(ListSessionsQuery {
+                state: None,
+                full: false,
+            }),
         )
         .await;
         let misses = LIST_SESSIONS_RESOLVER_MISSES.load(Ordering::Relaxed);
@@ -10580,10 +10589,16 @@ mod tests {
         let mut trashed = Instance::new("trashed", "/tmp/slim-trashed");
         trashed.trash();
 
-        assert!(!list_row_is_slim(&live, false), "live rows keep the full shape");
+        assert!(
+            !list_row_is_slim(&live, false),
+            "live rows keep the full shape"
+        );
         assert!(list_row_is_slim(&archived, false));
         assert!(list_row_is_slim(&trashed, false));
-        assert!(!list_row_is_slim(&archived, true), "?full=1 restores the old shape");
+        assert!(
+            !list_row_is_slim(&archived, true),
+            "?full=1 restores the old shape"
+        );
         assert!(!list_row_is_slim(&trashed, true));
     }
 
@@ -10603,9 +10618,8 @@ mod tests {
         trashed.trash();
         trashed.goal = Some("trashed goal".to_string());
 
-        let state = crate::server::test_support::build_test_app_state(vec![
-            live, archived, trashed,
-        ]);
+        let state =
+            crate::server::test_support::build_test_app_state(vec![live, archived, trashed]);
         fn row<'a>(envelope: &'a SessionsEnvelope, id: &str) -> &'a SessionResponse {
             envelope
                 .sessions
@@ -10681,7 +10695,10 @@ mod tests {
 
         let all = list_sessions(
             axum::extract::State(state.clone()),
-            axum::extract::Query(ListSessionsQuery { state: None, full: false }),
+            axum::extract::Query(ListSessionsQuery {
+                state: None,
+                full: false,
+            }),
         )
         .await;
         assert_eq!(
