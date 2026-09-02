@@ -89,6 +89,10 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     // composer accepts Enter; the verified variant gates on composer readiness
     // and resubmits a swallowed Enter (never re-pastes).
     tmux_session.send_keys_verified(&args.message, delay, &tool)?;
+    // Delivered: acknowledge the hook-written urgent flag (sticky kinds
+    // survive machine traffic — see `hooks::ack_hook_urgent_on_send`).
+    let urgent_ack = crate::hooks::ack_hook_urgent_on_send(&session_id, &args.message);
+    tracing::debug!(session = %session_id, ack = urgent_ack.as_str(), "send: urgent ack");
 
     // Stamp last_accessed_at so the "last activity" column reflects user
     // interaction, and remap the status to Running. The agent has just been

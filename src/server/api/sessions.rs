@@ -13723,8 +13723,10 @@ fn send_error_audit_outcome(err: &SendKeysError) -> String {
     }
 }
 
-type SendKeysResult =
-    Result<(EnsureReadyOutcome, Instance), Box<(Instance, EnsureReadyOutcome, SendKeysError)>>;
+type SendKeysResult = Result<
+    (EnsureReadyOutcome, Instance, crate::hooks::UrgentAck),
+    Box<(Instance, EnsureReadyOutcome, SendKeysError)>,
+>;
 
 pub async fn send_message(
     State(state): State<Arc<AppState>>,
@@ -13942,7 +13944,13 @@ pub async fn send_message(
             };
             return Err(Box::new((inst_owned, outcome, err)));
         }
-        Ok((outcome, inst_owned))
+        // Delivery is the authoritative "someone is handling this": clear the
+        // hook-written urgent flag here, on the daemon, so every sender (TUI,
+        // CLI, web, relay, Commander) acks it the same way regardless of the
+        // target session's own hooks. Sticky kinds survive machine traffic
+        // (see `hooks::ack_hook_urgent_on_send`).
+        let urgent_ack = crate::hooks::ack_hook_urgent_on_send(&inst_owned.id, &message);
+        Ok((outcome, inst_owned, urgent_ack))
     })
     .await;
 
@@ -13972,7 +13980,7 @@ pub async fn send_message(
     }
 
     match send_result {
-        Ok(Ok((outcome, started))) => {
+        Ok(Ok((outcome, started, urgent_ack))) => {
             // ensure_pane_ready mutated `started` (status, agent_session_id,
             // last_start_time, last_error) on the clone. Sync those back to
             // the live entry so the next request sees a coherent view;
@@ -13993,7 +14001,11 @@ pub async fn send_message(
             } else {
                 // Session was deleted between the send and the stamp; nothing
                 // left to persist.
-                return (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response();
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"sent": true, "urgent_ack": urgent_ack.as_str()})),
+                )
+                    .into_response();
             };
             drop(instances);
             let id_for_save = id.clone();
@@ -14022,7 +14034,11 @@ pub async fn send_message(
                     }
                 }
             });
-            (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"sent": true, "urgent_ack": urgent_ack.as_str()})),
+            )
+                .into_response()
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;
