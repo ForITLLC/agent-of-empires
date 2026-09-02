@@ -61,6 +61,56 @@ pub struct LifecycleReservation {
     pub op: LifecycleOperation,
     pub generation: u64,
     pub at: DateTime<Utc>,
+    /// Process that took the reservation. A reservation whose holder is
+    /// provably gone is not live, whatever its age: a crashed owner must not
+    /// wedge every lifecycle op behind the TTL. Absent on legacy rows and
+    /// omitted from the wire when unset, so the format is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_pid: Option<u32>,
+}
+
+impl LifecycleReservation {
+    /// `Some(true)` while the recorded holder is running, `Some(false)` when
+    /// it is provably gone, `None` when no holder was recorded or liveness
+    /// cannot be determined here (then the TTL alone governs).
+    pub fn holder_alive(&self) -> Option<bool> {
+        let raw = i32::try_from(self.holder_pid?).ok()?;
+        if raw <= 0 {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use nix::errno::Errno;
+            use nix::sys::signal::kill;
+            use nix::unistd::Pid;
+            match kill(Pid::from_raw(raw), None) {
+                Ok(()) | Err(Errno::EPERM) => Some(true),
+                Err(Errno::ESRCH) => Some(false),
+                Err(_) => None,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    /// Live = within `ttl` AND the holder, when recorded, is still running.
+    pub fn is_live(&self, now: DateTime<Utc>, ttl: chrono::Duration) -> bool {
+        (now - self.at) < ttl && self.holder_alive() != Some(false)
+    }
+
+    /// Operator-facing description of who holds the reservation and for how
+    /// long, so a "busy" refusal says whether the holder is even alive.
+    pub fn holder_detail(&self, now: DateTime<Utc>) -> String {
+        let age = (now - self.at).num_seconds().max(0);
+        match (self.holder_pid, self.holder_alive()) {
+            (Some(pid), Some(true)) => format!("held by pid {pid} (alive) for {age}s"),
+            (Some(pid), Some(false)) => format!("held by pid {pid} (DEAD) for {age}s"),
+            (Some(pid), None) => format!("held by pid {pid} (liveness unknown) for {age}s"),
+            (None, _) => format!("held by an unrecorded process for {age}s"),
+        }
+    }
 }
 
 impl Instance {
@@ -82,7 +132,7 @@ impl Instance {
         now: DateTime<Utc>,
     ) -> Result<u64, LifecycleReservationError> {
         if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
-            reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
+            reservation.generation == self.lifecycle_generation && reservation.is_live(now, ttl)
         }) {
             return Err(LifecycleReservationError::Busy(reservation.op));
         }
@@ -96,6 +146,7 @@ impl Instance {
             op: operation,
             generation,
             at: now,
+            holder_pid: Some(std::process::id()),
         });
         Ok(generation)
     }
@@ -118,7 +169,7 @@ impl Instance {
             &self.lifecycle_reservation,
             Some(reservation)
                 if reservation.generation == self.lifecycle_generation
-                    && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL
+                    && reservation.is_live(now, Self::LIFECYCLE_RESERVATION_TTL)
         )
     }
 
@@ -146,7 +197,7 @@ impl Instance {
             &self.lifecycle_reservation,
             Some(reservation)
                 if reservation.generation == self.lifecycle_generation
-                    && (now - reservation.at) >= ttl
+                    && !reservation.is_live(now, ttl)
         ) {
             self.lifecycle_reservation = None;
             true
@@ -200,11 +251,20 @@ impl Instance {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(());
             };
+            let holder_detail = stored
+                .lifecycle_reservation
+                .as_ref()
+                .map(|reservation| reservation.holder_detail(now))
+                .unwrap_or_default();
             let generation = stored
                 .try_acquire_lifecycle_reservation(operation, Self::LIFECYCLE_RESERVATION_TTL, now)
                 .map_err(|error| match error {
                     LifecycleReservationError::Busy(holder) => {
-                        anyhow::anyhow!("session {} is {}", self.id, holder.busy_reason())
+                        anyhow::anyhow!(
+                            "session {} is {} ({holder_detail})",
+                            self.id,
+                            holder.busy_reason()
+                        )
                     }
                     LifecycleReservationError::GenerationOverflow => {
                         anyhow::anyhow!("session {} lifecycle generation overflow", self.id)
@@ -452,6 +512,7 @@ mod tests {
                     op: LifecycleOperation::Launch,
                     generation: 1,
                     at: now,
+                    holder_pid: None,
                 }),
                 1,
                 false,
@@ -463,6 +524,7 @@ mod tests {
                     op: LifecycleOperation::Launch,
                     generation: 1,
                     at: now,
+                    holder_pid: None,
                 }),
                 2,
                 true,
@@ -474,6 +536,7 @@ mod tests {
                     op: LifecycleOperation::Launch,
                     generation: 1,
                     at: stale,
+                    holder_pid: None,
                 }),
                 1,
                 true,
@@ -485,6 +548,7 @@ mod tests {
                     op: LifecycleOperation::Purge,
                     generation: 1,
                     at: now,
+                    holder_pid: None,
                 }),
                 1,
                 false,
@@ -496,6 +560,7 @@ mod tests {
                     op: LifecycleOperation::Restore,
                     generation: 1,
                     at: now,
+                    holder_pid: None,
                 }),
                 1,
                 false,
@@ -507,6 +572,7 @@ mod tests {
                     op: LifecycleOperation::Trash,
                     generation: 1,
                     at: now,
+                    holder_pid: None,
                 }),
                 1,
                 false,
@@ -518,6 +584,7 @@ mod tests {
                     op: LifecycleOperation::Capture,
                     generation: 1,
                     at: now,
+                    holder_pid: None,
                 }),
                 1,
                 false,
@@ -575,6 +642,7 @@ mod tests {
             op: LifecycleOperation::Launch,
             generation: 1,
             at: Utc::now(),
+            holder_pid: None,
         });
         storage
             .update(|instances, _groups| {
@@ -782,6 +850,7 @@ mod tests {
                 op: LifecycleOperation::Purge,
                 generation,
                 at: now,
+                holder_pid: Some(std::process::id()),
             })
         );
     }
@@ -844,6 +913,126 @@ mod tests {
             .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, old_generation,));
         assert!(
             instance.lifecycle_reservation_is_owned(LifecycleOperation::Restore, new_generation,)
+        );
+    }
+
+    // ── WO#1641 3a: a reservation dies with its holder process ───────────────
+    const DEAD_PID: u32 = 2_000_000_000; // above pid_max on Linux and macOS
+
+    fn reservation_held_by(holder_pid: Option<u32>, at: DateTime<Utc>) -> LifecycleReservation {
+        LifecycleReservation {
+            op: LifecycleOperation::Launch,
+            generation: 1,
+            at,
+            holder_pid,
+        }
+    }
+
+    #[test]
+    fn reservation_with_dead_holder_is_not_live_before_ttl() {
+        let now = Utc::now();
+        let dead = reservation_held_by(Some(DEAD_PID), now);
+        assert_eq!(dead.holder_alive(), Some(false));
+        assert!(!dead.is_live(now, Instance::LIFECYCLE_RESERVATION_TTL));
+        assert!(
+            dead.holder_detail(now).contains("DEAD"),
+            "{}",
+            dead.holder_detail(now)
+        );
+    }
+
+    #[test]
+    fn reservation_with_live_holder_stays_live_until_ttl() {
+        let now = Utc::now();
+        let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
+        let live = reservation_held_by(Some(std::process::id()), now);
+        assert_eq!(live.holder_alive(), Some(true));
+        assert!(live.is_live(now, ttl));
+        assert!(!live.is_live(now + ttl + chrono::Duration::seconds(1), ttl));
+        assert!(live.holder_detail(now).contains("alive"));
+    }
+
+    #[test]
+    fn legacy_reservation_without_holder_keeps_ttl_semantics() {
+        let now = Utc::now();
+        let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
+        let legacy = reservation_held_by(None, now);
+        assert_eq!(legacy.holder_alive(), None);
+        assert!(legacy.is_live(now, ttl));
+        assert!(!legacy.is_live(now + ttl + chrono::Duration::seconds(1), ttl));
+
+        let json = r#"{"op":"launch","generation":1,"at":"2026-01-01T00:00:00Z"}"#;
+        let parsed: LifecycleReservation = serde_json::from_str(json).expect("legacy row parses");
+        assert_eq!(parsed.holder_pid, None);
+        assert!(
+            !serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("holder_pid"),
+            "unset holder must not change the wire format"
+        );
+        let recorded = reservation_held_by(Some(std::process::id()), now);
+        assert!(serde_json::to_string(&recorded)
+            .unwrap()
+            .contains("holder_pid"));
+    }
+
+    #[test]
+    fn dead_holder_reservation_yields_to_a_new_acquire() {
+        let now = Utc::now();
+        let mut instance = Instance::new("dead-holder", "/tmp/test");
+        instance.lifecycle_generation = 1;
+        instance.lifecycle_reservation = Some(reservation_held_by(Some(DEAD_PID), now));
+        assert!(!instance.has_fresh_lifecycle_reservation(now));
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Launch,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .expect("a dead holder must not wedge the next lifecycle op");
+        assert_eq!(generation, 2);
+        assert_eq!(
+            instance
+                .lifecycle_reservation
+                .as_ref()
+                .and_then(|r| r.holder_pid),
+            Some(std::process::id())
+        );
+    }
+
+    #[test]
+    fn live_holder_reservation_still_blocks() {
+        let now = Utc::now();
+        let mut instance = Instance::new("live-holder", "/tmp/test");
+        instance.lifecycle_generation = 1;
+        instance.lifecycle_reservation = Some(reservation_held_by(Some(std::process::id()), now));
+        assert!(instance.has_fresh_lifecycle_reservation(now));
+        assert_eq!(
+            instance.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Stop,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            ),
+            Err(LifecycleReservationError::Busy(LifecycleOperation::Launch))
+        );
+        assert!(
+            !instance.clear_expired_lifecycle_reservation(Instance::LIFECYCLE_RESERVATION_TTL, now)
+        );
+    }
+
+    #[test]
+    fn dead_holder_reservation_is_cleared_as_expired() {
+        let now = Utc::now();
+        let mut instance = Instance::new("dead-holder-clear", "/tmp/test");
+        instance.lifecycle_generation = 1;
+        instance.lifecycle_reservation = Some(reservation_held_by(Some(DEAD_PID), now));
+        assert!(
+            instance.clear_expired_lifecycle_reservation(Instance::LIFECYCLE_RESERVATION_TTL, now)
+        );
+        assert_eq!(instance.lifecycle_reservation, None);
+        assert_eq!(
+            instance.lifecycle_generation, 1,
+            "generation is retained as the revision"
         );
     }
 }
