@@ -2503,13 +2503,10 @@ impl HomeView {
             }
         }
 
-        // Recover session IDs for pre-existing sessions via pollers.
+        // Recover session IDs for pre-existing sessions via pollers. The
+        // repair does its own liveness probe, so no pre-check here: that was
+        // a second tmux probe per row on every launch.
         for inst in view.instances.values_mut() {
-            let has_live_tmux = inst.has_live_tmux_pane();
-            if !has_live_tmux {
-                continue;
-            }
-
             inst.repair_session_id_poller_if_needed();
         }
 

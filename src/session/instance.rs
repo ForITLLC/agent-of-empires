@@ -1758,16 +1758,10 @@ fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
     }
 }
 
+/// Cache-backed: the pollers call this for every row on every refresh, so a
+/// direct `list-sessions` here was one subprocess per instance per tick.
 fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
-    let output = crate::tmux::tmux_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    crate::tmux::live_any_kind_name_for_id(stdout.lines(), instance_id)
+    crate::tmux::live_any_kind_name_for_id_cached(instance_id)
 }
 
 /// A passively-detected status transition, queued for a batched disk write.
@@ -6240,7 +6234,12 @@ impl Instance {
         // Structured sessions have ACP workers rather than tmux panes. Their
         // lifecycle is reconciled by the daemon, so probing tmux here can only
         // fail and is especially costly from the native TUI's refresh loop.
+        // Archived and trashed rows are sunk: both kill the pane, so there is
+        // no poller to repair, and they are the bulk of a long-lived store.
+        // Both checks sit ahead of the tmux probe on purpose.
         if self.is_structured()
+            || self.is_archived()
+            || self.is_trashed()
             || !self.supports_session_poller()
             || self.session_id_poller_is_running()
             || !self.has_live_tmux_pane()
@@ -8462,6 +8461,35 @@ mod tests {
             !contended.contains(&("opencode".to_string(), canon)),
             "a dead id-less peer must not force the live session to abstain"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn repair_session_id_poller_skips_sunk_rows_before_probing_tmux() {
+        // Archive and trash both kill the pane, so a sunk row never has a
+        // poller worth repairing. Skipping it BEFORE the tmux probe is the
+        // point: the probe ran once per row on every status refresh, and
+        // archived rows are the bulk of a long-lived store. Force a snapshot
+        // that lists the row's pane so that, without the guard, the repair
+        // would take the row for live and try to start a poller.
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        let mut inst = Instance::new("Sunk row", "/tmp/aoe-sunk-row");
+        inst.tool = "claude".to_string();
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        guard.force_present(&[name.as_str()]);
+        assert!(
+            inst.has_live_tmux_pane(),
+            "sanity: the forced snapshot must read as a live pane for a live row"
+        );
+
+        inst.archive();
+        assert!(!inst.repair_session_id_poller_if_needed());
+        assert!(inst.session_id_poller.is_none());
+
+        inst.unarchive();
+        inst.trash();
+        assert!(!inst.repair_session_id_poller_if_needed());
+        assert!(inst.session_id_poller.is_none());
     }
 
     /// Force the tmux session cache into a fresh "server reachable, but this

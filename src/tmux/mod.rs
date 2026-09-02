@@ -697,6 +697,43 @@ pub(crate) fn live_any_kind_name_for_id<'a>(
     agent_hit.or(terminal_hit).or(container_hit)
 }
 
+/// [`live_any_kind_name_for_id`] against the shared session cache, refreshing
+/// a stale snapshot once. One `list-sessions` per [`CACHE_TTL`] window instead
+/// of one per instance: this backs `Instance::has_live_tmux_pane`, which the
+/// TUI and daemon status pollers call for every row on every refresh, most of
+/// them archived rows that have no pane to find. Mirrors [`live_session_name`];
+/// an unreachable server resolves to "no live pane", exactly as the direct
+/// `list-sessions` query did on a non-zero exit.
+pub(crate) fn live_any_kind_name_for_id_cached(session_id: &str) -> Option<String> {
+    if let Some(answer) = live_any_kind_name_from_cache(session_id) {
+        return answer;
+    }
+    refresh_session_cache();
+    live_any_kind_name_from_cache(session_id).flatten()
+}
+
+/// Resolve from the current cache snapshot without spawning. The outer `None`
+/// means the snapshot is stale or the lock is poisoned, so a refresh could
+/// still change the answer; `Some(None)` is a definitive "no live pane",
+/// including the recognized no-server snapshot.
+fn live_any_kind_name_from_cache(session_id: &str) -> Option<Option<String>> {
+    let cache = SESSION_CACHE.read().ok()?;
+    let fresh = cache
+        .time
+        .map(|t| t.elapsed() <= CACHE_TTL)
+        .unwrap_or(false);
+    if !fresh {
+        return None;
+    }
+    let Some(names) = cache.data.as_ref() else {
+        return Some(None);
+    };
+    Some(live_any_kind_name_for_id(
+        names.keys().map(String::as_str),
+        session_id,
+    ))
+}
+
 /// The tmux session name to act on for one of a session's panes, resolved
 /// against `live_names` (any iterator of live tmux session names).
 ///
@@ -1873,6 +1910,47 @@ mod tests {
             Some(derived),
             "the snapshot must satisfy the lookup, so no refresh is attempted"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn live_any_kind_name_for_id_cached_answers_from_a_fresh_snapshot() {
+        // The per-instance `list-sessions` fork this replaces was the hot
+        // path behind every status refresh: one subprocess per row, most of
+        // them archived rows with no pane at all. A fresh snapshot must
+        // answer the lookup outright, for a hit and for a miss alike.
+        let guard = SessionCacheGuard::capture();
+        let agent = format!("{P}Refactor_{ID8}");
+        guard.force_present(&[agent.as_str(), "vim"]);
+        assert_eq!(
+            live_any_kind_name_from_cache(ID),
+            Some(Some(agent.clone())),
+            "a fresh snapshot with the pane listed is a hit without a refresh"
+        );
+        assert_eq!(
+            live_any_kind_name_for_id_cached(ID).as_deref(),
+            Some(agent.as_str())
+        );
+
+        guard.force_present(&["vim"]);
+        assert_eq!(
+            live_any_kind_name_from_cache(ID),
+            Some(None),
+            "a fresh snapshot without the pane is a definitive miss, not a stale snapshot"
+        );
+        assert_eq!(live_any_kind_name_for_id_cached(ID), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn live_any_kind_name_for_id_cached_treats_no_server_as_no_live_name() {
+        // Mirrors the direct `list-sessions` path: a non-zero exit (no server)
+        // resolved to `None`, and the cache's recognized no-server snapshot
+        // must resolve the same way without re-spawning a doomed query.
+        let guard = SessionCacheGuard::capture();
+        guard.force_unreachable();
+        assert_eq!(live_any_kind_name_from_cache(ID), Some(None));
+        assert_eq!(live_any_kind_name_for_id_cached(ID), None);
     }
 
     #[test]
