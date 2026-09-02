@@ -67,6 +67,18 @@ pub(crate) enum StatusSource {
 }
 
 /// Shared application state accessible by all request handlers.
+/// Terminal record of one daemon-owned restart cascade (see
+/// `AppState::restart_outcomes`).
+#[derive(Debug, Clone)]
+pub struct RestartOutcomeRecord {
+    pub ok: bool,
+    pub error: Option<String>,
+    /// Unix seconds at which the cascade reached its terminal state.
+    pub finished_at: i64,
+    /// Profile the cascade persisted into.
+    pub profile: String,
+}
+
 pub struct AppState {
     pub profile: String,
     pub read_only: bool,
@@ -118,6 +130,25 @@ pub struct AppState {
     pub summary_semaphore: tokio::sync::Semaphore,
     /// Suppression set for the startup-recovery cascade.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
+    /// Session ids with an in-flight daemon-owned restart cascade
+    /// (`POST /api/sessions/{id}/restart`), each with the instant its mark
+    /// was taken. A repeat POST while the detached cascade is still running
+    /// returns 202 `already_restarting` instead of racing a second kill+start
+    /// against the first; a mark older than the admission TTL is treated as
+    /// leaked (a cascade that died without its finish path) and replaced, so
+    /// a vanished cascade can never wedge the endpoint into silent
+    /// `already_restarting` forever. Synchronous mutex: critical sections
+    /// are tiny and never span an `await`.
+    pub restart_inflight: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Terminal outcome of the LAST daemon-owned restart cascade per session
+    /// id. The `status` a poller samples from the list is overwritten within
+    /// ~500ms by the hook poller, so a CLI watching it can read a cascade
+    /// that never ran as restarted, or a transient blip as failure.
+    /// `GET /api/sessions/{id}/restart-status` serves this record instead:
+    /// written exactly once per cascade, at its true end, and never touched
+    /// by status detection. Synchronous mutex: tiny critical sections, never
+    /// spans an `await`.
+    pub restart_outcomes: std::sync::Mutex<std::collections::HashMap<String, RestartOutcomeRecord>>,
     /// Bumped under the `instances` write lock by any change an earlier disk snapshot
     /// would not carry, so a reload holding that snapshot drops itself.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
