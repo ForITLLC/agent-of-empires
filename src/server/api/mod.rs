@@ -27,6 +27,7 @@ pub mod plugins;
 mod projects;
 #[cfg(feature = "serve")]
 mod queue;
+mod relay;
 pub(crate) mod sessions;
 mod skills;
 pub(crate) mod system;
@@ -62,6 +63,7 @@ pub use plugins::{
     serve_plugin_icon, set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
+pub use relay::relay_send;
 pub use sessions::{
     attach_session_project, create_session, delete_session, delete_workspace,
     ensure_container_terminal, ensure_session, ensure_terminal, force_smart_rename,

@@ -495,6 +495,7 @@ async fn run(
         Some(Commands::Remove(args)) => cli::remove::run(&profile, args).await,
         Some(Commands::Restore(args)) => cli::restore::run(&profile, args).await,
         Some(Commands::Send(args)) => cli::send::run(&profile, args).await,
+        Some(Commands::Relay(args)) => cli::relay::run(args).await,
         Some(Commands::Status(args)) => cli::status::run(&profile, args).await,
         Some(Commands::Killall(args)) => cli::killall::run(args).await,
         #[cfg(feature = "serve")]

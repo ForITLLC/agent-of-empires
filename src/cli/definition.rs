@@ -25,6 +25,7 @@ use super::power::ActivityArgs;
 use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
 use super::ps::PsArgs;
+use super::relay::RelayArgs;
 use super::remove::RemoveArgs;
 use super::restore::RestoreArgs;
 use super::send::SendArgs;
@@ -111,6 +112,9 @@ pub enum Commands {
 
     /// Send a message to a running agent session
     Send(SendArgs),
+
+    /// Relay a message to a peer board's daemon (cross-board messaging)
+    Relay(RelayArgs),
 
     /// Show session status summary
     Status(StatusArgs),
@@ -353,6 +357,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Remove(_) => "remove",
         Commands::Restore(_) => "restore",
         Commands::Send(_) => "send",
+        Commands::Relay(_) => "relay",
         Commands::Status(_) => "status",
         Commands::Killall(_) => "killall",
         #[cfg(feature = "serve")]

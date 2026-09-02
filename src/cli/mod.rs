@@ -23,6 +23,7 @@ pub mod power;
 pub mod profile;
 pub mod project;
 pub mod ps;
+pub mod relay;
 pub mod remove;
 pub mod restore;
 pub mod send;

@@ -10,6 +10,7 @@ pub mod acp_ws;
 pub mod api;
 pub(crate) mod attach_project;
 pub mod auth;
+pub mod relay_ingress;
 mod ben_gate_surface;
 pub mod callback;
 pub(crate) mod cap_ledger;
@@ -333,6 +334,10 @@ pub struct RestartOutcomeRecord {
 
 pub struct AppState {
     pub profile: String,
+    /// Cross-board relay ingress (WO#1584), resolved once at launch from the
+    /// `[relay]` config section. `None` = unconfigured; `POST /api/relay` then
+    /// returns 404. Carries the shared ingress secret — never logged.
+    pub relay: Option<relay_ingress::RelayIngress>,
     pub read_only: bool,
     /// CityHall client mode, resolved once at launch from `AOE_CITYHALL_MODE`.
     /// When set, the web dashboard is locked down to an end-user client
@@ -1264,6 +1269,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         profile: profile.to_string(),
+        relay: relay_ingress::RelayIngress::from_config(&config.relay),
         read_only,
         cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
         instances,
@@ -1837,6 +1843,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/ensure", post(api::ensure_session))
         .route("/api/sessions/{id}/send", post(api::send_message))
+        // Cross-board relay ingress; auth is the scoped relay secret inside
+        // the handler (see api::relay), exempted from the token/passphrase
+        // gates in auth_middleware.
+        .route("/api/relay", post(api::relay_send))
         .route("/api/power", get(power::get_power).post(power::set_power))
         .route("/api/events", get(event_bus::stream_events))
         .route(
@@ -2759,6 +2769,7 @@ const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // Terminal surface.
     ("POST", "/api/sessions/{id}/ensure"),
     ("POST", "/api/sessions/{id}/send"),
+    ("POST", "/api/relay"),
     ("POST", "/api/sessions/{id}/terminal"),
     ("DELETE", "/api/sessions/{id}/terminal"),
     ("POST", "/api/sessions/{id}/container-terminal"),
@@ -6765,6 +6776,7 @@ pub mod test_support {
         ));
         Arc::new(AppState {
             profile: "test".to_string(),
+            relay: None,
             read_only: false,
             cityhall_mode,
             instances,
