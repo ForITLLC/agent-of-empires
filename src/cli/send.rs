@@ -84,6 +84,10 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     let _input_lock = target.lock_for_input()?;
     let delay = crate::agents::send_keys_enter_delay(&tool);
     tmux_session.send_keys_with_delay(&args.message, delay)?;
+    // Delivered: acknowledge the hook-written urgent flag (sticky kinds
+    // survive machine traffic — see `hooks::ack_hook_urgent_on_send`).
+    let urgent_ack = crate::hooks::ack_hook_urgent_on_send(&session_id, &args.message);
+    tracing::debug!(session = %session_id, ack = urgent_ack.as_str(), "send: urgent ack");
 
     let id_for_save = session_id.clone();
     if let Err(err) = storage.update(|instances, _groups| {
