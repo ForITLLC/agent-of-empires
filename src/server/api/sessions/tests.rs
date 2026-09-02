@@ -1,5 +1,69 @@
 use super::*;
 
+mod restart_endpoint {
+    use super::super::{admit_restart_inflight, restart_status_body, InflightAdmit};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn first_post_is_fresh_and_repeat_is_already_restarting() {
+        let mut inflight = HashMap::new();
+        let t0 = Instant::now();
+        assert_eq!(
+            admit_restart_inflight(&mut inflight, "s1", t0),
+            InflightAdmit::Fresh
+        );
+        let again = admit_restart_inflight(&mut inflight, "s1", t0 + Duration::from_secs(5));
+        assert_eq!(again, InflightAdmit::AlreadyRestarting { age_secs: 5 });
+        // Another session is independent.
+        assert_eq!(
+            admit_restart_inflight(&mut inflight, "s2", t0),
+            InflightAdmit::Fresh
+        );
+    }
+
+    #[test]
+    fn leaked_mark_past_ttl_is_replaced_not_refused() {
+        let mut inflight = HashMap::new();
+        let t0 = Instant::now();
+        admit_restart_inflight(&mut inflight, "s1", t0);
+        let later = t0 + Duration::from_secs(601);
+        assert_eq!(
+            admit_restart_inflight(&mut inflight, "s1", later),
+            InflightAdmit::StaleReplaced { age_secs: 601 }
+        );
+        // The replacement is now the live mark.
+        assert_eq!(
+            admit_restart_inflight(&mut inflight, "s1", later + Duration::from_secs(1)),
+            InflightAdmit::AlreadyRestarting { age_secs: 1 }
+        );
+    }
+
+    #[test]
+    fn status_body_reports_each_state() {
+        assert_eq!(restart_status_body(None, None)["state"], "unknown");
+        let body = restart_status_body(Some(Duration::from_secs(3)), None);
+        assert_eq!(body["state"], "in_flight");
+        assert_eq!(body["age_seconds"], 3);
+        let body = restart_status_body(Some(Duration::from_secs(900)), None);
+        assert_eq!(body["state"], "stale");
+        let rec = crate::server::RestartOutcomeRecord {
+            ok: false,
+            error: Some("pane PID unchanged".into()),
+            finished_at: 1_700_000_000,
+            profile: "default".into(),
+        };
+        let body = restart_status_body(None, Some(&rec));
+        assert_eq!(body["state"], "done");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "pane PID unchanged");
+        assert_eq!(body["profile"], "default");
+        // An in-flight mark outranks a stale verdict from the previous run.
+        let body = restart_status_body(Some(Duration::from_secs(1)), Some(&rec));
+        assert_eq!(body["state"], "in_flight");
+    }
+}
+
 /// `remove_instance` is the only way a row leaves `state.instances` on the
 /// delete path, so the epoch bump has to be tied to an actual removal
 /// rather than to reaching the call. Bumping unconditionally would spend

@@ -1559,3 +1559,432 @@ pub async fn update_session_unread(
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
+
+/// `POST /api/sessions/{id}/restart`: daemon-owned restart cascade.
+///
+/// A wedged agent session can restart itself without surviving the call.
+/// The handler validates the session (404 unknown, 409 structured, read-only
+/// refused), marks it Starting, spawns the kill+resume sequence detached in
+/// the daemon, and answers 202 before the sequence completes. An in-flight
+/// set makes the call idempotent: a repeat POST while a cascade is running
+/// returns 202 `already_restarting` instead of double-driving tmux. A mark
+/// older than `RESTART_INFLIGHT_TTL` is treated as leaked (a cascade that
+/// died without reaching its finish path) and replaced, so a vanished
+/// cascade can never wedge the endpoint into silent `already_restarting`.
+///
+/// The terminal outcome of the last cascade is served by
+/// `GET /api/sessions/{id}/restart-status` (`restart_status`): written
+/// exactly once at the true end of the cascade and never touched by status
+/// detection, so a caller watching for completion reads the cascade's own
+/// verdict rather than a status sample the hook poller overwrites.
+pub async fn restart_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    if state.read_only {
+        return super::super::read_only_response();
+    }
+
+    {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return super::super::session_not_found();
+        };
+        let structured;
+        {
+            structured = inst.is_structured();
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            structured = false;
+        }
+        if structured {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "structured_session",
+                    "message": "Structured-view (ACP) sessions are managed by the acp reconciler; use stop/start instead",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    {
+        let mut inflight = state
+            .restart_inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match admit_restart_inflight(&mut inflight, &id, std::time::Instant::now()) {
+            InflightAdmit::Fresh => {
+                tracing::info!(
+                    target: "server.lifecycle",
+                    verb = "restart",
+                    session = %id,
+                    outcome = "accepted",
+                    "lifecycle verb received: restart accepted; cascade dispatched"
+                );
+            }
+            InflightAdmit::StaleReplaced { age_secs } => {
+                tracing::error!(
+                    target: "server.lifecycle",
+                    verb = "restart",
+                    session = %id,
+                    stale_mark_age_secs = age_secs,
+                    "lifecycle verb received: in-flight restart mark exceeded TTL; \
+                     prior cascade died without finishing; replacing the leaked mark \
+                     and dispatching a fresh cascade"
+                );
+            }
+            InflightAdmit::AlreadyRestarting { age_secs } => {
+                tracing::warn!(
+                    target: "server.lifecycle",
+                    verb = "restart",
+                    session = %id,
+                    inflight_age_secs = age_secs,
+                    outcome = "already_restarting",
+                    "lifecycle verb received: restart refused; cascade already in flight"
+                );
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "already_restarting",
+                        "session_id": id,
+                        "inflight_age_seconds": age_secs,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // A fresh cascade invalidates the previous verdict: a poller that reads
+    // `restart-status` between accept and finish must see `in_flight`, never
+    // the last run's `done`.
+    state
+        .restart_outcomes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+
+    // Suppress the phantom Error the status poller would otherwise raise
+    // while the pane is torn down and rebuilt.
+    crate::session::recovery::mark_recently_restarted(&state.recently_restarted, &id);
+
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            inst.status = Status::Starting;
+            inst.last_error = None;
+        }
+    }
+
+    let task_state = state.clone();
+    let task_id = id.clone();
+    tokio::spawn(async move {
+        run_detached_restart(task_state, task_id).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "restarting",
+            "session_id": id,
+            "note": "restart runs server-side; this response returns before the sequence completes",
+        })),
+    )
+        .into_response()
+}
+
+/// How long an in-flight restart mark stays authoritative. A cascade that
+/// has not finished in this long is presumed dead (its task panicked past
+/// the catch, or the daemon lost it); the next POST replaces the mark.
+const RESTART_INFLIGHT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InflightAdmit {
+    Fresh,
+    AlreadyRestarting { age_secs: u64 },
+    StaleReplaced { age_secs: u64 },
+}
+
+pub(crate) fn admit_restart_inflight(
+    inflight: &mut std::collections::HashMap<String, std::time::Instant>,
+    id: &str,
+    now: std::time::Instant,
+) -> InflightAdmit {
+    match inflight.get(id) {
+        None => {
+            inflight.insert(id.to_string(), now);
+            InflightAdmit::Fresh
+        }
+        Some(taken_at) => {
+            let age = now.saturating_duration_since(*taken_at);
+            if age < RESTART_INFLIGHT_TTL {
+                InflightAdmit::AlreadyRestarting {
+                    age_secs: age.as_secs(),
+                }
+            } else {
+                inflight.insert(id.to_string(), now);
+                InflightAdmit::StaleReplaced {
+                    age_secs: age.as_secs(),
+                }
+            }
+        }
+    }
+}
+
+/// PID of the agent pane's root process, or None when the pane is gone.
+/// Sampled before and after the cascade: a "successful" restart whose pane
+/// PID did not change did not restart anything, and is recorded as failure.
+fn live_agent_pane_pid(id: &str, title: &str) -> Option<u32> {
+    crate::tmux::Session::new(id, title)
+        .ok()
+        .and_then(|s| s.get_pane_pid())
+}
+
+async fn run_detached_restart(state: Arc<AppState>, id: String) {
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let snapshot = {
+        let instances = state.instances.read().await;
+        instances.iter().find(|i| i.id == id).cloned()
+    };
+    let Some(instance) = snapshot else {
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "detached restart: instance vanished before cascade"
+        );
+        record_restart_outcome(
+            &state,
+            &id,
+            false,
+            Some("instance vanished before cascade".to_string()),
+            "",
+        );
+        finish_detached_restart(&state, &id).await;
+        return;
+    };
+
+    let profile = instance.source_profile.clone();
+    let sync_base = instance.clone();
+
+    let wake_message = crate::session::resolve_config_or_warn(&profile)
+        .session
+        .restart_wake_message
+        .clone();
+
+    let pre_pane_pid = {
+        let pid_id = id.clone();
+        let pid_title = sync_base.title.clone();
+        tokio::task::spawn_blocking(move || live_agent_pane_pid(&pid_id, &pid_title))
+            .await
+            .ok()
+            .flatten()
+    };
+
+    let request_id = id.clone();
+    let restart_result = tokio::task::spawn_blocking(move || {
+        crate::session::restart::perform_restart(crate::session::restart::RestartRequest {
+            session_id: request_id,
+            instance,
+            size: None,
+            wake_message,
+        })
+    })
+    .await;
+
+    match restart_result {
+        Ok(result) => {
+            let (status, last_error) = match &result.outcome {
+                Ok(_) => {
+                    let post_pane_pid = {
+                        let pid_id = id.clone();
+                        let pid_title = sync_base.title.clone();
+                        tokio::task::spawn_blocking(move || {
+                            live_agent_pane_pid(&pid_id, &pid_title)
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    };
+                    if pre_pane_pid.is_some() && post_pane_pid == pre_pane_pid {
+                        let msg = format!(
+                            "restart ineffective: pane PID {} unchanged after cascade",
+                            pre_pane_pid.unwrap_or_default()
+                        );
+                        tracing::error!(
+                            target: "server.lifecycle",
+                            verb = "restart",
+                            session = %id,
+                            pane_pid = pre_pane_pid.unwrap_or_default(),
+                            "restart cascade reported success but the pane PID did not \
+                             change; recording failure"
+                        );
+                        (Some(Status::Error), Some(msg))
+                    } else {
+                        tracing::info!(
+                            target: "server.lifecycle",
+                            verb = "restart",
+                            session = %id,
+                            old_pane_pid = pre_pane_pid.unwrap_or_default(),
+                            new_pane_pid = post_pane_pid.unwrap_or_default(),
+                            "restart cascade executed; pane PID change verified"
+                        );
+                        (None, None)
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "http.api.sessions",
+                        session = %id,
+                        "detached restart cascade failed: {e}"
+                    );
+                    (Some(Status::Error), Some(e.clone()))
+                }
+            };
+            record_restart_outcome(&state, &id, status.is_none(), last_error.clone(), &profile);
+            let working = (*result.instance).clone();
+            {
+                let mut instances = state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    apply_post_restart_sync(inst, &sync_base, &working);
+                    if let Some(s) = status {
+                        inst.status = s;
+                        inst.last_error = last_error.clone();
+                    }
+                }
+            }
+            let persist_id = id.clone();
+            if persist_session_update(
+                profile,
+                "detached restart",
+                state.file_watch.clone(),
+                move |instances| {
+                    if let Some(stored) = instances.iter_mut().find(|i| i.id == persist_id) {
+                        stored.merge_post_restart(&working);
+                        if let Some(s) = status {
+                            stored.status = s;
+                            stored.last_error = last_error.clone();
+                        }
+                    }
+                },
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    "detached restart: persist failed; memory is authoritative until next save"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "http.api.sessions",
+                session = %id,
+                "detached restart cascade panicked: {e}"
+            );
+            record_restart_outcome(
+                &state,
+                &id,
+                false,
+                Some(format!("restart cascade panicked: {e}")),
+                &profile,
+            );
+            let mut instances = state.instances.write().await;
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                inst.status = Status::Error;
+                inst.last_error = Some(format!("restart cascade panicked: {e}"));
+            }
+        }
+    }
+
+    finish_detached_restart(&state, &id).await;
+}
+
+fn record_restart_outcome(
+    state: &Arc<AppState>,
+    id: &str,
+    ok: bool,
+    error: Option<String>,
+    profile: &str,
+) {
+    let rec = crate::server::RestartOutcomeRecord {
+        ok,
+        error,
+        finished_at: chrono::Utc::now().timestamp(),
+        profile: profile.to_string(),
+    };
+    state
+        .restart_outcomes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(id.to_string(), rec);
+}
+
+/// `GET /api/sessions/{id}/restart-status`: the daemon's own verdict on the
+/// last `POST .../restart` for this session. `in_flight` while the cascade
+/// runs, `stale` when the in-flight mark outlived `RESTART_INFLIGHT_TTL`
+/// (the cascade died; the next POST self-heals), `done` with `ok`/`error`
+/// once the cascade finished, `unknown` when no cascade has run since the
+/// daemon started.
+pub async fn restart_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let in_flight_age = state
+        .restart_inflight
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&id)
+        .map(|taken_at| std::time::Instant::now().saturating_duration_since(*taken_at));
+    let rec = state
+        .restart_outcomes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&id)
+        .cloned();
+    Json(restart_status_body(in_flight_age, rec.as_ref())).into_response()
+}
+
+pub(crate) fn restart_status_body(
+    in_flight_age: Option<std::time::Duration>,
+    rec: Option<&crate::server::RestartOutcomeRecord>,
+) -> serde_json::Value {
+    if let Some(age) = in_flight_age {
+        return serde_json::json!({
+            "state": if age >= RESTART_INFLIGHT_TTL { "stale" } else { "in_flight" },
+            "age_seconds": age.as_secs(),
+        });
+    }
+    match rec {
+        Some(r) => serde_json::json!({
+            "state": "done",
+            "ok": r.ok,
+            "error": r.error,
+            "finished_at": r.finished_at,
+            "profile": r.profile,
+        }),
+        None => serde_json::json!({"state": "unknown"}),
+    }
+}
+
+async fn finish_detached_restart(state: &Arc<AppState>, id: &str) {
+    crate::session::recovery::drain_recovery_pending(
+        &state.recovery_pending,
+        &state.recently_restarted,
+        id,
+    );
+    state
+        .restart_inflight
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(id);
+}

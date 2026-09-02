@@ -503,6 +503,31 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `POST /api/sessions/{id}/restart`: ask the daemon to run the
+    /// kill+resume cascade for a terminal session. Returns as soon as the
+    /// daemon accepted (202); poll `restart_status` for the verdict.
+    pub async fn restart_session(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/restart",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `GET /api/sessions/{id}/restart-status`: the daemon's own verdict on
+    /// the last restart cascade (`in_flight` / `stale` / `done` / `unknown`).
+    pub async fn restart_status(&self, session_id: &str) -> Result<serde_json::Value, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/restart-status",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json().await?)
+    }
+
     /// `POST /api/sessions/{id}/acp/switch-agent`. Hands the session
     /// off to another ACP backend, keeping the transcript. Returns the
     /// daemon's response (before/switch seqs) so callers can fetch a
