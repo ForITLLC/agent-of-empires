@@ -618,6 +618,7 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now(),
+        holder_pid: None,
     });
     storage
         .update(|instances, groups| {

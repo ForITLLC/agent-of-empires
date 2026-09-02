@@ -892,6 +892,7 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        holder_pid: None,
     };
     view.mutate_instance(&second.id, |instance| {
         instance.status = Status::Idle;
