@@ -1216,6 +1216,10 @@ export interface ServerAbout {
    *  session creation, theme-only settings, no terminal / diff /
    *  project-management. Enforced server-side too. See #7. */
   cityhall_mode: boolean;
+  /** Operator-set label naming this server instance (`[web]
+   *  instance_label`); shown in the header and page title so multiple
+   *  daemons are distinguishable. */
+  instance_label?: string | null;
   profile: string;
   /** Resolved `acp.show_tool_durations` from the active profile's
    *  config. Drives the per-tool elapsed-time label in the acp

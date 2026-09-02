@@ -2197,6 +2197,13 @@ pub struct WebConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Notify on scheduled wake", widget = "toggle", global_only)]
     pub notify_on_wake_fire: bool,
+
+    /// Optional human label naming this server instance (e.g. "office rack",
+    /// "home mini"). Shown in the dashboard header and page title so people
+    /// who keep several daemons open can tell the tabs apart at a glance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(label = "Instance label", widget = "optional_text", global_only)]
+    pub instance_label: Option<String>,
 }
 
 impl Default for WebConfig {
@@ -2207,6 +2214,7 @@ impl Default for WebConfig {
             notify_on_idle: false,
             notify_on_error: true,
             notify_on_wake_fire: true,
+            instance_label: None,
         }
     }
 }
