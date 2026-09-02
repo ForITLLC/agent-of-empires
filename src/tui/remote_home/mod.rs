@@ -58,6 +58,10 @@ pub struct RemoteHomeState {
     /// rows can show each session's `row-column` status (#2948). Empty until
     /// the first fetch, and after one that failed.
     pub plugin_ui: UiSnapshot,
+    /// Label of the daemon this view is attached to (`[web] instance_label`
+    /// via `GET /api/about`), painted as the top strip. `None` until the
+    /// first fetch, or when that daemon has no label.
+    pub instance_label: Option<String>,
 }
 
 impl RemoteHomeState {
@@ -70,6 +74,7 @@ impl RemoteHomeState {
             last_error: None,
             loading: true,
             plugin_ui: UiSnapshot::default(),
+            instance_label: None,
         }
     }
 
@@ -242,5 +247,14 @@ async fn refresh(state: &mut RemoteHomeState) {
             UiSnapshot::default()
         }
     };
+    // Board identity rides along with the list: the strip must name the
+    // daemon this view is attached to, not the local config's label. A
+    // failed fetch keeps the last known label rather than blanking it.
+    match client.about_instance_label().await {
+        Ok(label) => state.instance_label = label,
+        Err(e) => {
+            tracing::debug!(target: "tui.remote_home", "about fetch failed: {e}");
+        }
+    }
     state.loading = false;
 }

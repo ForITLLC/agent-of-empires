@@ -2237,9 +2237,19 @@ impl App {
         // (dialog open, non-home view) reads as zero capture/parse rather
         // than leaking the previous frame's durations.
         self.home.preview_timings = Default::default();
+        // Board identity callout: one row across the very top of EVERY
+        // frame — list, preview, settings, dialogs — when `[web]
+        // instance_label` is set, so an operator with several boards open
+        // can tell at a glance which one this is. No label → untouched.
+        let board = self.home.board_banner.clone();
+        let label = crate::tui::board_banner::label(board.as_deref());
+        let (strip, body) = crate::tui::board_banner::split(frame.area(), label);
+        if let (Some(strip), Some(label)) = (strip, label) {
+            crate::tui::board_banner::render(frame, strip, &self.theme, label);
+        }
         self.home.render(
             frame,
-            frame.area(),
+            body,
             &self.theme,
             self.update_info.as_ref(),
             status_text,

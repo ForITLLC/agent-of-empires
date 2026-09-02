@@ -507,6 +507,12 @@ pub struct HomeView {
     /// Cached at construction + config refresh and pushed into the capture
     /// worker (`set_vt_enabled`), so a settings toggle applies in place.
     pub(super) vt_live_enabled: bool,
+    /// Optional board identity from `[web] instance_label` ("office rack",
+    /// "home mini"). The app root paints it as a one-row strip across the
+    /// top of EVERY view (`tui::board_banner`) so someone attached to
+    /// several boards can tell which one they are looking at. Cached at
+    /// construction + config refresh like the other config-derived fields.
+    pub(super) board_banner: Option<String>,
     /// Active profile's `default_attach_mode`, cached at construction and
     /// refreshed by `refresh_from_config` / `switch_profile`. The help
     /// overlay falls back to this when no session row is selected so the
@@ -2217,6 +2223,7 @@ impl HomeView {
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
             vt_live_enabled: resolved.tmux.vt_live,
+            board_banner: resolved.web.instance_label.clone(),
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
                 .as_ref()
@@ -7738,6 +7745,7 @@ impl HomeView {
         self.agent_clipboard_forward =
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;
+        self.board_banner = config.web.instance_label.clone();
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_vt_enabled(
                 self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),

@@ -1060,6 +1060,9 @@ impl HomeView {
         let profile = self.active_profile_display();
         let title = match &self.view_mode {
             ViewMode::Structured => {
+                // Board identity is the full-width strip the app root paints
+                // above every view (`tui::board_banner`), so the list title
+                // stays plain rather than labelling the board twice.
                 compose_list_title("aoe", profile, self.group_by, self.sort_order)
             }
             ViewMode::Terminal => {

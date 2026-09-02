@@ -3,6 +3,7 @@
 mod app;
 mod attach_project_poller;
 mod attached_status_hooks;
+pub(crate) mod board_banner;
 pub(crate) mod clipboard;
 mod components;
 mod creation_poller;

@@ -81,6 +81,14 @@ fn selected_row_style(style: Style, theme: &Theme) -> Style {
 }
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
+    // Board identity strip for the ATTACHED daemon, above the header — the
+    // same callout the local app root paints, so a remote board is named
+    // the same way a local one is.
+    let label = crate::tui::board_banner::label(state.instance_label.as_deref());
+    let (strip, area) = crate::tui::board_banner::split(area, label);
+    if let (Some(strip), Some(label)) = (strip, label) {
+        crate::tui::board_banner::render(frame, strip, theme, label);
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -444,5 +452,37 @@ mod tests {
         let style = Style::default().fg(theme.dimmed);
 
         assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
+    }
+
+    #[test]
+    fn attached_daemon_label_paints_the_top_strip_above_the_header() {
+        let mut state = state_with(&["a1"], json!([]));
+        let plain = rows(&state);
+        assert!(
+            plain[0].contains("Remote agent sessions"),
+            "no label → header on row 0: {plain:?}"
+        );
+
+        state.instance_label = Some("ForIT Cloud".to_string());
+        let painted = rows(&state);
+        assert!(
+            painted[0].starts_with(" ForIT Cloud"),
+            "label → strip on row 0: {painted:?}"
+        );
+        assert!(
+            painted[1].contains("Remote agent sessions"),
+            "header shifts below the strip: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|r| r.contains("session a1")),
+            "list still renders: {painted:?}"
+        );
+
+        state.instance_label = Some("   ".to_string());
+        let blank = rows(&state);
+        assert!(
+            blank[0].contains("Remote agent sessions"),
+            "blank label → no strip: {blank:?}"
+        );
     }
 }

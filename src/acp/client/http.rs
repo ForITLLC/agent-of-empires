@@ -332,6 +332,21 @@ impl HttpClient {
         Ok(res.json::<UiSnapshot>().await?)
     }
 
+    /// `GET /api/about`, reduced to the operator-set instance label. The
+    /// remote-home view paints it as the board callout so a TUI attached to
+    /// another machine's daemon names THAT board, not the local config's.
+    pub async fn about_instance_label(&self) -> Result<Option<String>, HttpError> {
+        #[derive(serde::Deserialize)]
+        struct About {
+            #[serde(default)]
+            instance_label: Option<String>,
+        }
+        let url = format!("{}/api/about", self.endpoint.base_url);
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_global_status(res).await?;
+        Ok(res.json::<About>().await?.instance_label)
+    }
+
     /// `GET /api/plugins/commands`. The daemon's active plugin commands with
     /// their keybinds and client actions. The structured view resolves plugin
     /// chords against this rather than the TUI's local registry, so a session on
