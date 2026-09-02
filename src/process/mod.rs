@@ -1086,6 +1086,7 @@ mod tests {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// Parse a single `KEY=value` entry out of `ps -E` output. The `-E` flag
 /// appends the process environment inline after the command, space-separated,
 /// so each variable shows up as a whitespace-delimited `KEY=value` token. We
@@ -1111,7 +1112,7 @@ fn parse_env_var_from_ps(ps_output: &str, key: &str) -> Option<String> {
 /// out-of-band (a `cx-restart` baking a pinned `CLAUDE_CONFIG_DIR`, or a
 /// `--fork-session` recovery) runs under a different account than its registry
 /// label implies. The session-move path uses it to detect that divergence.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 pub fn get_process_env_var(pid: u32, key: &str) -> Option<String> {
     let output = Command::new("ps")
         .args(["-wwwE", "-p", &pid.to_string()])
@@ -1121,6 +1122,27 @@ pub fn get_process_env_var(pid: u32, key: &str) -> Option<String> {
         return None;
     }
     parse_env_var_from_ps(&String::from_utf8_lossy(&output.stdout), key)
+}
+
+/// Linux: procps-ng rejects `ps -E` ("unsupported SysV option"), so the
+/// `ps`-based read above returned `None` for every pid here and every caller
+/// silently took its fail-safe branch (WO#1669 found the session-move verify
+/// never firing on a Linux host for exactly this reason). The kernel exposes
+/// the environment directly; read it.
+#[cfg(target_os = "linux")]
+pub fn get_process_env_var(pid: u32, key: &str) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    parse_env_var_from_environ(&raw, key)
+}
+
+/// `/proc/<pid>/environ` is `KEY=value\0KEY=value\0…`. Exact key match only
+/// (`KEY_X=` must not satisfy `KEY`).
+#[cfg(any(target_os = "linux", test))]
+fn parse_env_var_from_environ(raw: &[u8], key: &str) -> Option<String> {
+    raw.split(|b| *b == 0).find_map(|kv| {
+        let kv = std::str::from_utf8(kv).ok()?;
+        kv.strip_prefix(key)?.strip_prefix('=').map(str::to_string)
+    })
 }
 
 /// Like [`get_process_env_var`], but reads `pid` AND every descendant (root
@@ -1165,6 +1187,35 @@ mod env_tree_tests {
         );
         assert_eq!(first_env_var_in(&[10], env), None);
         assert_eq!(first_env_var_in(&[], env), None);
+    }
+}
+
+#[cfg(test)]
+mod environ_parse_tests {
+    use super::parse_env_var_from_environ;
+
+    #[test]
+    fn reads_the_exact_key_from_a_nul_separated_block() {
+        let raw = b"PATH=/usr/bin\0CLAUDE_CONFIG_DIR_OLD=/decoy\0CLAUDE_CONFIG_DIR=/x/.claude-accounts/forit-backup\0TERM=xterm\0";
+        assert_eq!(
+            parse_env_var_from_environ(raw, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/x/.claude-accounts/forit-backup")
+        );
+    }
+
+    #[test]
+    fn missing_key_and_prefix_lookalike_are_none() {
+        let raw = b"PATH=/usr/bin\0CLAUDE_CONFIG_DIRX=/decoy\0";
+        assert_eq!(parse_env_var_from_environ(raw, "CLAUDE_CONFIG_DIR"), None);
+        assert_eq!(parse_env_var_from_environ(b"", "CLAUDE_CONFIG_DIR"), None);
+    }
+
+    #[test]
+    fn empty_value_is_some_empty() {
+        assert_eq!(
+            parse_env_var_from_environ(b"CLAUDE_CONFIG_DIR=\0", "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("")
+        );
     }
 }
 
