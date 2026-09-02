@@ -890,6 +890,20 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
 #[derive(Deserialize)]
 pub struct ListSessionsQuery {
     pub state: Option<crate::session::SessionScope>,
+    /// `?full=1` restores the pre-slim shape for archived/trashed rows (goal
+    /// text, context size, capacity overlay). Off by default: those rows are
+    /// the bulk of a fleet listing and every poll re-fetched their payload.
+    #[serde(default)]
+    pub full: bool,
+}
+
+/// A listing row is "slim" when the session is archived or trashed and the
+/// caller did not ask for `?full=1`. Slim rows keep every identity/state field
+/// (id, title, status, `archived_at`, `trashed_at`) but drop the per-row
+/// payload that is only meaningful for a live session: goal text, context
+/// size, and the capacity overlay. The per-id GET is never slimmed.
+fn list_row_is_slim(inst: &Instance, full: bool) -> bool {
+    !full && (inst.is_archived() || inst.is_trashed())
 }
 
 /// Project a wire status that reflects pane reality. The status poller leaves
@@ -1003,7 +1017,7 @@ pub async fn list_sessions(
     // tmux-backed row, a missing or dead pane means the session is not
     // running; project a frozen looks-alive status to `Stopped` so the wire
     // value matches `/output`'s 409 reality.
-    for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+    for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
         if inst.is_structured() {
             continue;
         }
@@ -1015,6 +1029,14 @@ pub async fn list_sessions(
         resp.pane_alive = Some(alive);
     }
 
+    // Slim archived/trashed rows: drop the goal text the constructor copied
+    // in. The overlays below skip these rows for the same reason.
+    for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
+        if list_row_is_slim(inst, query.full) {
+            resp.goal = None;
+        }
+    }
+
     // Overlay per-session context size for Claude rows with a captured agent
     // sid. Inputs are collected up front and every transcript scan runs in one
     // blocking task, so the sidebar poll's async loop never touches disk.
@@ -1023,6 +1045,7 @@ pub async fn list_sessions(
             .iter()
             .enumerate()
             .filter(|(_, inst)| inst.tool == "claude")
+            .filter(|(_, inst)| !list_row_is_slim(inst, query.full))
             .filter_map(|(i, inst)| {
                 inst.agent_session_id.clone().map(|sid| {
                     (
@@ -1069,7 +1092,10 @@ pub async fn list_sessions(
     if let Some(cap_path) = crate::server::capacity::capacity_path() {
         let cap = crate::server::capacity::CapacityState::load(&cap_path);
         if !cap.profiles.is_empty() {
-            for resp in sessions.iter_mut() {
+            for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
+                if list_row_is_slim(inst, query.full) {
+                    continue;
+                }
                 resp.capacity = cap.profiles.get(&resp.profile).cloned();
             }
         }
@@ -10281,7 +10307,7 @@ mod tests {
             .into_response();
             let Json(envelope) = list_sessions(
                 State(state.clone()),
-                axum::extract::Query(ListSessionsQuery { state: None }),
+                axum::extract::Query(ListSessionsQuery { state: None, full: false }),
             )
             .await;
             let badge = envelope.mcp_surface.expect("badge set on envelope");
@@ -10296,7 +10322,7 @@ mod tests {
             .into_response();
             let Json(envelope) = list_sessions(
                 State(state),
-                axum::extract::Query(ListSessionsQuery { state: None }),
+                axum::extract::Query(ListSessionsQuery { state: None, full: false }),
             )
             .await;
             assert!(
@@ -10530,7 +10556,7 @@ mod tests {
         LIST_SESSIONS_RESOLVER_MISSES.store(0, Ordering::Relaxed);
         let _envelope = list_sessions(
             axum::extract::State(state.clone()),
-            axum::extract::Query(ListSessionsQuery { state: None }),
+            axum::extract::Query(ListSessionsQuery { state: None, full: false }),
         )
         .await;
         let misses = LIST_SESSIONS_RESOLVER_MISSES.load(Ordering::Relaxed);
@@ -10538,6 +10564,95 @@ mod tests {
         assert_eq!(
             misses, 2,
             "shared cache must resolve exactly once per unique (profile, project_path) across both overlays; got {misses}",
+        );
+    }
+
+    /// WO#1570: archived/trashed rows are ~95% of the fleet listing and are
+    /// re-fetched by every TUI/sidebar poll. Their goal text (262 KB across
+    /// 159 rows on the Mini) is dead weight on every tick, so the default
+    /// listing omits it for sunk rows; `?full=1` restores the old shape and
+    /// the per-id GET always carries it.
+    #[test]
+    fn list_row_is_slim_only_for_sunk_rows_without_full() {
+        let live = Instance::new("live", "/tmp/slim-live");
+        let mut archived = Instance::new("archived", "/tmp/slim-archived");
+        archived.archived_at = Some(chrono::Utc::now());
+        let mut trashed = Instance::new("trashed", "/tmp/slim-trashed");
+        trashed.trash();
+
+        assert!(!list_row_is_slim(&live, false), "live rows keep the full shape");
+        assert!(list_row_is_slim(&archived, false));
+        assert!(list_row_is_slim(&trashed, false));
+        assert!(!list_row_is_slim(&archived, true), "?full=1 restores the old shape");
+        assert!(!list_row_is_slim(&trashed, true));
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_sessions_omits_goal_text_on_sunk_rows_unless_full() {
+        let mut live = Instance::new("live", "/tmp/slim-live");
+        live.id = "slim-live".to_string();
+        live.goal = Some("live goal".to_string());
+        let mut archived = Instance::new("archived", "/tmp/slim-archived");
+        archived.id = "slim-archived".to_string();
+        archived.archived_at = Some(chrono::Utc::now());
+        archived.goal = Some("archived goal".to_string());
+        let mut trashed = Instance::new("trashed", "/tmp/slim-trashed");
+        trashed.id = "slim-trashed".to_string();
+        trashed.trash();
+        trashed.goal = Some("trashed goal".to_string());
+
+        let state = crate::server::test_support::build_test_app_state(vec![
+            live, archived, trashed,
+        ]);
+        fn row<'a>(envelope: &'a SessionsEnvelope, id: &str) -> &'a SessionResponse {
+            envelope
+                .sessions
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("row {id} missing"))
+        }
+
+        let slim = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery {
+                state: None,
+                full: false,
+            }),
+        )
+        .await;
+        assert_eq!(row(&slim, "slim-live").goal.as_deref(), Some("live goal"));
+        assert_eq!(
+            row(&slim, "slim-archived").goal,
+            None,
+            "archived goal text is dropped from the listing"
+        );
+        assert_eq!(
+            row(&slim, "slim-trashed").goal,
+            None,
+            "trashed goal text is dropped from the listing"
+        );
+        assert!(
+            row(&slim, "slim-archived").archived_at.is_some(),
+            "slimming only drops payload, never the archived flag"
+        );
+
+        let full = list_sessions(
+            axum::extract::State(state),
+            axum::extract::Query(ListSessionsQuery {
+                state: None,
+                full: true,
+            }),
+        )
+        .await;
+        assert_eq!(
+            row(&full, "slim-archived").goal.as_deref(),
+            Some("archived goal")
+        );
+        assert_eq!(
+            row(&full, "slim-trashed").goal.as_deref(),
+            Some("trashed goal")
         );
     }
 
@@ -10566,7 +10681,7 @@ mod tests {
 
         let all = list_sessions(
             axum::extract::State(state.clone()),
-            axum::extract::Query(ListSessionsQuery { state: None }),
+            axum::extract::Query(ListSessionsQuery { state: None, full: false }),
         )
         .await;
         assert_eq!(
@@ -10579,6 +10694,7 @@ mod tests {
             axum::extract::State(state.clone()),
             axum::extract::Query(ListSessionsQuery {
                 state: Some(crate::session::SessionScope::Live),
+                full: false,
             }),
         )
         .await;
@@ -10588,6 +10704,7 @@ mod tests {
             axum::extract::State(state.clone()),
             axum::extract::Query(ListSessionsQuery {
                 state: Some(crate::session::SessionScope::Trashed),
+                full: false,
             }),
         )
         .await;
@@ -10597,6 +10714,7 @@ mod tests {
             axum::extract::State(state),
             axum::extract::Query(ListSessionsQuery {
                 state: Some(crate::session::SessionScope::All),
+                full: false,
             }),
         )
         .await;
