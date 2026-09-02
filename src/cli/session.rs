@@ -518,12 +518,16 @@ fn config_dir_diverged(live: Option<&str>, expected: Option<&str>) -> bool {
 }
 
 /// Read the LIVE `CLAUDE_CONFIG_DIR` the session's running pane was launched
-/// with, by inspecting its pane process environment. `None` when the session
-/// has no live pane or the env can't be read (caller fails safe to no-divergence).
+/// with, by inspecting the pane's process tree. The pane primary can be a
+/// wrapper whose own environment lacks the variable (Linux: `bash
+/// /tmp/aoe-pane-env-…` → the agent), so the read walks pane pid and
+/// descendants and takes the first hit. `None` when the session has no live
+/// pane or no process in the tree carries it (caller fails safe to
+/// no-divergence).
 fn live_config_dir(inst: &crate::session::Instance) -> Option<String> {
     let session = inst.tmux_session().ok()?;
     let pid = crate::process::get_pane_pid(session.name())?;
-    crate::process::get_process_env_var(pid, "CLAUDE_CONFIG_DIR")
+    crate::process::get_process_env_var_in_tree(pid, "CLAUDE_CONFIG_DIR")
 }
 
 /// Relocate a session's record cross-profile, then re-bind the live account.

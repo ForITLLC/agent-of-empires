@@ -1123,6 +1123,51 @@ pub fn get_process_env_var(pid: u32, key: &str) -> Option<String> {
     parse_env_var_from_ps(&String::from_utf8_lossy(&output.stdout), key)
 }
 
+/// Like [`get_process_env_var`], but reads `pid` AND every descendant (root
+/// first, then tree order) and returns the first process that carries `key`.
+/// A tmux pane's primary is often a wrapper — `bash /tmp/aoe-pane-env-…` on
+/// Linux — whose OWN environment lacks the variable it hands to the agent it
+/// spawns, so a pane-pid-only read reports "unset" for a binding that is live
+/// one level down. The session-move verify uses this so its loud
+/// MOVE INCOMPLETE path is real on Linux, not a fail-safe no-op. macOS/Linux.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn get_process_env_var_in_tree(pid: u32, key: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let pids = linux::collect_pid_tree(pid);
+    #[cfg(target_os = "macos")]
+    let pids = macos::collect_pid_tree(pid);
+    first_env_var_in(&pids, |p| get_process_env_var(p, key))
+}
+
+/// First `Some` from `read` over `pids`, in order. Split out so the walk is
+/// testable without live processes.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn first_env_var_in(pids: &[u32], read: impl Fn(u32) -> Option<String>) -> Option<String> {
+    pids.iter().copied().find_map(read)
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod env_tree_tests {
+    use super::first_env_var_in;
+
+    // WO#1669: pane primary 10 is a wrapper with no CLAUDE_CONFIG_DIR, the
+    // agent 11 under it carries the live binding, 12 is a deeper helper.
+    #[test]
+    fn walks_past_a_wrapper_that_lacks_the_var() {
+        let env = |p: u32| match p {
+            11 => Some("/accounts/forit-backup".to_string()),
+            12 => Some("/accounts/decoy".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            first_env_var_in(&[10, 11, 12], env).as_deref(),
+            Some("/accounts/forit-backup")
+        );
+        assert_eq!(first_env_var_in(&[10], env), None);
+        assert_eq!(first_env_var_in(&[], env), None);
+    }
+}
+
 #[cfg(test)]
 mod env_parse_tests {
     use super::parse_env_var_from_ps;
