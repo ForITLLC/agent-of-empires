@@ -612,6 +612,7 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now(),
+        holder_pid: None,
     };
     view.mutate_instance(&id, |row| {
         row.lifecycle_generation = 1;

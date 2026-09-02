@@ -578,6 +578,7 @@ mod tests {
             op: LifecycleOperation::Purge,
             generation: 4,
             at: Utc::now(),
+            holder_pid: None,
         });
         reserved.merge_runtime_from_reload(&deleting);
 

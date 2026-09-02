@@ -1127,6 +1127,7 @@ mod tests {
             op: crate::session::LifecycleOperation::Trash,
             generation: 1,
             at: chrono::Utc::now(),
+            holder_pid: None,
         });
         seed_instance_on_disk(profile, &instance);
         attach_poller_with_update(&mut instance, sid);
