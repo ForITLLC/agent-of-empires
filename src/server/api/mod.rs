@@ -62,6 +62,10 @@ pub use sessions::{
     update_workspace_ordering, OutputQuery, SendMessageRequest,
     get_session_goal, set_session_goal,
 };
+// Daemon-side restart (POST /api/sessions/{id}/restart + GET restart-status): a
+// separate `use` so this branch stacks beside other route additions without
+// re-wrapping the block above.
+pub use sessions::{restart_session, restart_status};
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
@@ -358,6 +362,7 @@ mod tests {
                     "stop_session",
                     "force_smart_rename",
                     "start_session",
+                    "restart_session",
                 ],
             ),
             (

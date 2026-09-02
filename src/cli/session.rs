@@ -1879,6 +1879,81 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
         .collect()
 }
 
+/// Daemon-first restart: when a local daemon is reachable, hand it the
+/// cascade (`POST /api/sessions/{id}/restart`) and only WATCH from here.
+/// The CLI's own survival then no longer matters: a harness timeout or a
+/// SIGTERM that kills this process mid-poll leaves the cascade running in
+/// the daemon instead of stranding a half-torn-down pane behind a lifecycle
+/// reservation. Returns Ok(false) when no daemon is reachable or the POST
+/// itself was refused, so the caller falls back to the in-process path;
+/// never falls back after the daemon accepted.
+#[cfg(feature = "serve")]
+async fn try_daemon_restart(session_id: &str, title: &str) -> Result<bool> {
+    use crate::acp::client::{discovery, HttpClient};
+
+    let Ok(endpoint) = discovery::discover_local() else {
+        return Ok(false);
+    };
+    let Ok(client) = HttpClient::new(endpoint) else {
+        return Ok(false);
+    };
+    if client.restart_session(session_id).await.is_err() {
+        return Ok(false);
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Ok(body) = client.restart_status(session_id).await {
+            match body.get("state").and_then(|v| v.as_str()) {
+                Some("stale") => {
+                    let age = body
+                        .get("age_seconds")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    bail!(
+                        "Daemon-side restart for {title} is wedged: its in-flight mark is \
+                         {age}s old and the owning cascade died without finishing. \
+                         Re-run `aoe session restart`; the daemon replaces the stale \
+                         mark on the next request."
+                    );
+                }
+                Some("done") => {
+                    if body.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                        let profile = body
+                            .get("profile")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if profile.is_empty() {
+                            println!("✓ Restarted session: {} (daemon-side)", title);
+                        } else {
+                            println!(
+                                "✓ Restarted session: {} (daemon-side, profile '{}')",
+                                title, profile
+                            );
+                        }
+                        return Ok(true);
+                    }
+                    let err = body
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    bail!("Daemon-side restart failed for {title}: {err}");
+                }
+                _ => {}
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "✓ Restart accepted for {}; still settling daemon-side (watch `aoe list` or \
+                 GET /api/sessions/{}/restart-status)",
+                title, session_id
+            );
+            return Ok(true);
+        }
+    }
+}
+
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // #99 default-launch drift fix: a plain `aoe session restart <id>` (no
     // `-p`, so `profile` is empty) must operate on — and re-bind under — the
@@ -1906,6 +1981,12 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "restart")?;
+
+    // Daemon-first: the cascade must not depend on this process surviving.
+    #[cfg(feature = "serve")]
+    if try_daemon_restart(&inst.id, &inst.title).await? {
+        return Ok(());
+    }
     let mut working = inst.clone();
     working.source_profile = owning_profile.clone();
 

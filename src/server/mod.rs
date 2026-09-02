@@ -67,6 +67,6 @@ pub(crate) use sleep_inhibit::{
 };
 pub(crate) use startup::resolve_auth_mode;
 pub use startup::{start_server, ServerConfig};
-pub use state::{AppState, CleanupDefaultsCache};
+pub use state::{AppState, CleanupDefaultsCache, RestartOutcomeRecord};
 pub(crate) use token::generate_token;
 pub use token::TokenManager;
