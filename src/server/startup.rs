@@ -720,6 +720,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             crate::session::conversation_summary::MAX_CONCURRENT,
         ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
+        restart_inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
+        restart_outcomes: std::sync::Mutex::new(std::collections::HashMap::new()),
         mutation_epoch: Arc::clone(&mutation_epoch),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
