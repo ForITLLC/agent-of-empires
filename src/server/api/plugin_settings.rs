@@ -254,7 +254,8 @@ async fn group_options(state: &Arc<AppState>) -> Vec<SelectOption> {
 /// Extract the value of a `--model` / `-m` flag from a whitespace-split
 /// extra-args string (`session.agent_extra_args.<agent>`). Handles the spaced
 /// form (`--model X`, `-m X`) and the joined form (`--model=X`, `-m=X`). A
-/// dangling flag with no following value yields `None`.
+/// dangling flag — no following value, or the next token is another option
+/// (`--model --verbose`) — yields `None` rather than a bogus model.
 fn parse_model_flag(args: &str) -> Option<String> {
     let toks: Vec<&str> = args.split_whitespace().collect();
     for (i, tok) in toks.iter().enumerate() {
@@ -266,7 +267,10 @@ fn parse_model_flag(args: &str) -> Option<String> {
                 return Some(v.to_string());
             }
         } else if *tok == "--model" || *tok == "-m" {
-            if let Some(v) = toks.get(i + 1).filter(|v| !v.is_empty()) {
+            if let Some(v) = toks
+                .get(i + 1)
+                .filter(|v| !v.is_empty() && !v.starts_with('-'))
+            {
                 return Some(v.to_string());
             }
         }
@@ -399,6 +403,10 @@ mod tests {
         // no model flag present -> no pin
         assert_eq!(parse_model_flag("--port 8080"), None);
         assert_eq!(parse_model_flag(""), None);
+        // a flag followed by another option is dangling, not a pin on "--verbose"
+        assert_eq!(parse_model_flag("--model --verbose"), None);
+        assert_eq!(parse_model_flag("-m -v --port 8080"), None);
+        assert_eq!(parse_model_flag("--port 8080 --model"), None);
         // dangling flag with no value -> no pin (never returns an empty model)
         assert_eq!(parse_model_flag("--model"), None);
         assert_eq!(parse_model_flag("foo --model="), None);
