@@ -197,6 +197,7 @@ impl SessionResponse {
             next_wakeup_reason,
             monitor_active,
             monitor_description,
+            account: Default::default(),
         }
     }
 }
