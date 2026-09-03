@@ -382,6 +382,8 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
 
 /// Glob matching every session aoe creates (agents, terminals, tools): they
 /// all share [`crate::tmux::SESSION_PREFIX`].
+/// The tmux glob matching every session aoe manages (`<SESSION_PREFIX>*`),
+/// as used by the `prefix d` binding's format condition.
 fn managed_session_glob() -> String {
     format!("{}*", crate::tmux::SESSION_PREFIX)
 }
@@ -412,26 +414,93 @@ fn detach_return_condition(managed_glob: &str) -> String {
     )
 }
 
+/// Split one `tmux list-keys` line into its arguments, undoing tmux's own
+/// quoting (`args_escape`: a double-quoted word with backslash escapes, a
+/// single-quoted word, or a bare word) so a binding can be compared with
+/// aoe's own token for token.
+fn split_tmux_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_word = true;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(n) = chars.next() {
+                                cur.push(n);
+                            }
+                        }
+                        _ => cur.push(c),
+                    }
+                }
+            }
+            '\'' => {
+                in_word = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    cur.push(c);
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            _ => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    words
+}
+
 /// Whether aoe may (re)install its `prefix d` binding, given the output of
-/// `tmux list-keys -T prefix d`: only when the key is unbound, holds tmux's
-/// stock `detach-client`, or already holds aoe's binding. A user's own custom
-/// `d` binding is left alone.
-fn should_install_detach_return(list_keys_output: &str) -> bool {
+/// `tmux list-keys -T prefix d` and the exact condition aoe binds: only when
+/// the key is unbound, holds tmux's stock `detach-client`, or already holds
+/// aoe's own binding — `if-shell -F <own_condition> "switch-client -l"
+/// detach-client`, matched token for token. Anything else is the user's, and
+/// is left alone; an `if-shell` of their own that merely contains
+/// `switch-client -l` (a different condition or fallback) is NOT aoe's.
+fn should_install_detach_return(list_keys_output: &str, own_condition: &str) -> bool {
     let line = list_keys_output.trim();
     if line.is_empty() {
         return true;
     }
-    if line.contains("switch-client -l") {
-        return true;
-    }
-    let toks: Vec<&str> = line.split_whitespace().collect();
-    match toks
+    let toks = split_tmux_words(line);
+    let Some(i) = toks
         .windows(2)
         .position(|w| w[0] == "prefix" && w[1] == "d")
-    {
-        Some(i) => toks[i + 2..] == ["detach-client"],
-        None => false,
-    }
+    else {
+        return false;
+    };
+    let bound: Vec<&str> = toks[i + 2..].iter().map(String::as_str).collect();
+    bound == ["detach-client"]
+        || bound
+            == [
+                "if-shell",
+                "-F",
+                own_condition,
+                "switch-client -l",
+                "detach-client",
+            ]
 }
 
 /// Install the `prefix d` binding described on [`detach_return_condition`].
@@ -449,7 +518,8 @@ pub(crate) fn install_detach_return_binding() {
             return;
         }
     };
-    if !should_install_detach_return(&listing) {
+    let cond = detach_return_condition(&managed_session_glob());
+    if !should_install_detach_return(&listing, &cond) {
         tracing::debug!(
             target: "tmux.attach",
             "prefix d is user-bound ({}); leaving it alone",
@@ -457,7 +527,6 @@ pub(crate) fn install_detach_return_binding() {
         );
         return;
     }
-    let cond = detach_return_condition(&managed_session_glob());
     match crate::tmux::tmux_command()
         .args([
             "bind-key",
@@ -1084,26 +1153,99 @@ mod tests {
         );
     }
 
+    /// Only tmux's stock `detach-client`, an unbound key, or aoe's own
+    /// binding (exact condition AND both branches) may be rebound.
     #[test]
     fn should_install_detach_return_only_over_stock_or_own_binding() {
-        assert!(should_install_detach_return(""));
+        let cond = detach_return_condition("aoe_*");
+        assert!(should_install_detach_return("", &cond));
         assert!(should_install_detach_return(
-            "bind-key -T prefix d detach-client\n"
+            "bind-key -T prefix d detach-client\n",
+            &cond
         ));
         assert!(should_install_detach_return(
-            "bind-key    -T prefix d                    detach-client"
+            "bind-key    -T prefix d                    detach-client",
+            &cond
         ));
-        assert!(should_install_detach_return(
-            r##"bind-key -T prefix d if-shell -F "#{&&:x}" "switch-client -l" detach-client"##
+        // aoe's own binding, exactly as tmux 3.4 lists it back
+        let own = format!(
+            r#"bind-key -T prefix d if-shell -F "{cond}" "switch-client -l" detach-client"#
+        );
+        assert!(should_install_detach_return(&own, &cond));
+        assert!(!should_install_detach_return(
+            "bind-key -T prefix d kill-session",
+            &cond
         ));
         assert!(!should_install_detach_return(
-            "bind-key -T prefix d kill-session"
+            "bind-key -T prefix d run-shell my-script",
+            &cond
         ));
         assert!(!should_install_detach_return(
-            "bind-key -T prefix d run-shell my-script"
+            "bind-key -T prefix d detach-client -a",
+            &cond
+        ));
+    }
+
+    /// A user's own `if-shell` binding that merely contains `switch-client -l`
+    /// — a different condition, a different fallback, or a missing one — is
+    /// theirs and must never be replaced.
+    #[test]
+    fn should_install_detach_return_leaves_custom_switch_client_bindings_alone() {
+        let cond = detach_return_condition("aoe_*");
+        assert!(!should_install_detach_return(
+            r##"bind-key -T prefix d if-shell -F "#{&&:x}" "switch-client -l" detach-client"##,
+            &cond
         ));
         assert!(!should_install_detach_return(
-            "bind-key -T prefix d detach-client -a"
+            "bind-key -T prefix d if-shell -F '#{==:1,1}' 'switch-client -l' detach-client",
+            &cond
         ));
+        assert!(!should_install_detach_return(
+            &format!(
+                r#"bind-key -T prefix d if-shell -F "{cond}" "switch-client -l" kill-session"#
+            ),
+            &cond
+        ));
+        assert!(!should_install_detach_return(
+            &format!(r#"bind-key -T prefix d if-shell -F "{cond}" "switch-client -l""#),
+            &cond
+        ));
+        assert!(!should_install_detach_return(
+            &format!(
+                r#"bind-key -T prefix d if-shell -F "{cond}" "switch-client -l -t other" detach-client"#
+            ),
+            &cond
+        ));
+        assert!(!should_install_detach_return(
+            "bind-key -T prefix d switch-client -l",
+            &cond
+        ));
+    }
+
+    /// `list-keys` output is split the way tmux quoted it: double quotes with
+    /// backslash escapes, single quotes verbatim, bare words on whitespace.
+    #[test]
+    fn split_tmux_words_undoes_tmux_quoting() {
+        assert_eq!(
+            split_tmux_words(
+                r##"bind-key -T prefix d if-shell -F "#{a,b}" "switch-client -l" detach-client"##
+            ),
+            [
+                "bind-key",
+                "-T",
+                "prefix",
+                "d",
+                "if-shell",
+                "-F",
+                "#{a,b}",
+                "switch-client -l",
+                "detach-client"
+            ]
+        );
+        assert_eq!(
+            split_tmux_words(r#"a "b \"c\" d" 'e f' g\ h"#),
+            ["a", "b \"c\" d", "e f", "g h"]
+        );
+        assert_eq!(split_tmux_words("   "), Vec::<String>::new());
     }
 }
