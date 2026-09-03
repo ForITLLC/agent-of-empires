@@ -1909,3 +1909,292 @@ fn branch_picker_mouse_selection_routes_to_the_focused_field() {
         dialog.worktree_branch.value()
     );
 }
+
+// --- tool ↔ profile binding ---
+//
+// The fleet shape these pin: sixteen profiles whose resolved default_tool is
+// claude (a global `default_tool = "claude"`) and one `codex` profile with
+// `default_tool = "codex"` plus a codex `agent_extra_args` pin. Picking the
+// codex engine anywhere must create the record IN the codex profile with
+// that pin applied; picking claude from the codex profile is ambiguous and
+// must not move the profile.
+
+const CODEX_PROFILE_CONFIG: &str = r#"
+[session]
+default_tool = "codex"
+
+[session.agent_extra_args]
+codex = "-m gpt-5.6-sol"
+"#;
+
+/// Field indices for a dialog with a profile picker and more than one tool:
+/// profile 0, path 1, title 2, tool 3.
+const PROFILE_FIELD: usize = 0;
+const TOOL_FIELD_WITH_PROFILES: usize = 3;
+
+/// Write a registry under the isolated app dir: the global config plus one
+/// `config.toml` per listed profile (an empty body is a profile with no
+/// overrides). Callers hold `isolate_home` for the duration.
+fn write_profile_registry(global: &str, profiles: &[(&str, &str)]) {
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    let profiles_dir = app_dir.join("profiles");
+    fs::write(app_dir.join("config.toml"), global).expect("global config");
+    for (name, body) in profiles {
+        let dir = profiles_dir.join(name);
+        fs::create_dir_all(&dir).expect("profile dir");
+        fs::write(dir.join("config.toml"), body).expect("profile config");
+    }
+}
+
+/// Dialog with the claude + codex engines and the given profile list,
+/// standing in the first profile.
+fn tool_profile_dialog(profiles: &[&str]) -> NewSessionDialog {
+    let mut dialog =
+        NewSessionDialog::new_with_tools(vec!["claude", "codex"], TEST_PATH.to_string());
+    dialog.available_profiles = profiles.iter().map(|p| p.to_string()).collect();
+    dialog.profile_descriptions = vec![None; profiles.len()];
+    dialog.profile_index = 0;
+    dialog
+}
+
+#[test]
+#[serial_test::serial]
+fn test_tool_cycle_to_codex_snaps_profile_to_the_codex_profile() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    write_profile_registry(
+        "default_profile = \"default\"\n",
+        &[("default", ""), ("codex", CODEX_PROFILE_CONFIG)],
+    );
+
+    let mut dialog = tool_profile_dialog(&["default", "codex"]);
+    dialog.focused_field = TOOL_FIELD_WITH_PROFILES;
+
+    dialog.handle_key(key(KeyCode::Right));
+
+    assert_eq!(dialog.selected_tool(), "codex");
+    assert_eq!(
+        dialog.selected_profile(),
+        "codex",
+        "tool=codex must land in the one profile whose default_tool is codex"
+    );
+    assert_eq!(dialog.profile, "codex");
+    assert_eq!(
+        dialog.extra_args.value(),
+        "-m gpt-5.6-sol",
+        "the codex profile's agent_extra_args pin must be applied by the snap"
+    );
+    assert_eq!(
+        dialog.snap_hint.as_deref(),
+        Some("profile → codex (default_tool = codex)")
+    );
+
+    match dialog.build_submit_result() {
+        DialogResult::Submit(data) => {
+            assert_eq!(data.profile, "codex");
+            assert_eq!(data.tool, "codex");
+            assert_eq!(data.extra_args, "-m gpt-5.6-sol");
+        }
+        _ => panic!("Expected Submit"),
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn test_tool_cycle_leaves_profile_when_no_profile_defaults_to_the_tool() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    write_profile_registry(
+        "default_profile = \"default\"\n",
+        &[("default", ""), ("work", "")],
+    );
+
+    let mut dialog = tool_profile_dialog(&["default", "work"]);
+    dialog.focused_field = TOOL_FIELD_WITH_PROFILES;
+
+    dialog.handle_key(key(KeyCode::Right));
+
+    assert_eq!(dialog.selected_tool(), "codex");
+    assert_eq!(dialog.selected_profile(), "default");
+    assert_eq!(dialog.snap_hint, None);
+}
+
+#[test]
+#[serial_test::serial]
+fn test_tool_cycle_leaves_profile_when_several_profiles_default_to_the_tool() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    write_profile_registry(
+        "default_profile = \"default\"\n",
+        &[
+            ("default", ""),
+            ("codex-a", CODEX_PROFILE_CONFIG),
+            ("codex-b", CODEX_PROFILE_CONFIG),
+        ],
+    );
+
+    let mut dialog = tool_profile_dialog(&["default", "codex-a", "codex-b"]);
+    dialog.focused_field = TOOL_FIELD_WITH_PROFILES;
+
+    dialog.handle_key(key(KeyCode::Right));
+
+    assert_eq!(dialog.selected_tool(), "codex");
+    assert_eq!(
+        dialog.selected_profile(),
+        "default",
+        "two codex profiles is ambiguous: the dialog must not guess"
+    );
+    assert_eq!(dialog.extra_args.value(), "");
+    assert_eq!(dialog.snap_hint, None);
+}
+
+#[test]
+#[serial_test::serial]
+fn test_tool_cycle_fleet_shape_codex_snaps_then_claude_stays_put() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    write_profile_registry(
+        "default_profile = \"default\"\n\n[session]\ndefault_tool = \"claude\"\n",
+        &[
+            ("default", ""),
+            ("forit-main", ""),
+            ("codex", CODEX_PROFILE_CONFIG),
+        ],
+    );
+
+    let mut dialog = tool_profile_dialog(&["default", "forit-main", "codex"]);
+    dialog.profile_index = 1; // standing in forit-main
+    dialog.focused_field = TOOL_FIELD_WITH_PROFILES;
+
+    // claude → codex: exactly one profile defaults to codex, so snap.
+    dialog.handle_key(key(KeyCode::Right));
+    assert_eq!(dialog.selected_tool(), "codex");
+    assert_eq!(dialog.selected_profile(), "codex");
+    assert_eq!(dialog.extra_args.value(), "-m gpt-5.6-sol");
+    assert!(dialog.snap_hint.is_some());
+
+    // codex → claude: every ordinary profile resolves to claude via the
+    // global default, so there is no single target; stay in codex.
+    dialog.handle_key(key(KeyCode::Left));
+    assert_eq!(dialog.selected_tool(), "claude");
+    assert_eq!(dialog.selected_profile(), "codex");
+    assert_eq!(dialog.snap_hint, None);
+}
+
+#[test]
+#[serial_test::serial]
+fn test_profile_cycle_to_codex_snaps_tool_and_extra_args() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    write_profile_registry(
+        "default_profile = \"default\"\n",
+        &[("default", ""), ("codex", CODEX_PROFILE_CONFIG)],
+    );
+
+    let mut dialog = tool_profile_dialog(&["default", "codex"]);
+    dialog.focused_field = PROFILE_FIELD;
+    assert_eq!(dialog.selected_tool(), "claude");
+
+    // Profile → tool: cycling onto the codex profile snaps the engine to
+    // its default_tool and loads that tool's extra args.
+    dialog.handle_key(key(KeyCode::Right));
+    assert_eq!(dialog.selected_profile(), "codex");
+    assert_eq!(dialog.selected_tool(), "codex");
+    assert_eq!(dialog.extra_args.value(), "-m gpt-5.6-sol");
+    assert_eq!(
+        dialog.snap_hint.as_deref(),
+        Some("tool → codex (codex default_tool)")
+    );
+
+    // Back to a profile with no default_tool: the engine falls back to the
+    // first tool, which is a reset rather than a snap, so no notice.
+    dialog.handle_key(key(KeyCode::Left));
+    assert_eq!(dialog.selected_profile(), "default");
+    assert_eq!(dialog.selected_tool(), "claude");
+    assert_eq!(dialog.extra_args.value(), "");
+    assert_eq!(dialog.snap_hint, None);
+}
+
+#[test]
+#[serial_test::serial]
+fn test_click_on_tool_snaps_profile_like_the_keyboard() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    write_profile_registry(
+        "default_profile = \"default\"\n",
+        &[("default", ""), ("codex", CODEX_PROFILE_CONFIG)],
+    );
+
+    let mut dialog = tool_profile_dialog(&["default", "codex"]);
+    stage_focusable(
+        &mut dialog,
+        TOOL_FIELD_WITH_PROFILES,
+        ratatui::layout::Rect::new(0, 5, 30, 1),
+    );
+
+    dialog.handle_click(10, 5).expect("click should hit tool");
+
+    assert_eq!(dialog.selected_tool(), "codex");
+    assert_eq!(dialog.selected_profile(), "codex");
+    assert_eq!(dialog.extra_args.value(), "-m gpt-5.6-sol");
+    assert_eq!(
+        dialog.snap_hint.as_deref(),
+        Some("profile → codex (default_tool = codex)")
+    );
+}
+
+#[test]
+fn test_tool_cycle_with_single_profile_never_moves_profile() {
+    let mut dialog = multi_tool_dialog();
+    // No profile picker: path 0, title 1, tool 2.
+    dialog.focused_field = 2;
+
+    dialog.handle_key(key(KeyCode::Right));
+
+    assert_eq!(dialog.selected_tool(), "opencode");
+    assert_eq!(dialog.profile_index, 0);
+    assert_eq!(dialog.snap_hint, None);
+}
+
+#[test]
+#[serial_test::serial]
+fn test_snap_hint_renders_above_key_hints_and_clears_on_next_key() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    write_profile_registry(
+        "default_profile = \"default\"\n",
+        &[("default", ""), ("codex", CODEX_PROFILE_CONFIG)],
+    );
+
+    let mut dialog = tool_profile_dialog(&["default", "codex"]);
+    dialog.focused_field = TOOL_FIELD_WITH_PROFILES;
+    dialog.handle_key(key(KeyCode::Right));
+
+    let theme = crate::tui::styles::Theme::default();
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+    terminal
+        .draw(|frame| dialog.render(frame, frame.area(), &theme))
+        .expect("render");
+    let screen = screen_text(terminal.backend().buffer());
+    assert!(
+        screen.contains("↔ profile → codex (default_tool = codex)"),
+        "snap notice not rendered: {screen}"
+    );
+    assert!(
+        screen.contains("Tab") && screen.contains("next"),
+        "the notice must sit above the key hints, not replace them: {screen}"
+    );
+
+    // Any further key retires the notice.
+    dialog.handle_key(key(KeyCode::Tab));
+    terminal
+        .draw(|frame| dialog.render(frame, frame.area(), &theme))
+        .expect("render");
+    let screen = screen_text(terminal.backend().buffer());
+    assert!(
+        !screen.contains("profile → codex"),
+        "snap notice must clear on the next key: {screen}"
+    );
+}
