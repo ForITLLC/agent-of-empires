@@ -190,6 +190,154 @@ pub fn detect_antigravity_status(raw_content: &str) -> Status {
     detect_via_manifest("antigravity", raw_content, "", None)
 }
 
+// --- Restart-wake pane classifiers -----------------------------------------
+//
+// Pure, ANSI-stripping detectors the restart wake worker
+// (`session::restart::classify_wake_pane`) drives its decisions from. They
+// read shapes the manifest deliberately does not turn into a status (the
+// composer holding a draft, a specific menu) and are `pub(crate)` so the
+// worker can act on them without re-deriving the pane window.
+
+/// How many trailing non-empty pane lines the composer detectors scan. The
+/// composer prompt renders at the bottom of the pane with at most the box
+/// rule, the mode footer, and a hint line below it.
+const CLAUDE_COMPOSER_TAIL: usize = 10;
+
+/// How far back the resume-picker scan looks: the same recent window the
+/// detection manifests use, so a picker that scrolled away reads as answered.
+const CLAUDE_PICKER_WINDOW: usize = 30;
+
+/// Bounded prefix of a message's first line used to recognise it on screen.
+/// Line wrapping and narrow panes cut off the rest.
+const CLAUDE_MESSAGE_PREFIX_CHARS: usize = 32;
+
+/// The last `n` non-empty lines of an ANSI-stripped capture.
+fn recent_non_empty_lines(clean: &str, n: usize) -> Vec<&str> {
+    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = non_empty.len().saturating_sub(n);
+    non_empty[start..].to_vec()
+}
+
+/// The bounded first-line prefix a message is recognised by, `None` for a
+/// message with no text on its first line.
+fn claude_message_prefix(message: &str) -> Option<String> {
+    let first_line = message.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    Some(
+        first_line
+            .chars()
+            .take(CLAUDE_MESSAGE_PREFIX_CHARS)
+            .collect(),
+    )
+}
+
+/// A menu row: an optional selection cursor (`❯` or `>`), a single digit, a
+/// period, then a space or the end of the line. The shape Claude's
+/// folder-trust dialog, resume picker and approval menus all render their
+/// options in; `10. tenth` and `1.5 seconds` are prose.
+fn claude_line_is_numbered_choice(line: &str) -> bool {
+    let rest = line.trim_start();
+    let rest = rest
+        .strip_prefix('❯')
+        .or_else(|| rest.strip_prefix('>'))
+        .unwrap_or(rest)
+        .trim_start();
+    let mut chars = rest.chars();
+    matches!(chars.next(), Some('1'..='9'))
+        && chars.next() == Some('.')
+        && chars.next().is_none_or(char::is_whitespace)
+}
+
+/// Claude Code shows a blocking "resume" picker when an interactive
+/// `--resume <id>` lands on a COMPACTED session: a one-line preamble ("We
+/// recommend resuming from a summary.") over a numbered menu whose options are
+/// "1. Resume from summary (recommended)" and "2. Resume full session as-is".
+/// It carries no "do you want to" question, no spinner and no "esc to
+/// interrupt", so nothing in the manifest names it. A restart wake message
+/// typed here goes into the menu instead of the composer, which is how a
+/// cross-account relocation left sessions parked dark. Matching the
+/// numbered-choice shape, not a bare substring, keeps a pane that merely
+/// quotes the picker in prose (a chat message describing it, a commit diff)
+/// from being mistaken for the live menu.
+pub(crate) fn claude_pane_has_resume_picker(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    recent_non_empty_lines(&clean, CLAUDE_PICKER_WINDOW)
+        .iter()
+        .any(|line| {
+            if !claude_line_is_numbered_choice(line) {
+                return false;
+            }
+            let lower = line.to_lowercase();
+            lower.contains("resume from summary") || lower.contains("resume full session")
+        })
+}
+
+/// The Claude Code composer (input box) is rendered and accepting input: a
+/// `❯` prompt line in the trailing region that is NOT a numbered menu choice
+/// (the folder-trust dialog, resume picker and approval menus all render
+/// their selection cursor as `❯ 1. ...`). This is the "truly ready" signal a
+/// post-restart send has to gate on. Measured on a live boot, the pane's
+/// shell is replaced ~600ms before the composer renders, and a paste landing
+/// in that gap keeps its text but loses its submitting Enter to boot-time
+/// terminal-mode churn, leaving the message sitting unsubmitted.
+pub(crate) fn claude_pane_input_ready(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    recent_non_empty_lines(&clean, CLAUDE_COMPOSER_TAIL)
+        .iter()
+        .any(|line| {
+            let trimmed = line.trim();
+            (trimmed == "❯" || trimmed.starts_with("❯ "))
+                && !claude_line_is_numbered_choice(trimmed)
+        })
+}
+
+/// `message` is sitting unsubmitted in the Claude composer: the paste landed
+/// but the submitting Enter was swallowed (the post-restart boot race). The
+/// composer renders the draft on its `❯` prompt line, so match a bounded
+/// prefix of the message's first line right after the cursor. Requiring the
+/// message's own text keeps an unrelated draft (someone else's half-typed
+/// input) from drawing a recovery Enter that would submit text the caller
+/// does not own.
+pub(crate) fn claude_message_stuck_in_composer(raw_content: &str, message: &str) -> bool {
+    let Some(prefix) = claude_message_prefix(message) else {
+        return false;
+    };
+    let clean = strip_ansi(raw_content);
+    recent_non_empty_lines(&clean, CLAUDE_COMPOSER_TAIL)
+        .iter()
+        .any(|line| {
+            line.trim()
+                .strip_prefix('❯')
+                .map(str::trim_start)
+                .is_some_and(|draft| draft.starts_with(&prefix))
+        })
+}
+
+/// How many times `message` appears in the capture as a SUBMITTED prompt:
+/// Claude echoes each user turn into the transcript as a `>`-prefixed line.
+/// A composer draft (`❯ ...`) and a prose mention do not count. The restart
+/// wake worker compares this before and after a send, because a `--resume`
+/// re-renders the transcript tail and, for a routinely restarted session,
+/// that tail already carries an earlier restart's wake: only an echo that
+/// appeared after this send proves the prompt consumed it.
+pub(crate) fn claude_submitted_message_count(raw_content: &str, message: &str) -> usize {
+    let Some(prefix) = claude_message_prefix(message) else {
+        return 0;
+    };
+    let clean = strip_ansi(raw_content);
+    clean
+        .lines()
+        .filter(|line| {
+            line.trim()
+                .strip_prefix('>')
+                .map(str::trim_start)
+                .is_some_and(|echo| echo.starts_with(&prefix))
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4856,5 +5004,223 @@ path: /workspace/secrets.env
             detect_antigravity_status("random output text"),
             Status::Idle
         );
+    }
+
+    // --- restart-wake pane classifiers (guarded auto-resume) -----------------
+    //
+    // Pure detectors the restart wake worker drives its decisions from. The
+    // fixtures are live captures: the resume picker a `--resume` of a
+    // compacted session lands on, the composer at boot, and the swallowed-Enter
+    // outcome of pasting into a pane whose composer had not rendered yet.
+
+    #[test]
+    fn resume_picker_detected_on_live_menu_with_ansi() {
+        let pane = "\
+  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.
+\x1b[36m  ❯ 1. Resume from summary (recommended)\x1b[0m
+    2. Resume full session as-is";
+        assert!(claude_pane_has_resume_picker(pane));
+    }
+
+    #[test]
+    fn resume_picker_detected_on_either_option_line() {
+        assert!(claude_pane_has_resume_picker(
+            "   2. Resume full session as-is"
+        ));
+        assert!(claude_pane_has_resume_picker(
+            " > 1. Resume from summary (recommended)"
+        ));
+    }
+
+    #[test]
+    fn resume_picker_not_confused_by_prose_quote() {
+        // A turn discussing the picker quotes its option text without the
+        // numbered-choice shape: not a live menu.
+        let pane = "\
+⏺ The daemon reports \"Resume from summary\" panes as Waiting, and a pane
+  that says \"resume full session\" in prose is not the picker.
+
+ ❯ ";
+        assert!(!claude_pane_has_resume_picker(pane));
+        assert!(!claude_pane_has_resume_picker(""));
+    }
+
+    #[test]
+    fn resume_picker_only_scans_the_recent_window() {
+        // A picker that scrolled 40 non-empty lines up was already answered.
+        let mut pane = String::from("  ❯ 1. Resume from summary (recommended)\n");
+        for i in 0..40 {
+            pane.push_str(&format!("⏺ output line {i}\n"));
+        }
+        pane.push_str(" ❯ ");
+        assert!(!claude_pane_has_resume_picker(&pane));
+    }
+
+    #[test]
+    fn input_ready_on_fresh_composer() {
+        // A freshly booted pane whose composer has rendered: the lone `❯`
+        // prompt line between the box rules, mode footer below. This is the
+        // "truly ready" state a post-restart send must wait for; the shell
+        // being gone is ~600ms too early, and a paste landing in that gap
+        // loses its submitting Enter.
+        let pane = "\
+ ▐▛███▜▌   Claude Code v2.1.197
+▝▜█████▛▘  Sonnet 4.5 · Claude Max
+  ▘▘ ▝▝    /home/user/project
+
+────────────────────────────────────────────────────────
+ ❯
+────────────────────────────────────────────────────────
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn input_ready_on_composer_with_placeholder() {
+        let pane = "\
+────────────────────────────────
+ ❯ Try \"fix lint errors\"
+────────────────────────────────";
+        assert!(claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn input_ready_false_while_booting() {
+        // Mid-boot: the version banner is up but the composer has not
+        // rendered. A send now is exactly the race being fixed.
+        let pane = "\
+ ▐▛███▜▌   Claude Code v2.1.197
+▝▜█████▛▘  Sonnet 4.5 · Claude Max
+  ▘▘ ▝▝    /home/user/project";
+        assert!(!claude_pane_input_ready(pane));
+        assert!(!claude_pane_input_ready(""));
+        assert!(!claude_pane_input_ready("\n\n\n"));
+    }
+
+    #[test]
+    fn input_ready_false_on_numbered_menus() {
+        // The folder-trust dialog and the resume picker both render a `❯`
+        // cursor, but on a numbered choice: pasting a message there types
+        // into a menu, not the composer.
+        let trust = "\
+ Do you trust the files in this folder?
+
+ /home/user/project
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit";
+        assert!(!claude_pane_input_ready(trust));
+        let picker = "\
+  We recommend resuming from a summary.
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is";
+        assert!(!claude_pane_input_ready(picker));
+    }
+
+    #[test]
+    fn input_ready_with_ansi_during_running_turn() {
+        // Mid-turn the composer stays rendered below the spinner (steering
+        // input is legitimate), and a live capture carries ANSI.
+        let pane = "\x1b[2m✶ Working… (4s · ↓ 88 tokens)\x1b[0m\n\
+────────────────────────────────\n\
+\x1b[1m ❯ \x1b[0m\n\
+────────────────────────────────\n\
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_pane_input_ready(pane));
+    }
+
+    #[test]
+    fn stuck_in_composer_on_swallowed_enter() {
+        // The boot race outcome observed live: the paste landed in the
+        // composer but the trailing Enter was consumed by boot-time
+        // terminal-mode churn, so the message sits unsubmitted after `❯`.
+        let pane = "\
+────────────────────────────────────────────────────────
+ ❯ wake up: pick up what you were doing
+────────────────────────────────────────────────────────
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_message_stuck_in_composer(
+            pane,
+            "wake up: pick up what you were doing"
+        ));
+    }
+
+    #[test]
+    fn stuck_in_composer_matches_bounded_prefix_and_first_line() {
+        // A long message wraps on the composer line; only a bounded prefix of
+        // its first line is required. A multi-line message matches on line 1.
+        let long = "STATUS UPDATE: please re-verify the gateway health probe and report the exact timestamp delta";
+        let pane = " ❯ STATUS UPDATE: please re-verify the gateway health probe and report the exa\n   ⏵⏵ bypass permissions on";
+        assert!(claude_message_stuck_in_composer(pane, long));
+        let multi = "line one of the work order\nline two detail";
+        let pane = " ❯ line one of the work order\n   ⏵⏵ bypass permissions on";
+        assert!(claude_message_stuck_in_composer(pane, multi));
+    }
+
+    #[test]
+    fn stuck_in_composer_false_on_empty_or_unrelated_draft() {
+        // Submitted: the composer is back to a bare prompt. Unrelated: someone
+        // else's draft; pressing Enter for it would submit text this worker
+        // does not own.
+        let empty = "────────────────\n ❯ \n────────────────";
+        assert!(!claude_message_stuck_in_composer(empty, "wake up: pick up"));
+        assert!(!claude_message_stuck_in_composer(empty, ""));
+        let other = " ❯ an unrelated half-typed draft\n   ⏵⏵ bypass permissions on";
+        assert!(!claude_message_stuck_in_composer(other, "wake up: pick up"));
+    }
+
+    #[test]
+    fn stuck_in_composer_ignores_the_transcript_echo() {
+        // Once submitted, Claude echoes the prompt as a `>` transcript line.
+        // That is a consumed message, not a stuck draft.
+        let pane = "\
+> wake up: pick up what you were doing
+
+⏺ Picking up where I left off…
+────────────────
+ ❯ 
+────────────────";
+        assert!(!claude_message_stuck_in_composer(
+            pane,
+            "wake up: pick up what you were doing"
+        ));
+    }
+
+    #[test]
+    fn submitted_message_count_counts_transcript_echoes_only() {
+        let msg = "wake up: pick up what you were doing";
+        assert_eq!(claude_submitted_message_count("", msg), 0);
+        assert_eq!(claude_submitted_message_count("anything", ""), 0);
+        // One echo from a prior restart in scrollback, one from this one.
+        let pane = "\
+> wake up: pick up what you were doing
+
+⏺ Earlier turn from the previous restart.
+
+\x1b[1m>\x1b[0m wake up: pick up what you were doing
+
+⏺ Picking up where I left off…
+────────────────
+ ❯ 
+────────────────";
+        assert_eq!(claude_submitted_message_count(pane, msg), 2);
+        // The composer draft and a prose mention are not submissions.
+        let not_submitted = "\
+⏺ I will say wake up: pick up what you were doing when asked.
+ ❯ wake up: pick up what you were doing";
+        assert_eq!(claude_submitted_message_count(not_submitted, msg), 0);
+    }
+
+    #[test]
+    fn numbered_choice_line_shape() {
+        assert!(claude_line_is_numbered_choice(
+            "❯ 1. Yes, I trust this folder"
+        ));
+        assert!(claude_line_is_numbered_choice("   2. No, exit"));
+        assert!(claude_line_is_numbered_choice("> 3. Something"));
+        assert!(!claude_line_is_numbered_choice("❯ "));
+        assert!(!claude_line_is_numbered_choice("1.5 seconds elapsed"));
+        assert!(!claude_line_is_numbered_choice("10. tenth item"));
+        assert!(!claude_line_is_numbered_choice("version 2. released"));
     }
 }
