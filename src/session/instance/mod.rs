@@ -36,6 +36,7 @@ pub use execution::{
     ConversationBinding, ConversationProvenance, ExecutionBinding, ExecutionLocation,
 };
 mod flags;
+mod folder_trust;
 mod hooks;
 mod identity_sidecar;
 mod kill;
