@@ -355,6 +355,10 @@ pub struct AppState {
     /// graceful drain open until the browser tab decides to disconnect.
     /// See #1198.
     pub shutdown: CancellationToken,
+    /// Live account identity + usage per config dir and per session, refreshed
+    /// by `account_usage::spawn_account_usage_loop`. Read by `/api/sessions`
+    /// and `/api/accounts`. See WO#1852.
+    pub account_cache: Arc<RwLock<super::account_usage::AccountCache>>,
     /// Process-wide file-watch primitive. Threaded into `Storage::new` so
     /// in-process writes surface immediately via `notify_local_change`,
     /// and used to register per-profile `subscribe_channel` watches that

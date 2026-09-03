@@ -1,9 +1,16 @@
 //! `agent-of-empires status` command implementation
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
 use clap::Args;
 use serde::Serialize;
 
+use crate::session::account::{
+    daemon_usage_map, discover_account_dirs, local_session_accounts, now_ms, read_identity,
+    record_config_dir, tool_has_config_dir, AccountIdentity, SessionAccount, UsageSnapshot,
+};
 use crate::session::{Status, Storage};
 
 #[derive(Args)]
@@ -39,6 +46,94 @@ struct StatusJson {
     stopped: usize,
     error: usize,
     total: usize,
+    /// Every account this profile can reach — the bound config dir, its
+    /// sibling account dirs and the default dir — with the identity its
+    /// `/status` tab would show and the daemon's cached usage meters. An
+    /// account with no sessions still reports, so a mover can see where
+    /// there is room. (WO#1852)
+    accounts: Vec<AccountStatusJson>,
+    /// One row per session: status plus the same flattened account view
+    /// `aoe list --json` and `/api/sessions` carry.
+    sessions: Vec<SessionStatusJson>,
+}
+
+#[derive(Serialize)]
+struct AccountStatusJson {
+    #[serde(flatten)]
+    identity: AccountIdentity,
+    /// Sessions in this profile on this account: live process binding
+    /// when there is one, else the profile's recorded binding.
+    live_sessions: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsageSnapshot>,
+}
+
+#[derive(Serialize)]
+struct SessionStatusJson {
+    id: String,
+    title: String,
+    tool: String,
+    status: &'static str,
+    #[serde(flatten)]
+    account: SessionAccount,
+}
+
+/// Account rows for `dirs`, counting the sessions on each by canonical
+/// config dir. `identity` and `usage` answer by dir so this stays pure.
+fn account_rows(
+    dirs: Vec<PathBuf>,
+    sessions: &HashMap<String, SessionAccount>,
+    usage: &HashMap<String, UsageSnapshot>,
+    mut identity: impl FnMut(&Path) -> AccountIdentity,
+) -> Vec<AccountStatusJson> {
+    dirs.into_iter()
+        .map(|dir| {
+            let id = identity(&dir);
+            let live_sessions = sessions
+                .values()
+                .filter(|a| a.account_config_dir.as_deref() == Some(id.config_dir.as_str()))
+                .count();
+            AccountStatusJson {
+                live_sessions,
+                usage: usage.get(&id.config_dir).cloned(),
+                identity: id,
+            }
+        })
+        .collect()
+}
+
+fn session_rows(
+    instances: &[crate::session::Instance],
+    accounts: &mut HashMap<String, SessionAccount>,
+) -> Vec<SessionStatusJson> {
+    instances
+        .iter()
+        .map(|inst| SessionStatusJson {
+            id: inst.id.clone(),
+            title: inst.title.clone(),
+            tool: inst.tool.clone(),
+            status: inst.status.as_str(),
+            account: accounts.remove(&inst.id).unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// The config dirs to discover accounts from: the profile's binding for
+/// every account-bearing tool in use, and always claude's, so a profile
+/// with no sessions still reports its accounts.
+fn bound_dirs(profile: &str, instances: &[crate::session::Instance]) -> Vec<PathBuf> {
+    let mut tools: Vec<&str> = instances
+        .iter()
+        .map(|i| i.tool.as_str())
+        .filter(|t| tool_has_config_dir(t))
+        .collect();
+    tools.push("claude");
+    tools.sort_unstable();
+    tools.dedup();
+    tools
+        .into_iter()
+        .filter_map(|t| record_config_dir(profile, t))
+        .collect()
 }
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
@@ -49,12 +144,9 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
         inst.source_profile = storage.profile().to_string();
     }
 
-    if instances.is_empty() {
-        if args.json {
-            println!(
-                r#"{{"waiting": 0, "running": 0, "idle": 0, "stopped": 0, "error": 0, "total": 0}}"#
-            );
-        } else if args.quiet {
+    // `--json` falls through: zero sessions still has accounts to report.
+    if instances.is_empty() && !args.json {
+        if args.quiet {
             println!("0");
         } else {
             println!("No sessions in profile '{}'.", storage.profile());
@@ -79,6 +171,15 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     let counts = count_by_status(&instances);
 
     if args.json {
+        let usage = daemon_usage_map().await;
+        let mut per_session = local_session_accounts(&instances, profile, &usage);
+        let now = now_ms();
+        let accounts = account_rows(
+            discover_account_dirs(bound_dirs(profile, &instances)),
+            &per_session,
+            &usage,
+            |dir| read_identity(dir, now),
+        );
         let status_json = StatusJson {
             waiting: counts.waiting,
             running: counts.running,
@@ -86,6 +187,8 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
             stopped: counts.stopped,
             error: counts.error,
             total: counts.total,
+            accounts,
+            sessions: session_rows(&instances, &mut per_session),
         };
         println!("{}", serde_json::to_string(&status_json)?);
     } else if args.quiet {
@@ -168,4 +271,79 @@ fn shorten_path(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::account::AccountSource;
+
+    fn identity(dir: &Path) -> AccountIdentity {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        AccountIdentity {
+            account: name.clone(),
+            config_dir: dir.to_string_lossy().into_owned(),
+            email: Some(format!("{name}@example.test")),
+            org: None,
+            credential_state: "ok".into(),
+            expires_at: None,
+        }
+    }
+
+    fn on(dir: &str) -> SessionAccount {
+        SessionAccount {
+            account_dir: Some(dir.rsplit('/').next().unwrap().to_string()),
+            account_config_dir: Some(dir.to_string()),
+            account_source: Some(AccountSource::Live),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn every_account_reports_with_its_session_count_and_usage_even_at_zero() {
+        let a = "/accts/a-main";
+        let b = "/accts/b-main";
+        let sessions: HashMap<String, SessionAccount> = [
+            ("s1".to_string(), on(a)),
+            ("s2".to_string(), on(a)),
+            ("s3".to_string(), SessionAccount::default()),
+        ]
+        .into_iter()
+        .collect();
+        let usage: HashMap<String, UsageSnapshot> = [(
+            b.to_string(),
+            UsageSnapshot {
+                fable_pct: Some(97),
+                read_at: 5,
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let rows = account_rows(
+            vec![PathBuf::from(a), PathBuf::from(b)],
+            &sessions,
+            &usage,
+            identity,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].identity.account.as_str(), rows[0].live_sessions),
+            ("a-main", 2)
+        );
+        assert!(
+            rows[0].usage.is_none(),
+            "no daemon row -> unknown, never zero"
+        );
+        assert_eq!(
+            (rows[1].identity.account.as_str(), rows[1].live_sessions),
+            ("b-main", 0)
+        );
+        assert_eq!(rows[1].usage.as_ref().and_then(|u| u.fable_pct), Some(97));
+        let json = serde_json::to_value(&rows[1]).unwrap();
+        assert_eq!(json["email"], "b-main@example.test");
+        assert_eq!(json["live_sessions"], 0);
+        assert_eq!(json["usage"]["fable_pct"], 97);
+        assert!(json.get("token").is_none() && json.get("access_token").is_none());
+    }
 }

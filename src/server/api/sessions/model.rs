@@ -274,6 +274,13 @@ pub struct SessionResponse {
     /// badge tooltip. Only set when `monitor_active` is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor_description: Option<String>,
+    /// Which account the session's LIVE process is on (email/org read from
+    /// the running agent's `CLAUDE_CONFIG_DIR`), its cached usage meters,
+    /// and whether that differs from the profile's recorded binding. Filled
+    /// by the daemon's account-usage cache; empty for tools without a
+    /// config-dir env var.
+    #[serde(flatten)]
+    pub account: crate::session::account::SessionAccount,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -498,6 +505,7 @@ impl SessionResponse {
             next_wakeup_reason,
             monitor_active,
             monitor_description,
+            account: Default::default(),
         }
     }
 }

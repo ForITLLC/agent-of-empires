@@ -423,6 +423,9 @@ struct SessionDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
     profile: String,
+    /// Live account + usage view (WO#1852); same keys as `/api/sessions`.
+    #[serde(flatten)]
+    account: crate::session::account::SessionAccount,
 }
 
 fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
@@ -442,6 +445,7 @@ fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
         agent_session_id: inst.agent_session_id.clone(),
         parent_session_id: inst.parent_session_id.clone(),
         profile: profile.to_string(),
+        account: Default::default(),
     }
 }
 
@@ -2234,7 +2238,17 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     inst.self_heal_session_id(profile, &contended);
 
     if args.json {
-        super::output::print_json(&session_details(&inst, storage.profile()))?;
+        let mut details = session_details(&inst, storage.profile());
+        let usage = crate::session::account::daemon_usage_map().await;
+        let mut map = crate::session::account::local_session_accounts(
+            std::iter::once(&inst),
+            storage.profile(),
+            &usage,
+        );
+        if let Some(a) = map.remove(&inst.id) {
+            details.account = a;
+        }
+        super::output::print_json(&details)?;
     } else {
         println!("Session: {}", inst.title);
         println!("  ID:      {}", inst.id);
