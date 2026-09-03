@@ -1,5 +1,6 @@
 //! tmux integration module
 
+pub(crate) mod composer;
 pub(crate) mod composite;
 pub(crate) mod detect;
 pub(crate) mod env;
@@ -17,6 +18,7 @@ pub(crate) mod utils;
 #[cfg(unix)]
 pub(crate) mod vt;
 
+pub use composer::{ParkedDraftRefusal, SubmitUnconfirmed};
 pub use composite::PaneGeom;
 pub(crate) use session::{peel_trailing_semicolons, submit_text, SubmitText};
 pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
