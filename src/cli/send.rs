@@ -95,7 +95,12 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     );
 
     let delay = crate::agents::send_keys_enter_delay(&tool);
-    tmux_session.send_keys_with_delay(&args.message, delay)?;
+    // Verified send: waits for the Claude composer, REFUSES if an operator's
+    // unsent draft is parked in it (the refusal names the draft's size,
+    // never its text, and exits non-zero), and confirms the Enter landed.
+    // There is deliberately no --force: forcing would submit the human's
+    // words under their name.
+    tmux_session.send_keys_verified(&args.message, delay, &tool)?;
     // Delivered: acknowledge the hook-written urgent flag (sticky kinds
     // survive machine traffic — see `hooks::ack_hook_urgent_on_send`).
     let urgent_ack = crate::hooks::ack_hook_urgent_on_send(&session_id, &args.message);

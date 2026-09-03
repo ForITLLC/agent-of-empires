@@ -7,6 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{
+    composer::{
+        classify_machine_draft, claude_composer_draft, claude_message_stuck_in_composer,
+        claude_pane_input_ready, MachineDraft, ParkedDraftRefusal, SubmitUnconfirmed,
+        DRAFT_TIMEOUT, MAX_SUBMIT_RETRIES, READY_POLL, READY_TIMEOUT, VERIFY_CAPTURE_LINES,
+        VERIFY_SETTLE,
+    },
     composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
     utils::{
@@ -1434,6 +1440,139 @@ impl Session {
         Self::tmux_send(&target, &["Enter"])?;
 
         Ok(())
+    }
+
+    /// Like [`send_keys_with_delay`](Self::send_keys_with_delay), but for a
+    /// Claude Code pane it (1) waits for the composer to be rendered and
+    /// accepting input, (2) REFUSES when the composer already holds text the
+    /// operator has not sent, and (3) confirms the submit landed, re-sending
+    /// a bare Enter when the paste arrived but its Enter was swallowed.
+    ///
+    /// The refusal is the point. An injected send types into the same input
+    /// box a human may be mid-sentence in; pasting into it fuses the two and
+    /// the trailing Enter submits the merged blob under the human's name.
+    /// The refusal is returned as a [`ParkedDraftRefusal`] (downcastable
+    /// through `anyhow`) carrying the draft's size and never its text.
+    ///
+    /// Other tools fall through to the plain send: their composers are not
+    /// read here.
+    pub fn send_keys_verified(&self, text: &str, enter_delay_ms: u64, tool: &str) -> Result<()> {
+        self.send_keys_verified_with_history(text, enter_delay_ms, tool, &[])
+    }
+
+    /// [`send_keys_verified`](Self::send_keys_verified) with the pane's
+    /// recent machine-sent messages, so a PRIOR machine message parked
+    /// unsubmitted (its Enter swallowed by a boot race) is recognised and
+    /// submitted bare rather than refused as a human draft. Anything not
+    /// provably machine text stays a human draft.
+    pub fn send_keys_verified_with_history(
+        &self,
+        text: &str,
+        enter_delay_ms: u64,
+        tool: &str,
+        machine_history: &[String],
+    ) -> Result<()> {
+        if tool != "claude" {
+            return self.send_keys_with_delay(text, enter_delay_ms);
+        }
+        if !self.exists() {
+            bail!("Session does not exist: {}", self.name);
+        }
+
+        // Phase 1: the composer must be rendered. Measured on a live boot,
+        // the pane's shell is replaced ~600ms before the composer renders and
+        // a paste landing in that gap keeps its text but loses its Enter.
+        let ready_deadline = Instant::now() + READY_TIMEOUT;
+        let mut content = self.capture_pane(VERIFY_CAPTURE_LINES)?;
+        while !claude_pane_input_ready(&content) {
+            if Instant::now() >= ready_deadline {
+                tracing::warn!(target: "tmux.command",
+                    "send_keys_verified: composer not ready within {:?} for {}; sending anyway",
+                    READY_TIMEOUT, self.name);
+                break;
+            }
+            std::thread::sleep(READY_POLL);
+            content = self.capture_pane(VERIFY_CAPTURE_LINES)?;
+        }
+
+        // Phase 2: nothing unsent may be sitting in the composer. Machine
+        // text (this send's own earlier attempt, or a prior machine message)
+        // is completed with a bare Enter; anything else is a human's and is
+        // refused once the draft window elapses.
+        let draft_deadline = Instant::now() + DRAFT_TIMEOUT;
+        while let Some(draft) = claude_composer_draft(&content) {
+            match classify_machine_draft(&draft, text, machine_history) {
+                MachineDraft::Outgoing => {
+                    tracing::info!(target: "tmux.command",
+                        "send_keys_verified: outgoing text already parked in {}; submitting bare Enter",
+                        self.name);
+                    return self.submit_parked(text, tool, false);
+                }
+                MachineDraft::Prior => {
+                    tracing::info!(target: "tmux.command",
+                        "send_keys_verified: prior machine message parked in {}; submitting it first",
+                        self.name);
+                    self.submit_parked(&draft, tool, true)?;
+                    content = self.capture_pane(VERIFY_CAPTURE_LINES)?;
+                }
+                MachineDraft::No => {
+                    if Instant::now() >= draft_deadline {
+                        let refusal = ParkedDraftRefusal::from_draft(&draft);
+                        tracing::warn!(target: "tmux.command",
+                            "send_keys_verified: refusing send to {}: {refusal}", self.name);
+                        return Err(refusal.into());
+                    }
+                    std::thread::sleep(READY_POLL);
+                    content = self.capture_pane(VERIFY_CAPTURE_LINES)?;
+                }
+            }
+        }
+
+        // Phase 3: type + Enter, then Phase 4: confirm the Enter registered.
+        self.send_keys_with_delay(text, enter_delay_ms)?;
+        self.confirm_submitted(text, tool, false)
+    }
+
+    /// Submits text already parked in the composer with a bare Enter and
+    /// confirms it left. Never pastes: the text is already there.
+    fn submit_parked(&self, parked: &str, tool: &str, prior: bool) -> Result<()> {
+        let target = format!("{}:^.0", self.name);
+        Self::tmux_send(&target, &["Enter"])?;
+        self.confirm_submitted(parked, tool, prior)
+    }
+
+    /// The submit is confirmed when the agent is visibly running the turn or
+    /// the message is no longer on the composer's prompt row. A message still
+    /// parked there gets a bounded number of bare-Enter resends; if it is
+    /// STILL parked afterwards the result is [`SubmitUnconfirmed`], never a
+    /// silent `Ok` — the API must not answer `sent: true` for text the
+    /// target never received.
+    fn confirm_submitted(&self, text: &str, tool: &str, prior: bool) -> Result<()> {
+        let target = format!("{}:^.0", self.name);
+        let mut attempts = 0u32;
+        loop {
+            std::thread::sleep(VERIFY_SETTLE);
+            let content = self.capture_pane(VERIFY_CAPTURE_LINES)?;
+            let running = super::status_detection::detect_status_from_content(&content, tool)
+                == Status::Running;
+            if running || !claude_message_stuck_in_composer(&content, text) {
+                return Ok(());
+            }
+            if attempts >= MAX_SUBMIT_RETRIES {
+                let unconfirmed = SubmitUnconfirmed {
+                    attempts,
+                    prior_machine_message: prior,
+                };
+                tracing::warn!(target: "tmux.command",
+                    "send_keys_verified: {} for {}", unconfirmed, self.name);
+                return Err(unconfirmed.into());
+            }
+            attempts += 1;
+            tracing::warn!(target: "tmux.command",
+                "send_keys_verified: message parked unsubmitted in {}; bare-Enter resend {attempts}/{MAX_SUBMIT_RETRIES}",
+                self.name);
+            Self::tmux_send(&target, &["Enter"])?;
+        }
     }
 
     /// Sends exactly the given token sequence to the pane, in order, with no

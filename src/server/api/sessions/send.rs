@@ -25,12 +25,87 @@ fn default_revive() -> bool {
     true
 }
 
+#[derive(Debug)]
 enum SendKeysError {
     NotRunning,
     ResumeFailed(String),
     Transient(Status),
     StructuredView,
+    /// The composer held an operator's unsent draft; NOTHING was typed.
+    /// Distinct from `Tmux` because delivery state is CERTAIN (not sent)
+    /// and a retry is safe once the composer clears.
+    ParkedDraft(crate::tmux::ParkedDraftRefusal),
+    /// The text was typed but its submitting Enter never registered after
+    /// the resend budget: typed, not submitted.
+    SubmitUnconfirmed(crate::tmux::SubmitUnconfirmed),
     Tmux(anyhow::Error),
+}
+
+/// The HTTP status + body for a failed send. Pure so the wire contract is
+/// unit-testable without a pane: callers (fleet tooling, `aoe send` over
+/// the daemon) branch on `error` and `sent`, and a parked-draft refusal
+/// must never be mistakable for a transport failure.
+fn send_error_parts(err: &SendKeysError) -> (StatusCode, serde_json::Value) {
+    match err {
+        SendKeysError::NotRunning => (
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": "session_not_running"}),
+        ),
+        SendKeysError::ResumeFailed(sid) => (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "resume_failed",
+                "message": format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                "resume_session_id": sid,
+            }),
+        ),
+        SendKeysError::Transient(status) => (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "session_transient",
+                "status": format!("{status:?}"),
+            }),
+        ),
+        SendKeysError::StructuredView => (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "acp_mode_unsupported"}),
+        ),
+        // 423 Locked: the resource (the composer) is held by someone else.
+        // Never the draft's text — only its size, so the operator can
+        // recognise their own half-written message.
+        SendKeysError::ParkedDraft(refusal) => (
+            StatusCode::LOCKED,
+            serde_json::json!({
+                "error": "parked_draft",
+                "reason": "operator_draft_in_composer",
+                "sent": false,
+                "retry_safe": true,
+                "retry_when": "composer_clear",
+                "draft_chars": refusal.chars,
+                "draft_lines": refusal.lines,
+                "detail": refusal.to_string(),
+            }),
+        ),
+        // 502: the pane (the upstream) accepted the text but not the submit.
+        // A retry of the SAME message submits the parked copy instead of
+        // double-pasting, so it is safe to retry.
+        SendKeysError::SubmitUnconfirmed(unconfirmed) => (
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({
+                "error": "submit_unconfirmed",
+                "sent": false,
+                "typed": true,
+                "retry_safe": true,
+                "attempts": unconfirmed.attempts,
+                "prior_machine_message": unconfirmed.prior_machine_message,
+                "detail": unconfirmed.to_string(),
+            }),
+        ),
+        SendKeysError::Tmux(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error": "tmux_error"}),
+        ),
+    }
 }
 
 /// Ok carries the urgent-flag acknowledgement so the response can say
@@ -150,8 +225,17 @@ pub async fn send_message(
             return Err(Box::new((inst_owned, outcome, SendKeysError::NotRunning)));
         }
         let delay = crate::agents::send_keys_enter_delay(&tool);
-        if let Err(e) = tmux_session.send_keys_with_delay(&message, delay) {
-            return Err(Box::new((inst_owned, outcome, SendKeysError::Tmux(e))));
+        if let Err(e) = tmux_session.send_keys_verified(&message, delay, &tool) {
+            // Typed refusals cross the anyhow boundary intact; everything
+            // else is a transport failure.
+            let mapped = match e.downcast::<crate::tmux::ParkedDraftRefusal>() {
+                Ok(refusal) => SendKeysError::ParkedDraft(refusal),
+                Err(e) => match e.downcast::<crate::tmux::SubmitUnconfirmed>() {
+                    Ok(unconfirmed) => SendKeysError::SubmitUnconfirmed(unconfirmed),
+                    Err(e) => SendKeysError::Tmux(e),
+                },
+            };
+            return Err(Box::new((inst_owned, outcome, mapped)));
         }
         // Delivery is the authoritative "someone is handling this": clear the
         // hook-written urgent flag here, on the daemon, so every sender (TUI,
@@ -225,7 +309,7 @@ pub async fn send_message(
             // touch fields the live entry needs to reflect (fresh sid from
             // acquire, last_start_time, etc.). Sync only when work happened.
             let did_work = !matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
-            match send_err {
+            match &send_err {
                 SendKeysError::NotRunning => {
                     // External kill or remain-on-exit-off crash can race
                     // ensure_pane_ready's Alive decision against the
@@ -240,40 +324,36 @@ pub async fn send_message(
                             apply_cascade_state_sync(i, &sync_base, &started);
                         }
                     }
-                    (
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({"error": "session_not_running"})),
-                    )
-                        .into_response()
                 }
-                SendKeysError::ResumeFailed(sid) => {
+                SendKeysError::ResumeFailed(_) => {
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                         apply_post_restart_sync(i, &sync_base, &started);
                     }
-                    (
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({
-                            "error": "resume_failed",
-                            "message": format!("Resume failed for sid {sid}; preserved for explicit retry"),
-                            "resume_session_id": sid,
-                        })),
-                    )
-                        .into_response()
                 }
-                SendKeysError::Transient(status) => (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "session_transient",
-                        "status": format!("{status:?}"),
-                    })),
-                )
-                    .into_response(),
-                SendKeysError::StructuredView => (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "acp_mode_unsupported"})),
-                )
-                    .into_response(),
+                SendKeysError::Transient(_) | SendKeysError::StructuredView => {}
+                SendKeysError::ParkedDraft(refusal) => {
+                    // Nothing was typed and the session is healthy: no status
+                    // or last_error paint. A refusal is not a session error;
+                    // painting one would tell every observer the pane broke
+                    // when a human is simply mid-sentence in it.
+                    tracing::info!(target: "http.api.sessions", "send_message: refused for {id}: {refusal}");
+                    if did_work {
+                        let mut instances = state.instances.write().await;
+                        if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
+                            apply_cascade_state_sync(i, &sync_base, &started);
+                        }
+                    }
+                }
+                SendKeysError::SubmitUnconfirmed(unconfirmed) => {
+                    tracing::warn!(target: "http.api.sessions", "send_message: {id}: {unconfirmed}");
+                    if did_work {
+                        let mut instances = state.instances.write().await;
+                        if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
+                            apply_cascade_state_sync(i, &sync_base, &started);
+                        }
+                    }
+                }
                 SendKeysError::Tmux(e) => {
                     tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
                     let msg = e.to_string();
@@ -293,13 +373,10 @@ pub async fn send_message(
                             i.last_error = Some(msg);
                         }
                     }
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "tmux_error"})),
-                    )
-                        .into_response()
                 }
             }
+            let (status, body) = send_error_parts(&send_err);
+            (status, Json(body)).into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "send_message: blocking task panicked for {id}: {e}");
@@ -743,4 +820,84 @@ pub async fn urgent_ack_session(
         "urgent": urgent,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod send_error_contract_tests {
+    use super::*;
+
+    /// A parked-draft refusal is 423 Locked with a machine-readable body
+    /// that says NOT SENT, safe to retry, and when — and carries the draft's
+    /// size, never its text.
+    #[test]
+    fn parked_draft_is_423_locked_and_withholds_the_draft() {
+        let draft = "yes, authorize the vendor bump and send the escalation emails";
+        let refusal = crate::tmux::ParkedDraftRefusal::from_draft(draft);
+        let (status, body) = send_error_parts(&SendKeysError::ParkedDraft(refusal));
+        assert_eq!(status, StatusCode::LOCKED);
+        assert_eq!(body["error"], "parked_draft");
+        assert_eq!(body["reason"], "operator_draft_in_composer");
+        assert_eq!(body["sent"], false);
+        assert_eq!(body["retry_safe"], true);
+        assert_eq!(body["retry_when"], "composer_clear");
+        assert_eq!(body["draft_chars"], draft.chars().count());
+        assert_eq!(body["draft_lines"], 1);
+        let wire = body.to_string();
+        assert!(
+            !wire.contains("vendor"),
+            "refusal body leaked the draft: {wire}"
+        );
+        assert!(body["detail"].as_str().unwrap().contains("NOT SENT"));
+    }
+
+    /// Typed-but-unsubmitted is 502 and says so: sent=false, typed=true.
+    #[test]
+    fn submit_unconfirmed_is_502_typed_not_sent() {
+        let (status, body) = send_error_parts(&SendKeysError::SubmitUnconfirmed(
+            crate::tmux::SubmitUnconfirmed {
+                attempts: 3,
+                prior_machine_message: false,
+            },
+        ));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "submit_unconfirmed");
+        assert_eq!(body["sent"], false);
+        assert_eq!(body["typed"], true);
+        assert_eq!(body["retry_safe"], true);
+        assert_eq!(body["attempts"], 3);
+    }
+
+    /// The pre-existing arms keep their wire shape.
+    #[test]
+    fn legacy_arms_unchanged() {
+        let (s, b) = send_error_parts(&SendKeysError::NotRunning);
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("session_not_running"))
+        );
+        let (s, b) = send_error_parts(&SendKeysError::ResumeFailed("abc".into()));
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert_eq!(b["error"], "resume_failed");
+        assert_eq!(b["resume_session_id"], "abc");
+        let (s, b) = send_error_parts(&SendKeysError::Transient(Status::Starting));
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("session_transient"))
+        );
+        assert_eq!(b["status"], "Starting");
+        let (s, b) = send_error_parts(&SendKeysError::StructuredView);
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("acp_mode_unsupported"))
+        );
+        let (s, b) = send_error_parts(&SendKeysError::Tmux(anyhow::anyhow!("no server")));
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some("tmux_error"))
+        );
+        assert!(
+            b.get("sent").is_none(),
+            "transport failure must not claim a delivery state"
+        );
+    }
 }
