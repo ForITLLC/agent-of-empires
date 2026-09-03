@@ -297,7 +297,7 @@ mod tests {
         (
             "sessions/send.rs",
             include_str!("sessions/send.rs"),
-            &["send_message"],
+            &["send_message", "urgent_ack_session"],
         ),
         (
             "sessions/ensure.rs",
