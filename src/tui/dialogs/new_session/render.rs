@@ -109,6 +109,10 @@ impl NewSessionDialog {
             let error_text = format!("✗ Error: {}", error);
             let needed = (error_text.len() as u16).div_ceil(inner_width as u16);
             needed.clamp(2, 6)
+        } else if self.snap_hint.is_some() {
+            // The tool ↔ profile snap notice takes a row of its own above
+            // the key hints.
+            3
         } else {
             2
         };
@@ -478,6 +482,13 @@ impl NewSessionDialog {
                 .wrap(Wrap { trim: true });
             frame.render_widget(error_paragraph, chunks[hint_chunk]);
         } else {
+            let mut lines = Vec::new();
+            if let Some(snap) = &self.snap_hint {
+                lines.push(Line::from(Span::styled(
+                    format!("↔ {snap}"),
+                    Style::default().fg(theme.accent),
+                )));
+            }
             let mut hint_spans = Vec::new();
             hint_spans.push(Span::styled("Tab", Style::default().fg(theme.hint)));
             hint_spans.push(Span::raw(" next  "));
@@ -539,8 +550,9 @@ impl NewSessionDialog {
             hint_spans.push(Span::raw(" help  "));
             hint_spans.push(Span::styled("Esc", Style::default().fg(theme.hint)));
             hint_spans.push(Span::raw(" cancel"));
+            lines.push(Line::from(hint_spans));
             frame.render_widget(
-                Paragraph::new(Line::from(hint_spans)).wrap(Wrap { trim: true }),
+                Paragraph::new(lines).wrap(Wrap { trim: true }),
                 chunks[hint_chunk],
             );
         }

@@ -3,6 +3,7 @@
 mod group_input;
 mod path_input;
 mod render;
+mod tool_profile_bind;
 
 #[cfg(test)]
 mod tests;
@@ -44,7 +45,7 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
     },
     FieldHelp {
         name: "Profile",
-        description: "Settings profile for session defaults (Left/Right to cycle)",
+        description: "Defaults profile (Left/Right to cycle; the tool follows its default_tool)",
     },
     FieldHelp {
         name: "Title",
@@ -56,7 +57,7 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
     },
     FieldHelp {
         name: "Tool",
-        description: "Which AI tool to use (Ctrl+P to configure command and extra args)",
+        description: "AI tool (Ctrl+P to configure). Snaps Profile when one profile defaults to it",
     },
     FieldHelp {
         name: "Structured",
@@ -259,6 +260,12 @@ pub struct NewSessionDialog {
     pub(super) available_projects: Vec<crate::session::Project>,
     pub(super) dir_picker: DirPicker,
     pub(super) error_message: Option<String>,
+    /// One-line notice for the last tool ↔ profile snap (picking the
+    /// `codex` engine moved the Profile field to the `codex` profile, or
+    /// cycling to a profile moved the engine to its `default_tool`).
+    /// Rendered above the key hints; cleared on the next key or click so
+    /// it never outlives the action it explains.
+    pub(super) snap_hint: Option<String>,
     pub(super) show_help: bool,
     /// Whether the dialog is in loading state (creating session in background)
     pub(super) loading: bool,
@@ -560,6 +567,7 @@ impl NewSessionDialog {
             extra_args: Input::new(extra_args_value),
             command_override: Input::new(command_override_value),
             error_message: None,
+            snap_hint: None,
             show_help: false,
             loading: false,
             has_hooks: false,
@@ -787,7 +795,12 @@ impl NewSessionDialog {
     /// Re-resolve config defaults when the profile changes.
     /// Resets tool, yolo, sandbox, and env settings but preserves user inputs
     /// (title, path, group, worktree).
-    fn reload_config_defaults(&mut self) {
+    ///
+    /// This is the profile → tool half of the tool ↔ profile binding: the
+    /// engine snaps to the profile's resolved `session.default_tool` when
+    /// that tool is installed. Returns that resolved `default_tool` so the
+    /// caller can tell a real snap from the index-0 fallback.
+    fn reload_config_defaults(&mut self) -> Option<String> {
         let profile = self.selected_profile().to_string();
         self.profile = profile.clone();
         let config = self.resolve_config_for_path(&profile);
@@ -853,6 +866,111 @@ impl NewSessionDialog {
         self.sandbox_focused_field = 0;
         self.worktree_config_mode = false;
         self.worktree_config_focused_field = 0;
+
+        config.session.default_tool
+    }
+
+    /// Cycle the Tool field one step and apply every side effect the engine
+    /// change implies: always-yolo tools force the toggle, host-only tools
+    /// clear sandbox + worktree, the per-tool config is re-resolved, and —
+    /// the tool → profile half of the binding — the Profile field follows
+    /// the engine to the one profile whose `default_tool` it is. Shared by
+    /// the keyboard cycler and the mouse click so both surfaces snap alike.
+    fn cycle_tool(&mut self, forward: bool) {
+        let len = self.available_tools.len();
+        if len < 2 {
+            return;
+        }
+        self.tool_index = if forward {
+            (self.tool_index + 1) % len
+        } else if self.tool_index == 0 {
+            len - 1
+        } else {
+            self.tool_index - 1
+        };
+        if self.selected_tool_always_yolo() {
+            self.yolo_mode = true;
+        } else {
+            self.yolo_mode = self.yolo_mode_default;
+        }
+        if self.selected_tool_host_only() {
+            self.sandbox_enabled = false;
+            self.worktree_enabled = false;
+            self.worktree_branch.reset();
+        }
+        self.reload_tool_config();
+        self.snap_profile_to_tool();
+    }
+
+    /// Cycle the Profile field one step and re-resolve its defaults. The
+    /// engine snap itself lives in `reload_config_defaults`; this wrapper
+    /// only raises the one-line notice when that snap actually moved the
+    /// engine onto the profile's `default_tool` (the index-0 fallback for a
+    /// profile with no `default_tool` is not a snap and stays silent).
+    fn cycle_profile(&mut self, forward: bool) {
+        let len = self.available_profiles.len();
+        if len < 2 {
+            return;
+        }
+        self.profile_index = if forward {
+            (self.profile_index + 1) % len
+        } else if self.profile_index == 0 {
+            len - 1
+        } else {
+            self.profile_index - 1
+        };
+        let tool_before = self.tool_index;
+        let Some(default_tool) = self.reload_config_defaults() else {
+            return;
+        };
+        let landed_on_default = self.available_tools.get(self.tool_index) == Some(&default_tool);
+        if self.tool_index != tool_before && landed_on_default {
+            self.snap_hint = Some(format!(
+                "tool → {default_tool} ({} default_tool)",
+                self.selected_profile()
+            ));
+        }
+    }
+
+    /// Resolved `session.default_tool` for every profile the Profile field
+    /// cycles through, in lockstep with `available_profiles`. Resolved the
+    /// way `reload_config_defaults` resolves the selected profile (global +
+    /// profile + repo overrides for the current path), so each answer is
+    /// exactly the engine a cycle to that profile would pick.
+    fn profile_default_tools(&self) -> Vec<(String, Option<String>)> {
+        self.available_profiles
+            .iter()
+            .map(|name| {
+                let default_tool = self.resolve_config_for_path(name).session.default_tool;
+                (name.clone(), default_tool)
+            })
+            .collect()
+    }
+
+    /// tool → profile half of the binding. After the engine cycler lands on
+    /// a tool, move the Profile field to the one profile whose resolved
+    /// `default_tool` is that tool (`tool_profile_bind::profile_for_tool`
+    /// holds the rule), then run the same defaults reload a profile cycle
+    /// runs so that profile's `agent_extra_args`, sandbox and yolo defaults
+    /// apply. With zero or several candidate profiles nothing moves.
+    fn snap_profile_to_tool(&mut self) {
+        if !self.has_profile_selection() {
+            return;
+        }
+        let tool = self.available_tools[self.tool_index].clone();
+        let bindings = self.profile_default_tools();
+        let Some(target) =
+            tool_profile_bind::profile_for_tool(&tool, self.selected_profile(), &bindings)
+                .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(index) = self.available_profiles.iter().position(|p| *p == target) else {
+            return;
+        };
+        self.profile_index = index;
+        self.reload_config_defaults();
+        self.snap_hint = Some(format!("profile → {target} (default_tool = {tool})"));
     }
 
     #[cfg(test)]
@@ -917,6 +1035,7 @@ impl NewSessionDialog {
             extra_args: Input::default(),
             command_override: Input::default(),
             error_message: None,
+            snap_hint: None,
             show_help: false,
             loading: false,
             has_hooks: false,
@@ -990,6 +1109,7 @@ impl NewSessionDialog {
             extra_args: Input::default(),
             command_override: Input::default(),
             error_message: None,
+            snap_hint: None,
             show_help: false,
             loading: false,
             has_hooks: false,
@@ -1034,6 +1154,7 @@ impl NewSessionDialog {
     /// `handle_click` only fires on the top-level form.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<NewSessionData>> {
         let pos = ratatui::layout::Position::from((col, row));
+        self.snap_hint = None;
 
         // List pickers (group / branch / projects) float over every
         // other surface (main form AND config overlays), so route their
@@ -1212,32 +1333,14 @@ impl NewSessionDialog {
         };
 
         if self.focused_field == profile_field {
-            if self.available_profiles.len() > 1 {
-                self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
-                // Mirror the keyboard cycle: pick up the new profile's
-                // defaults (sandbox, yolo, hooks, tool override) so the
-                // dialog reflects what a submit would actually create.
-                self.reload_config_defaults();
-            }
+            // Mirror the keyboard cycle: pick up the new profile's
+            // defaults (sandbox, yolo, hooks, tool override) so the
+            // dialog reflects what a submit would actually create.
+            self.cycle_profile(true);
         } else if self.focused_field == tool_field {
-            if self.available_tools.len() > 1 {
-                self.tool_index = (self.tool_index + 1) % self.available_tools.len();
-                // Same side effects the Space/Left/Right tool handler
-                // applies: always-yolo tools force the toggle, host-only
-                // tools clear sandbox + worktree, and the per-tool config
-                // overlay (and its branch override) get re-resolved.
-                if self.selected_tool_always_yolo() {
-                    self.yolo_mode = true;
-                } else {
-                    self.yolo_mode = self.yolo_mode_default;
-                }
-                if self.selected_tool_host_only() {
-                    self.sandbox_enabled = false;
-                    self.worktree_enabled = false;
-                    self.worktree_branch.reset();
-                }
-                self.reload_tool_config();
-            }
+            // Same side effects as the Space/Left/Right tool handler,
+            // including the tool → profile snap.
+            self.cycle_tool(true);
         } else if self.focused_field == structured_field {
             self.structured_enabled = !self.structured_enabled;
         } else if self.focused_field == yolo_mode_field {
@@ -1278,6 +1381,9 @@ impl NewSessionDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
+        // A snap notice explains the key that produced it and nothing else.
+        self.snap_hint = None;
+
         // When loading, only allow Esc to cancel
         if self.loading {
             if matches!(key.code, KeyCode::Esc) {
@@ -1529,44 +1635,13 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == profile_field =>
             {
-                if self.available_profiles.len() > 1 {
-                    if key.code == KeyCode::Left {
-                        self.profile_index = if self.profile_index == 0 {
-                            self.available_profiles.len() - 1
-                        } else {
-                            self.profile_index - 1
-                        };
-                    } else {
-                        self.profile_index =
-                            (self.profile_index + 1) % self.available_profiles.len();
-                    }
-                    self.reload_config_defaults();
-                }
+                self.cycle_profile(key.code != KeyCode::Left);
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == tool_field =>
             {
-                if key.code == KeyCode::Left {
-                    self.tool_index = if self.tool_index == 0 {
-                        self.available_tools.len() - 1
-                    } else {
-                        self.tool_index - 1
-                    };
-                } else {
-                    self.tool_index = (self.tool_index + 1) % self.available_tools.len();
-                }
-                if self.selected_tool_always_yolo() {
-                    self.yolo_mode = true;
-                } else {
-                    self.yolo_mode = self.yolo_mode_default;
-                }
-                if self.selected_tool_host_only() {
-                    self.sandbox_enabled = false;
-                    self.worktree_enabled = false;
-                    self.worktree_branch.reset();
-                }
-                self.reload_tool_config();
+                self.cycle_tool(key.code != KeyCode::Left);
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
