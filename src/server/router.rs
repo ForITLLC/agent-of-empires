@@ -389,8 +389,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/manifest.json", get(serve_public_file))
         .route("/sw.js", get(serve_public_file))
         .route("/icon-192.png", get(serve_public_file))
-        .route("/icon-512.png", get(serve_public_file))
-        .fallback(get(serve_index));
+        .route("/icon-512.png", get(serve_public_file));
+
+    // Fallback: an unmatched `/api/*` path fails closed with a JSON 404 so an
+    // automation probe can never read the SPA shell (or an empty body) as an
+    // API answer. Every other unmatched path keeps SPA semantics under `web`.
+    let app = app.fallback(spa_or_api_fallback);
 
     app.layer(axum::middleware::from_fn_with_state(
         state.clone(),
@@ -410,9 +414,46 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
     .with_state(state)
 }
 
+/// Router fallback. An unmatched `/api/*` path answers a JSON 404: the API
+/// surface fails closed, because serving the SPA shell there let a typoed or
+/// retired route read as `200 text/html` to any consumer that only checked
+/// the status. Anything else keeps SPA semantics under `web` (GET/HEAD serve
+/// the index shell, other methods answer 405); without `web` browser paths
+/// stay a plain 404, as before.
+pub(super) async fn spa_or_api_fallback(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = uri.path();
+    if path == "/api" || path.starts_with("/api/") {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "unknown API route",
+                "path": path,
+            })),
+        )
+            .into_response();
+    }
+    #[cfg(feature = "web")]
+    {
+        if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+            return axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        serve_index(uri, headers).await.into_response()
+    }
+    #[cfg(not(feature = "web"))]
+    {
+        let _ = (method, headers);
+        axum::http::StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 /// Placeholder logged in place of a route template when axum matched no
-/// route: the SPA fallback, and the 405 that fallback returns for a
-/// non-GET method. A request whose *path* matched a registered route still
+/// route: the SPA fallback, the 405 that fallback returns for a non-GET
+/// method, and the JSON 404 it returns for an unmatched `/api/*` path. A request whose *path* matched a registered route still
 /// carries its template even when the method router rejects it, because
 /// axum matches on path before it dispatches on method. The raw URI is never
 /// substituted here: it is attacker- or user-controlled text, and the whole
@@ -699,6 +740,102 @@ mod tests {
                 "{header:?}: got {line}"
             );
             assert!(line.contains("request_id="), "no request id at all: {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unmatched_api_path_fails_closed_json_404() {
+        use tower::ServiceExt;
+        // An unmatched /api/* path must never fall through to the SPA shell
+        // (or an empty body): a consumer probing a route that does not exist
+        // has to see a JSON 404, not a 200 text/html index page.
+        for (method, path) in [
+            ("GET", "/api"),
+            ("GET", "/api/nonesuch"),
+            ("GET", "/api/sessions/deadbeef/nonesuch"),
+            ("POST", "/api/definitely-not-a-route"),
+            ("PATCH", "/api/capacity/profile"),
+        ] {
+            let state = test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vecs(&["localhost"]),
+                Vec::new(),
+                None,
+            );
+            let app = test_support::build_router_for_test(state);
+            let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+            let mut req = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(remote));
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "{method} {path} must fail closed with 404"
+            );
+            let ct = resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            assert!(
+                ct.starts_with("application/json"),
+                "{method} {path} must answer JSON, got '{ct}'"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["error"], "unknown API route", "{method} {path}");
+            assert_eq!(v["path"], path, "{method} {path}");
+        }
+    }
+
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn spa_fallback_survives_for_non_api_paths() {
+        use tower::ServiceExt;
+        // Client-side routes outside /api keep serving the SPA shell, and a
+        // non-GET method on such a path still answers 405 rather than 404.
+        let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        for (method, want) in [
+            ("GET", axum::http::StatusCode::OK),
+            ("HEAD", axum::http::StatusCode::OK),
+            ("POST", axum::http::StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let state = test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vecs(&["localhost"]),
+                Vec::new(),
+                None,
+            );
+            let app = test_support::build_router_for_test(state);
+            let mut req = axum::http::Request::builder()
+                .method(method)
+                .uri("/sessions/some-client-route")
+                .header("host", "localhost")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(remote));
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), want, "{method} /sessions/some-client-route");
+            if want == axum::http::StatusCode::OK {
+                let ct = resp
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                assert!(
+                    ct.starts_with("text/html"),
+                    "{method} SPA shell, got '{ct}'"
+                );
+            }
         }
     }
 }
