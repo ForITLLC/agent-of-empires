@@ -458,9 +458,13 @@ pub fn require_known_profile(profile: &str) -> Result<()> {
     if known.is_empty() || known.iter().any(|p| p == profile) {
         return Ok(());
     }
+    // Rendered escaped (`escape_debug`): the rejected string is arbitrary
+    // user input headed for stderr and the tracing log, so a control
+    // sequence in it must not reach the terminal raw.
+    let shown = profile.escape_debug();
     anyhow::bail!(
-        "Profile '{profile}' does not exist. Create it explicitly with \
-         `aoe profile create {profile}`; a bare -p/--profile will not mint one \
+        "Profile '{shown}' does not exist. Create it explicitly with \
+         `aoe profile create {shown}`; a bare -p/--profile will not mint one \
          (guards against stray profiles from typos or session titles). \
          Run `aoe profile list` to see existing profiles."
     );
@@ -684,10 +688,13 @@ fn validate_profile_name(name: &str) -> Result<()> {
 /// through `Storage::new` -> `get_profile_dir` and auto-vivified a profile dir
 /// whose name was a space-joined `<profile> <id> <title>`.
 ///
-/// Creation is therefore held to a tighter charset (`[A-Za-z0-9._-]`, max 64)
-/// than deletion. Deletion must STAY permissive so malformed strays minted by
-/// older binaries can still be removed via the CLI; creation must never mint a
-/// new one.
+/// Creation is therefore held to a tighter charset (`[A-Za-z0-9_-]`, max 64)
+/// than deletion — the same grammar the daemon API's `validate_profile_name`
+/// (`server::api`) enforces, so a profile the CLI can create is one the
+/// web/API can then delete, rename or configure (dots are excluded on both
+/// sides: `.hidden` must not be creatable anywhere). Deletion must STAY
+/// permissive so malformed strays minted by older binaries can still be
+/// removed via the CLI; creation must never mint a new one.
 fn validate_new_profile_name(name: &str) -> Result<()> {
     validate_profile_name(name)?;
     if name.len() > 64 {
@@ -695,11 +702,12 @@ fn validate_new_profile_name(name: &str) -> Result<()> {
     }
     if !name
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
     {
+        // Escaped: arbitrary input headed for stderr/log, never rendered raw.
         anyhow::bail!(
-            "Profile name '{}' has disallowed characters (allowed: A-Z a-z 0-9 . _ -)",
-            name
+            "Profile name '{}' has disallowed characters (allowed: A-Z a-z 0-9 _ -)",
+            name.escape_debug()
         );
     }
     Ok(())
@@ -1592,7 +1600,6 @@ mod tests {
             "wma-work",
             "personal-main",
             "main",
-            ".hidden",
             "client-a",
             "1",
         ] {
@@ -1614,6 +1621,10 @@ mod tests {
             "all",
             "..",
             "a/b",
+            // Dots are outside the `[A-Za-z0-9_-]` charset the daemon API
+            // enforces, so the CLI create gate rejects them identically.
+            ".hidden",
+            "a.b",
         ] {
             validate_new_profile_name(bad)
                 .err()
@@ -1622,6 +1633,23 @@ mod tests {
         // 65 chars exceeds the length cap.
         let too_long = "a".repeat(65);
         validate_new_profile_name(&too_long).expect_err("65-char name must be rejected");
+    }
+
+    #[test]
+    fn test_validate_new_profile_name_escapes_control_chars_in_error() {
+        // A rejected name is echoed back escaped, so a control sequence
+        // (here an ANSI SGR) can never reach the terminal raw.
+        let err = validate_new_profile_name("bad\u{1b}[31mname")
+            .expect_err("control char must be rejected");
+        let text = err.to_string();
+        assert!(
+            !text.contains('\u{1b}'),
+            "raw ESC leaked into the error: {text:?}"
+        );
+        assert!(
+            text.contains("\\u{1b}"),
+            "expected the escaped form in the error: {text:?}"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1674,6 +1702,16 @@ mod tests {
         // An existing profile and the empty (default) name both pass.
         require_known_profile("forit-main").expect("existing profile must be allowed");
         require_known_profile("").expect("empty/default profile must be allowed");
+
+        // The refusal echoes the name escaped: a control sequence in `-p`
+        // must not reach the terminal raw.
+        let err = require_known_profile("nope\u{1b}[31m")
+            .expect_err("unknown profile with control chars must be refused");
+        let text = err.to_string();
+        assert!(
+            !text.contains('\u{1b}') && text.contains("\\u{1b}"),
+            "expected escaped ESC in the error: {text:?}"
+        );
     }
 
     #[test]
