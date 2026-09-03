@@ -146,6 +146,11 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         // Agents
         .route("/api/agents", get(api::list_agents))
+        // Accounts: live identity + usage per config dir (WO#1852)
+        .route(
+            "/api/accounts",
+            get(crate::server::account_usage::list_accounts),
+        )
         // Profiles
         .route(
             "/api/profiles",

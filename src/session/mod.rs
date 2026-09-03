@@ -1,5 +1,6 @@
 //! Session management module
 
+pub mod account;
 mod anchored_fs;
 pub mod artifacts;
 pub mod attach_project;
