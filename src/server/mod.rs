@@ -1,6 +1,7 @@
 //! The daemon.
 
 pub(crate) mod access;
+pub mod account_usage;
 pub(crate) mod acp_events;
 pub mod acp_reconciler;
 pub mod acp_ws;

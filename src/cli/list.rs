@@ -98,6 +98,9 @@ struct SessionJson {
     worktree: Option<WorktreeJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
+    /// Live account + usage view (WO#1852); same keys as `/api/sessions`.
+    #[serde(flatten)]
+    account: crate::session::account::SessionAccount,
 }
 
 #[derive(Serialize)]
@@ -143,6 +146,19 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
         workspace_repos: workspace_repos_for(inst),
         worktree: worktree_for(inst),
         parent_session_id: inst.parent_session_id.clone(),
+        account: Default::default(),
+    }
+}
+
+/// Overlay the locally-resolved account view (usage from the daemon when
+/// one is up) onto `--json` rows. See WO#1852.
+async fn overlay_accounts(rows: &mut [SessionJson], instances: &[Instance], profile: &str) {
+    let usage = crate::session::account::daemon_usage_map().await;
+    let mut map = crate::session::account::local_session_accounts(instances, profile, &usage);
+    for row in rows.iter_mut() {
+        if let Some(a) = map.remove(&row.id) {
+            row.account = a;
+        }
     }
 }
 
@@ -296,10 +312,11 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
         .collect();
 
     if args.json {
-        let sessions: Vec<SessionJson> = instances
+        let mut sessions: Vec<SessionJson> = instances
             .iter()
             .map(|inst| session_json(inst, storage.profile()))
             .collect();
+        overlay_accounts(&mut sessions, &instances, storage.profile()).await;
         super::output::print_json(&sessions)?;
         return Ok(());
     }
