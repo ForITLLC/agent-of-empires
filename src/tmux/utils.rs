@@ -380,6 +380,108 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Glob matching every session aoe creates (agents, terminals, tools): they
+/// all share [`crate::tmux::SESSION_PREFIX`].
+fn managed_session_glob() -> String {
+    format!("{}*", crate::tmux::SESSION_PREFIX)
+}
+
+/// The tmux format condition under which `prefix d` hands the client back to
+/// the session it came from instead of detaching it.
+///
+/// When the aoe TUI itself runs inside tmux (a `tmux new-session … aoe`
+/// wrapper, a grouped mirror session for mosh, a tmux window running `aoe`),
+/// attaching to an agent is a `switch-client`, so the TUI keeps running unseen
+/// in its own session. tmux's stock `prefix d` is `detach-client`: it drops the
+/// whole client, the TUI's session is left with nothing attached, and the user
+/// lands on whatever launched tmux — a bare shell, or a dead terminal when the
+/// wrapper session is `destroy-unattached`. The intro dialog promises "prefix
+/// then d comes back to aoe", so make that true: inside an aoe-managed session
+/// whose client has a previous session that is NOT aoe-managed, `prefix d` is
+/// `switch-client -l`; everywhere else it stays `detach-client`.
+///
+/// tmux evaluates the condition itself (`if-shell -F`, no shell fork) and
+/// clears `client_last_session` when that session is destroyed, so a vanished
+/// TUI session degrades to a plain detach rather than a stuck client.
+fn detach_return_condition(managed_glob: &str) -> String {
+    format!(
+        "#{{&&:#{{m:{glob},#{{session_name}}}},\
+         #{{&&:#{{!=:#{{client_last_session}},}},\
+         #{{==:#{{m:{glob},#{{client_last_session}}}},0}}}}}}",
+        glob = managed_glob
+    )
+}
+
+/// Whether aoe may (re)install its `prefix d` binding, given the output of
+/// `tmux list-keys -T prefix d`: only when the key is unbound, holds tmux's
+/// stock `detach-client`, or already holds aoe's binding. A user's own custom
+/// `d` binding is left alone.
+fn should_install_detach_return(list_keys_output: &str) -> bool {
+    let line = list_keys_output.trim();
+    if line.is_empty() {
+        return true;
+    }
+    if line.contains("switch-client -l") {
+        return true;
+    }
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    match toks
+        .windows(2)
+        .position(|w| w[0] == "prefix" && w[1] == "d")
+    {
+        Some(i) => toks[i + 2..] == ["detach-client"],
+        None => false,
+    }
+}
+
+/// Install the `prefix d` binding described on [`detach_return_condition`].
+/// Runs on every attach — one cheap, idempotent tmux call — so a restarted
+/// tmux server picks it up again. Never fails the attach: a tmux error is
+/// logged and the stock behaviour stands.
+pub(crate) fn install_detach_return_binding() {
+    let listing = match crate::tmux::tmux_command()
+        .args(["list-keys", "-T", "prefix", "d"])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(e) => {
+            tracing::debug!(target: "tmux.attach", "list-keys prefix d failed: {e}");
+            return;
+        }
+    };
+    if !should_install_detach_return(&listing) {
+        tracing::debug!(
+            target: "tmux.attach",
+            "prefix d is user-bound ({}); leaving it alone",
+            listing.trim()
+        );
+        return;
+    }
+    let cond = detach_return_condition(&managed_session_glob());
+    match crate::tmux::tmux_command()
+        .args([
+            "bind-key",
+            "-T",
+            "prefix",
+            "d",
+            "if-shell",
+            "-F",
+            &cond,
+            "switch-client -l",
+            "detach-client",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => tracing::debug!(
+            target: "tmux.attach",
+            "bind-key prefix d failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => tracing::debug!(target: "tmux.attach", "bind-key prefix d failed: {e}"),
+    }
+}
+
 /// Convert tmux's raw prefix notation (e.g. "C-a", "M-b", "F12") to the
 /// display form shown in UI hints. Preserves case from tmux so users see the
 /// same letter they typed in `~/.tmux.conf`.
@@ -972,5 +1074,36 @@ mod tests {
             "title\n",
             "a newline the title itself carried must survive"
         );
+    }
+
+    #[test]
+    fn detach_return_condition_is_managed_current_and_foreign_last_session() {
+        assert_eq!(
+            detach_return_condition("aoe_*"),
+            "#{&&:#{m:aoe_*,#{session_name}},#{&&:#{!=:#{client_last_session},},#{==:#{m:aoe_*,#{client_last_session}},0}}}"
+        );
+    }
+
+    #[test]
+    fn should_install_detach_return_only_over_stock_or_own_binding() {
+        assert!(should_install_detach_return(""));
+        assert!(should_install_detach_return(
+            "bind-key -T prefix d detach-client\n"
+        ));
+        assert!(should_install_detach_return(
+            "bind-key    -T prefix d                    detach-client"
+        ));
+        assert!(should_install_detach_return(
+            r##"bind-key -T prefix d if-shell -F "#{&&:x}" "switch-client -l" detach-client"##
+        ));
+        assert!(!should_install_detach_return(
+            "bind-key -T prefix d kill-session"
+        ));
+        assert!(!should_install_detach_return(
+            "bind-key -T prefix d run-shell my-script"
+        ));
+        assert!(!should_install_detach_return(
+            "bind-key -T prefix d detach-client -a"
+        ));
     }
 }
