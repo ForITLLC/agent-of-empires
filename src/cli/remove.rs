@@ -64,11 +64,15 @@ fn should_delete_branch(
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
+    // Without `-p` the target may be registered in any profile; find its
+    // owner first (full id or unique title only — see `cli::resolve_scope`).
+    let scope = super::resolve_scope(profile, &args.identifier)?;
+    let profile = scope.profile.as_str();
     let storage = Storage::open_unwatched(profile)?;
 
     let (instances, _groups) = storage.load_with_groups()?;
 
-    let mut inst = super::resolve_session(&args.identifier, &instances)
+    let mut inst = super::resolve_session(&scope.identifier, &instances)
         .map_err(|e| anyhow::anyhow!("{} in profile '{}'", e, storage.profile()))?
         .clone();
     inst.source_profile = storage.profile().to_string();

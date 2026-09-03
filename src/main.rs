@@ -301,6 +301,7 @@ async fn run(
     }
 
     let profile_explicit = cli.profile.is_some();
+    cli::set_profile_explicit(profile_explicit);
     let profile = cli.profile.unwrap_or_default();
 
     if cli.command.is_some() {
