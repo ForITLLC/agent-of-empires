@@ -237,6 +237,9 @@ pub struct SessionResponse {
     pub monitor_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor_description: Option<String>,
+    /// Live account identity and cached usage from the fleet daemon.
+    #[serde(default, flatten)]
+    pub account: crate::session::account::SessionAccount,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

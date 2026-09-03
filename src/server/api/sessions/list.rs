@@ -109,6 +109,20 @@ pub async fn list_sessions(
         })
         .collect();
 
+    // Overlay the live account + usage view from the daemon's cache (one
+    // read lock, no I/O per row). See WO#1852.
+    {
+        let cache = state.account_cache.read().await;
+        for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
+            resp.account = crate::server::account_usage::session_account(
+                &cache,
+                &inst.id,
+                &crate::session::config::effective_profile(&inst.source_profile),
+                &inst.tool,
+            );
+        }
+    }
+
     // Share resolved config between the ACP-capability and smart-rename
     // overlays, halving disk reads when a profile/project pair repeats in the
     // 3s sidebar poll (#2603). Monotonic, so the delta below is this request's
@@ -624,6 +638,7 @@ mod workspace_ordering_tests {
             next_wakeup_reason: None,
             monitor_active: false,
             monitor_description: None,
+            account: Default::default(),
             favorited: false,
             color: None,
             urgent: false,

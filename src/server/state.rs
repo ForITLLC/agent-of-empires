@@ -220,6 +220,10 @@ pub struct AppState {
     pub(super) telemetry_last_reported: std::sync::Mutex<Option<ReportedServeSignals>>,
     /// Resolved when the daemon receives SIGINT/SIGTERM/SIGHUP.
     pub shutdown: CancellationToken,
+    /// Live account identity + usage per config dir and per session, refreshed
+    /// by `account_usage::spawn_account_usage_loop`. Read by `/api/sessions`
+    /// and `/api/accounts`. See WO#1852.
+    pub account_cache: Arc<RwLock<super::account_usage::AccountCache>>,
     /// Process-wide file-watch primitive.
     pub(crate) file_watch: Arc<FileWatchService>,
     /// Wakeup signal for `disk_watcher_consumer`.

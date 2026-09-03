@@ -525,6 +525,15 @@ impl HttpClient {
             .filter(|pct| (1..=99).contains(pct)))
     }
 
+    /// `GET /api/accounts`: the daemon's cached account identity + usage
+    /// rows (WO#1852). Only the fields the CLI overlays are decoded.
+    pub async fn accounts(&self) -> Result<crate::session::account::AccountsWire, HttpError> {
+        let url = format!("{}/api/accounts", self.endpoint.base_url);
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, "").await?;
+        Ok(res.json().await?)
+    }
+
     /// Cheapest authenticated probe: separates a down host (transport error)
     /// from misconfigured auth (401).
     pub async fn health_check(&self) -> Result<(), HttpError> {

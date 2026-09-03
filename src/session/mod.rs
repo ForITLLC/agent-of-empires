@@ -1,5 +1,6 @@
 //! Session management module
 
+pub mod account;
 pub(crate) mod anchored_fs;
 pub mod artifacts;
 pub mod attach_project;

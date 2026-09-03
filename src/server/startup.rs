@@ -658,6 +658,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
         shutdown: CancellationToken::new(),
+        account_cache: Default::default(),
         file_watch: Arc::clone(&file_watch),
         disk_changed: Arc::new(tokio::sync::Notify::new()),
         disk_watch_handles: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -676,6 +677,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Periodic opt-in `usage_snapshot` loop.
     spawn_serve_snapshot_loop(state.clone());
+    // Live account identity + usage cache (WO#1852): first pass immediate.
+    super::account_usage::spawn_account_usage_loop(state.clone());
 
     // GC the recently_restarted suppression map periodically; the TTL check on read filters
     // but does not remove entries.
