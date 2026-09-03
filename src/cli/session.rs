@@ -1886,7 +1886,6 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
 /// reservation. Returns Ok(false) when no daemon is reachable or the POST
 /// itself was refused, so the caller falls back to the in-process path;
 /// never falls back after the daemon accepted.
-#[cfg(feature = "serve")]
 async fn try_daemon_restart(session_id: &str, title: &str) -> Result<bool> {
     use crate::acp::client::{discovery, HttpClient};
 
@@ -1982,7 +1981,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     bail_if_acp(inst, "restart")?;
 
     // Daemon-first: the cascade must not depend on this process surviving.
-    #[cfg(feature = "serve")]
     if try_daemon_restart(&inst.id, &inst.title).await? {
         return Ok(());
     }
