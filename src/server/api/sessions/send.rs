@@ -709,3 +709,38 @@ mod paste_image_tests {
         );
     }
 }
+
+/// `POST /api/sessions/{id}/urgent_ack` — explicit acknowledgement of the
+/// hook-written urgent flag (WO#1832). The pane-watchdog sidecar stamps
+/// `urgent` on a capped / logged-out row; until this route the only thing
+/// that stripped it was a delivered `send` (`ack_hook_urgent_on_send`), and
+/// `PATCH {urgent:false}` is 422 — so a stale flag on a healthy row could only
+/// be cleared by messaging the session. An explicit ack clears sticky kinds
+/// too: it is the human (or the Commander) seeing the row.
+/// Response: `{"id", "urgent_ack": "cleared"|"absent"|"kept", "urgent": bool}`.
+pub async fn urgent_ack_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let known = {
+        let instances = state.instances.read().await;
+        instances.iter().any(|i| i.id == id)
+    };
+    if !known {
+        return crate::server::api::session_not_found();
+    }
+    let ack = crate::hooks::ack_hook_urgent(&id);
+    let urgent = crate::hooks::read_hook_urgent(&id);
+    Json(serde_json::json!({
+        "id": id,
+        "urgent_ack": ack.as_str(),
+        "urgent": urgent,
+    }))
+    .into_response()
+}
