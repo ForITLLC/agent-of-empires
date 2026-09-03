@@ -303,6 +303,8 @@ impl PairedTerminal {
             bail!("{} does not exist: {}", self.kind.label(), self.name);
         }
 
+        crate::tmux::utils::install_detach_return_binding();
+
         if crate::tmux::utils::inside_tmux() {
             let status = crate::tmux::tmux_command()
                 .args(["switch-client", "-t", &self.name])
