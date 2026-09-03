@@ -1593,14 +1593,12 @@ pub async fn restart_session(
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return super::super::session_not_found();
         };
-        let structured;
-        {
-            structured = inst.is_structured();
-        }
-        #[cfg(not(feature = "serve"))]
-        {
-            structured = false;
-        }
+        // Structured view is core (upstream 15be9fdf made the daemon
+        // unconditional). The former not-serve fallback here was compiled IN
+        // on a `--features web` build (`serve` is only an alias of `web`) and
+        // double-assigned `structured` -> E0384: the 2026-09-03 07:38Z VM
+        // build failure.
+        let structured = inst.is_structured();
         if structured {
             return (
                 StatusCode::CONFLICT,
