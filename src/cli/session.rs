@@ -446,7 +446,47 @@ fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
 }
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
+/// Re-home a profile-scoped id verb onto the profile that owns its session
+/// when the invocation named none (see `cli::resolve_scope`); the identifier
+/// is rewritten to the session's full id so the verb's own lookup is exact.
+/// Verbs without a session identifier (`current`, `import`, the trash verbs,
+/// `restart --all`), `restore` (its target lives in a profile's trash, not its
+/// registry) and verbs that already resolve across profiles pass through.
+fn scope_command(profile: &str, mut command: SessionCommands) -> Result<(String, SessionCommands)> {
+    let target: Option<&mut String> = match &mut command {
+        SessionCommands::Start(a)
+        | SessionCommands::Stop(a)
+        | SessionCommands::Attach(a)
+        | SessionCommands::Unsnooze(a)
+        | SessionCommands::Favorite(a)
+        | SessionCommands::Unfavorite(a)
+        | SessionCommands::Unarchive(a) => Some(&mut a.identifier),
+        SessionCommands::Restart(a) => a.identifier.as_mut(),
+        SessionCommands::Show(a) => a.identifier.as_mut(),
+        SessionCommands::Rename(a) => a.identifier.as_mut(),
+        SessionCommands::SetWorktreeName(a) => a.identifier.as_mut(),
+        SessionCommands::Capture(a) => a.identifier.as_mut(),
+        SessionCommands::SetSessionId(a) => Some(&mut a.identifier),
+        SessionCommands::AddProject(a) => Some(&mut a.identifier),
+        SessionCommands::SetBase(a) => Some(&mut a.identifier),
+        SessionCommands::Snooze(a) => Some(&mut a.identifier),
+        SessionCommands::Color(a) => Some(&mut a.identifier),
+        SessionCommands::Archive(a) => Some(&mut a.identifier),
+        _ => None,
+    };
+    match target {
+        Some(identifier) => {
+            let scope = super::resolve_scope(profile, identifier)?;
+            *identifier = scope.identifier;
+            Ok((scope.profile, command))
+        }
+        None => Ok((profile.to_string(), command)),
+    }
+}
+
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
+    let (profile, command) = scope_command(profile, command)?;
+    let profile = profile.as_str();
     match command {
         SessionCommands::Start(args) => start_session(profile, args).await,
         SessionCommands::Stop(args) => stop_session(profile, args).await,
