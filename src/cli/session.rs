@@ -495,6 +495,40 @@ fn extract_config_dir(environment: &[String]) -> Option<String> {
         .find_map(|e| e.strip_prefix("CLAUDE_CONFIG_DIR=").map(|v| v.to_string()))
 }
 
+/// Seed Claude Code's folder-trust record for `project_path` into the config
+/// tree the destination profile's environment selects: `<CLAUDE_CONFIG_DIR>/
+/// .claude.json` when the profile pins one, else the default `~/.claude.json`.
+/// The key is the workspace's canonical path (the pane's `process.cwd()` is
+/// the physical path); a workspace that does not resolve keeps its configured
+/// spelling. Returns the file written and the key used. Every other key in the
+/// file is preserved (`hooks::trust_claude_project`).
+fn seed_destination_folder_trust(
+    environment: &[String],
+    home: &std::path::Path,
+    project_path: &str,
+) -> Result<(std::path::PathBuf, String)> {
+    let claude_json = match extract_config_dir(environment) {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir).join(".claude.json"),
+        _ => home.join(".claude.json"),
+    };
+    if let Some(parent) = claude_json.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating Claude config dir {}", parent.display()))?;
+    }
+    let key = std::fs::canonicalize(project_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| project_path.to_string());
+    crate::hooks::trust_claude_project(&claude_json, &key, crate::hooks::SymlinkPolicy::Follow)
+        .with_context(|| {
+            format!(
+                "writing folder trust for {} into {}",
+                key,
+                claude_json.display()
+            )
+        })?;
+    Ok((claude_json, key))
+}
+
 /// Canonicalize a config-dir path through symlinks so a compat-alias dir (e.g.
 /// `.claude-accounts/pivot-main` -> `gna-main`) compares equal to its real
 /// target and never reads as a spurious divergence. Fail-soft to the raw string
@@ -593,6 +627,31 @@ async fn move_session(args: MoveArgs) -> Result<()> {
         );
         return Ok(());
     }
+
+    // Trust the workspace on the DESTINATION account before anything moves.
+    // A re-bind lands the pane on an account that has never opened this cwd;
+    // Claude Code answers that with its workspace-trust prompt, and a headless
+    // pane answers the prompt by dying with nothing on screen (WO#1743). Seed
+    // now, whether the restart happens below or days later (`--no-restart`),
+    // and refuse the move outright when the record cannot be written: a loud
+    // refusal here beats a silent dead pane at the next launch.
+    let target_environment =
+        crate::session::profile_config::resolve_config_or_warn(&target).environment;
+    let home = dirs::home_dir().context("cannot seed destination folder trust: no home dir")?;
+    let (trusted_json, trusted_key) =
+        seed_destination_folder_trust(&target_environment, &home, &record.project_path)
+            .with_context(|| {
+                format!(
+                    "refusing to move '{}' ({}) to profile '{}': its workspace {} could not be \
+                     trusted on the destination account (the pane would die on the trust prompt)",
+                    title, id, target, record.project_path
+                )
+            })?;
+    println!(
+        "✓ Destination trust seeded: {} -> {}",
+        trusted_key,
+        trusted_json.display()
+    );
 
     // Build the relocated record: re-home it on the target profile and drop
     // the per-profile group association (group_path is meaningful only
@@ -3318,6 +3377,73 @@ mod move_divergence_tests {
 
     const FORIT_MAIN: &str = "/Users/me/.claude-accounts/forit-main";
     const FORIT_BACKUP: &str = "/Users/me/.claude-accounts/forit-backup";
+
+    #[test]
+    fn destination_trust_seeds_the_pinned_config_dir_on_the_canonical_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let account = temp.path().join("accounts").join("bsc-main");
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(
+            account.join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"keep-me"},"projects":{"/other":{"hasTrustDialogAccepted":true}}}"#,
+        )
+        .unwrap();
+        let env = vec![
+            "FOO=bar".to_string(),
+            format!("CLAUDE_CONFIG_DIR={}", account.display()),
+        ];
+        let home = temp.path().join("home");
+
+        let (json_path, key) =
+            super::seed_destination_folder_trust(&env, &home, repo.to_str().unwrap()).unwrap();
+
+        assert_eq!(json_path, account.join(".claude.json"));
+        assert_eq!(key, std::fs::canonicalize(&repo).unwrap().to_string_lossy());
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(json["projects"][&key]["hasTrustDialogAccepted"], true);
+        assert_eq!(json["projects"]["/other"]["hasTrustDialogAccepted"], true);
+        assert_eq!(json["oauthAccount"]["accountUuid"], "keep-me");
+        assert!(
+            !home.join(".claude.json").exists(),
+            "home must not be touched when a config dir is pinned"
+        );
+    }
+
+    #[test]
+    fn destination_trust_falls_back_to_home_claude_json_when_unpinned() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let home = temp.path().join("home");
+        let env = vec!["FOO=bar".to_string()];
+
+        let (json_path, key) =
+            super::seed_destination_folder_trust(&env, &home, repo.to_str().unwrap()).unwrap();
+
+        assert_eq!(json_path, home.join(".claude.json"));
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(json["projects"][&key]["hasTrustDialogAccepted"], true);
+    }
+
+    #[test]
+    fn destination_trust_refuses_loudly_when_the_config_dir_is_unwritable() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let blocker = temp.path().join("not-a-dir");
+        std::fs::write(&blocker, "file").unwrap();
+        let env = vec![format!("CLAUDE_CONFIG_DIR={}", blocker.display())];
+
+        let err = super::seed_destination_folder_trust(&env, temp.path(), repo.to_str().unwrap())
+            .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("creating Claude config dir"), "{msg}");
+    }
 
     #[test]
     fn extract_config_dir_plucks_the_value() {
