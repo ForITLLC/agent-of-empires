@@ -295,6 +295,10 @@ impl PairedTerminal {
             bail!("{} does not exist: {}", self.kind.label(), self.name);
         }
 
+        // `prefix d` inside this session returns to the caller (the TUI)
+        // instead of dropping the client; see `install_detach_return_binding`.
+        crate::tmux::utils::install_detach_return_binding();
+
         if std::env::var("TMUX").is_ok() {
             let status = crate::tmux::tmux_command()
                 .args(["switch-client", "-t", &self.name])
