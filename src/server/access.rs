@@ -402,6 +402,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // Terminal surface.
     ("POST", "/api/sessions/{id}/ensure"),
     ("POST", "/api/sessions/{id}/send"),
+    ("POST", "/api/sessions/{id}/urgent_ack"),
     ("POST", "/api/sessions/{id}/terminal"),
     ("DELETE", "/api/sessions/{id}/terminal"),
     ("POST", "/api/sessions/{id}/container-terminal"),

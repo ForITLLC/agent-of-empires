@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use regex::Regex;
-use uuid::Uuid;
 
 use crate::session::Status;
 
@@ -199,12 +198,13 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
 /// Every key the `attention-urgent` writer stamps alongside `urgent`. An ack
 /// strips all of them so a later [`read_hook_urgent`] can never see a
 /// half-cleared flag.
-const URGENT_KEYS: [&str; 5] = [
+const URGENT_KEYS: [&str; 6] = [
     "urgent",
     "urgent_reason",
     "urgent_set_at",
     "urgent_expires_at",
     "urgent_kind",
+    "urgent_source",
 ];
 
 /// Urgent kinds that resolve OUT-OF-BAND — a browser sign-in (`auth`), a
@@ -330,6 +330,53 @@ pub fn ack_hook_urgent_on_send(instance_id: &str, message: &str) -> UrgentAck {
         Err(e) => {
             tracing::warn!(target: "hooks.status",
                 "ack_hook_urgent_on_send: {} left as-is: {}", instance_id, e);
+            UrgentAck::Kept
+        }
+    }
+}
+
+/// Explicit acknowledgement of a session's urgent flag — the counterpart of
+/// [`ack_hook_urgent_on_send`] for `POST /api/sessions/{id}/urgent_ack` and
+/// `aoe session urgent-ack <id>` (WO#1832).
+///
+/// Delivery keeps an unexpired [`STICKY_URGENT_KINDS`] flag against machine
+/// traffic because a work order is not a human seeing the row. An explicit ack
+/// IS that: the caller has looked at the row and is clearing it, so every
+/// urgent key goes — sticky or not, expired or not. Before this route the only
+/// thing that stripped a stale watchdog stamp on the VM daemon was a `send`
+/// (`PATCH {urgent:false}` is 422). The tier/reason fields are untouched.
+/// Fail-open like delivery: a read/parse failure is `Absent`, a write failure
+/// leaves the file as it was (`Kept`).
+pub fn ack_hook_urgent(instance_id: &str) -> UrgentAck {
+    let Ok(Some(dir)) = dir_guard::open_instance_dir_read_only(instance_id) else {
+        return UrgentAck::Absent;
+    };
+    let Ok(Some(bytes)) =
+        dir_guard::read_file_at(dir.as_fd(), "attention.json", ATTENTION_FILE_READ_CAP)
+    else {
+        return UrgentAck::Absent;
+    };
+    let Ok(serde_json::Value::Object(mut payload)) =
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+    else {
+        return UrgentAck::Absent;
+    };
+    if !payload
+        .get("urgent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return UrgentAck::Absent;
+    }
+    for key in URGENT_KEYS {
+        payload.remove(key);
+    }
+    let body = serde_json::Value::Object(payload).to_string();
+    match dir_guard::write_atomic(dir.as_fd(), "attention.json", body.as_bytes()) {
+        Ok(()) => UrgentAck::Cleared,
+        Err(e) => {
+            tracing::warn!(target: "hooks.status",
+                "ack_hook_urgent: {} left as-is: {}", instance_id, e);
             UrgentAck::Kept
         }
     }
@@ -807,6 +854,63 @@ mod tests {
                     .unwrap();
             assert_eq!(raw, body.as_bytes(), "{kind}: file must be byte-identical");
         }
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn explicit_ack_clears_unexpired_sticky_kind() {
+        // WO#1832: an explicit ack is a human (or the Commander) seeing the
+        // row — it clears what delivery of machine traffic must keep.
+        let (_g, _, _tmp) = BaseGuard::ready();
+        for kind in STICKY_URGENT_KINDS {
+            let id = format!("ack_explicit_{kind}");
+            write_attention_json(&id, &urgent_body(Some(kind), future()));
+            assert_eq!(
+                ack_hook_urgent_on_send(&id, COMMANDER_MSG),
+                UrgentAck::Kept,
+                "{kind}: delivery keeps it"
+            );
+            assert_eq!(ack_hook_urgent(&id), UrgentAck::Cleared, "{kind}");
+            assert!(!read_hook_urgent(&id), "{kind}: flag must be gone");
+            let v = read_attention_json(&id);
+            assert_eq!(v["tier"], 3, "tier survives the ack: {v}");
+            for key in URGENT_KEYS {
+                assert!(v.get(key).is_none(), "{key} still present: {v}");
+            }
+            assert_eq!(
+                ack_hook_urgent(&id),
+                UrgentAck::Absent,
+                "{kind}: idempotent"
+            );
+        }
+        assert_eq!(
+            ack_hook_urgent("ack_explicit_never_written"),
+            UrgentAck::Absent
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn explicit_ack_strips_the_watchdog_provenance_key() {
+        // The pane-watchdog sidecar writes urgent_source alongside the flag;
+        // an ack must not leave that orphaned (it is how the sidecar tells its
+        // own stamp from a hook's).
+        let (_g, _, _tmp) = BaseGuard::ready();
+        let body = serde_json::json!({
+            "tier": 3, "reason": "needs_input",
+            "urgent": true, "urgent_reason": "pane-watchdog: usage cap on 'x'",
+            "urgent_kind": "cap", "urgent_source": "pane-watchdog",
+            "urgent_set_at": 1, "urgent_expires_at": future(),
+        })
+        .to_string();
+        write_attention_json("ack_wd", &body);
+        assert_eq!(ack_hook_urgent("ack_wd"), UrgentAck::Cleared);
+        let v = read_attention_json("ack_wd");
+        assert_eq!(
+            v,
+            serde_json::json!({"tier": 3, "reason": "needs_input"}),
+            "{v}"
+        );
     }
 
     #[test]

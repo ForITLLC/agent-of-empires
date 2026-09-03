@@ -69,6 +69,9 @@ pub use sessions::{restart_session, restart_status};
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
+// Explicit urgent ack (POST /api/sessions/{id}/urgent_ack): its own `use` so this
+// branch stacks beside other route additions without re-wrapping the block above.
+pub use sessions::urgent_ack_session;
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
 // Trash retention sweep, driven by the daemon's hourly loop; not a route handler.
@@ -327,7 +330,7 @@ mod tests {
             (
                 "api/sessions/send.rs",
                 include_str!("sessions/send.rs"),
-                &["send_message"],
+                &["send_message", "urgent_ack_session"],
             ),
             (
                 "api/sessions/ensure.rs",
@@ -562,7 +565,7 @@ mod tests {
             (
                 "api/sessions/send.rs",
                 include_str!("sessions/send.rs"),
-                &["send_message"],
+                &["send_message", "urgent_ack_session"],
             ),
             (
                 "api/sessions/ensure.rs",
