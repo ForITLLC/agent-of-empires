@@ -207,6 +207,11 @@ impl Instance {
             }
         }
         self.clear_pane_identity_sidecar();
+        // The pane is about to read this account's config tree; make sure the
+        // workspace is already trusted there, or a moved/fresh account dies on
+        // the trust prompt with nothing on screen. A failure aborts the launch
+        // loudly (`fail_reserved_launch` records it as the session's error).
+        self.seed_host_folder_trust()?;
 
         let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan {
             let launched_at_ms = SystemTime::now()
