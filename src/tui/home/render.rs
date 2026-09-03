@@ -578,15 +578,6 @@ fn push_shelf_error_lines(
     }
 }
 
-/// Compact display code for a profile name, used by the per-row profile tag
-/// in all-profiles view where the full name is too wide.
-///
-/// Hyphen/underscore-delimited names collapse to their segment initials
-/// (`forit-backup` becomes `fb`); single-segment names take their first three
-/// chars (`default` becomes `def`). Always lowercased, capped at four chars.
-/// The mapping is per-name and deterministic, so two profiles that collapse to
-/// the same code render identically; the full name still shows in a filtered
-/// view's list title and in the New/Restart dialogs.
 /// Per-row tag content plus the mode's max content width. The renderer
 /// right-pads `content` to `max_width` so the bracket span is fixed-width
 /// across rows (`[fb  ]` vs `[def ]`), keeping the activity column from
@@ -600,8 +591,14 @@ pub(crate) struct RowTag {
 const BRANCH_TAG_WIDTH: usize = 12;
 
 impl RowTag {
+    /// The bracketed tag, right-padded to `max_width` terminal cells. Padding
+    /// is measured by display width, not `char` count, so a wide glyph
+    /// (`界`, two cells) or a combining mark (zero cells) in the content still
+    /// yields a bracket span of exactly `max_width + 2` cells.
     pub fn rendered(&self) -> String {
-        format!("[{:<width$}]", self.content, width = self.max_width)
+        let used = unicode_width::UnicodeWidthStr::width(self.content.as_str());
+        let pad = self.max_width.saturating_sub(used);
+        format!("[{}{}]", self.content, " ".repeat(pad))
     }
 }
 
@@ -701,7 +698,24 @@ fn branch_tag_content(branch: &str, max_width: usize) -> Option<String> {
     }
 }
 
+/// Compact display code for a profile name, used by the per-row profile tag
+/// in all-profiles view where the full name is too wide.
+///
+/// Hyphen/underscore-delimited names keep a short lead segment (three
+/// characters or fewer) whole and append the initials of the remaining
+/// segments, so sibling profiles that share an initial stay distinguishable
+/// at a glance (`gna-main` becomes `gnam`, `bsc-main`/`bso-main` become
+/// `bscm`/`bsom`, `wma-work` becomes `wmaw`); a longer lead contributes its
+/// initial only (`forit-backup` becomes `fb`). Single-segment names take
+/// their first three chars (`default` becomes `def`). The code is lowercased
+/// and THEN capped at four terminal cells, measured by display width: a case
+/// expansion (`İ` lowercases to two scalars) or a wide glyph (`界` is two
+/// cells) can therefore never push the fixed-width `[....]` tag past
+/// [`RowTag::max_width`]. The mapping is per-name and deterministic, so two
+/// profiles that collapse to the same code render identically; the full name
+/// still shows in a filtered view's list title and in the New/Restart dialogs.
 pub(crate) fn profile_short_code(profile: &str) -> String {
+    const MAX_CELLS: usize = 4;
     let segments: Vec<&str> = profile
         .split(['-', '_'])
         .filter(|s| !s.is_empty())
@@ -723,11 +737,27 @@ pub(crate) fn profile_short_code(profile: &str) -> String {
             lead_part
                 .chars()
                 .chain(rest.iter().filter_map(|s| s.chars().next()))
-                .take(4)
+                .take(MAX_CELLS)
                 .collect()
         }
     };
-    code.to_lowercase()
+    truncate_to_display_width(&code.to_lowercase(), MAX_CELLS)
+}
+
+/// The longest prefix of `s` that fits in `max_cells` terminal cells
+/// (`unicode-width`), so a tag cap holds on screen and not just in scalars.
+fn truncate_to_display_width(s: &str, max_cells: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > max_cells {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out
 }
 
 /// Format a timestamp as a compact relative age (e.g. `3m`, `2h`, `4d`, `2mo`).
@@ -4827,6 +4857,29 @@ mod tests {
         assert_eq!(profile_short_code("a-b-c-d-e-f"), "abcd");
     }
 
+    /// The four-cell cap is enforced AFTER lowercasing and by display width:
+    /// `İ` lowercases to `i` + a combining dot (two scalars, one cell) and
+    /// `界` is one scalar but two cells — neither may widen the tag.
+    #[test]
+    fn profile_short_code_caps_by_display_width_after_lowercasing() {
+        use unicode_width::UnicodeWidthStr;
+        let expanded = profile_short_code("İab-main");
+        assert_eq!(expanded, "i\u{307}abm");
+        assert_eq!(expanded.width(), 4);
+        assert_eq!(profile_short_code("界界界-main"), "界界");
+        assert_eq!(profile_short_code("界界界-main").width(), 4);
+        assert_eq!(profile_short_code("界-main"), "界m");
+        assert_eq!(profile_short_code("x界-main"), "x界m");
+        assert_eq!(profile_short_code("界界界界"), "界界");
+        for name in ["İİİİ-main", "界界界界-main", "İ界-x-y-z", "ÀÉÎ-main"] {
+            assert!(
+                profile_short_code(name).width() <= 4,
+                "{name:?} -> {:?} exceeds four cells",
+                profile_short_code(name)
+            );
+        }
+    }
+
     #[test]
     fn profile_short_code_lowercases_and_ignores_empty_segments() {
         assert_eq!(profile_short_code("Forit_Backup"), "fb");
@@ -5035,11 +5088,33 @@ mod tests {
 
     #[test]
     fn row_tag_content_fits_within_max_width() {
-        // RowTag.rendered() right-pads to max_width via `{:<width$}` —
-        // if content ever exceeds max_width the format width is ignored
-        // and the bracket span jitters. profile_short_code's documented
-        // cap of 4 is the tightest case to spot-check.
-        assert!(profile_short_code("forit-backup-extra").len() <= 4);
+        // RowTag.rendered() right-pads to max_width by display width —
+        // if content ever exceeds max_width the pad is zero and the bracket
+        // span jitters. profile_short_code's documented cap of 4 cells is
+        // the tightest case to spot-check.
+        use unicode_width::UnicodeWidthStr;
+        assert!(profile_short_code("forit-backup-extra").width() <= 4);
+        assert!(profile_short_code("界界界-main").width() <= 4);
+    }
+
+    /// Padding is display-width-aware: a two-cell glyph counts as two.
+    #[test]
+    fn row_tag_rendered_pads_by_display_width() {
+        let wide = RowTag {
+            content: "界界".to_string(),
+            max_width: 4,
+        };
+        assert_eq!(wide.rendered(), "[界界]");
+        let one_wide = RowTag {
+            content: "界m".to_string(),
+            max_width: 4,
+        };
+        assert_eq!(one_wide.rendered(), "[界m ]");
+        let combining = RowTag {
+            content: "i\u{307}abm".to_string(),
+            max_width: 4,
+        };
+        assert_eq!(combining.rendered(), "[i\u{307}abm]");
     }
 
     #[test]
