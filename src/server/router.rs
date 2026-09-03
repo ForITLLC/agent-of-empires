@@ -75,6 +75,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // gates in auth_middleware.
         .route("/api/relay", post(api::relay_send))
         .route(
+            "/api/sessions/{id}/urgent_ack",
+            post(api::urgent_ack_session),
+        )
+        .route(
             "/api/sessions/{id}/paste-image",
             // A base64 screenshot blows past the global 1 MiB cap.
             post(api::paste_image).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),

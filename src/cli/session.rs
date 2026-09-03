@@ -76,6 +76,11 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
+    /// Acknowledge (clear) a session's urgent flag, sticky kinds included —
+    /// the explicit counterpart of the ack a delivered `send` performs. For a
+    /// row that is healthy again but still flagged (WO#1832).
+    UrgentAck(SessionIdArgs),
+
     /// Set (or clear) a per-session color label, rendered as a colored dot in
     /// the web sidebar for at-a-glance status signaling. Intended for a
     /// running agent to flag its own state, e.g.
@@ -462,6 +467,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unfavorite(args) => {
             mark_session(profile, args, "Unfavorited", Instance::unfavorite).await
         }
+        SessionCommands::UrgentAck(args) => urgent_ack_session(profile, args).await,
         SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => {
@@ -932,6 +938,24 @@ async fn mark_session(
         })
     })?;
     println!("{verb}: {title}");
+    Ok(())
+}
+
+/// `aoe session urgent-ack <id>` — clear the hook-written urgent flag on a
+/// session, sticky kinds included (WO#1832). The registry is read only to
+/// resolve the identifier; the flag lives in the hook status dir, not in
+/// sessions.json, so nothing is persisted here.
+async fn urgent_ack_session(profile: &str, args: SessionIdArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let inst = super::resolve_session(&args.identifier, &instances)?;
+    let ack = crate::hooks::ack_hook_urgent(&inst.id);
+    println!(
+        "Urgent ack for '{}' ({}): {}",
+        inst.title,
+        inst.id,
+        ack.as_str()
+    );
     Ok(())
 }
 
