@@ -138,6 +138,7 @@ fn build_test_app_state_impl(
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
         shutdown: CancellationToken::new(),
+        account_cache: Default::default(),
         file_watch,
         disk_changed: Arc::new(tokio::sync::Notify::new()),
         disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
