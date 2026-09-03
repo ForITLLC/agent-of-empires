@@ -105,6 +105,129 @@ pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Resul
     bail!("Session not found: {}", identifier)
 }
 
+/// Whether the invocation named a profile (`-p`/`--profile`, or the
+/// `AGENT_OF_EMPIRES_PROFILE` environment variable clap reads for it). `main`
+/// records it once before any subcommand runs; the profile-scoped id verbs use
+/// it to choose between the one-profile lookup (`resolve_session`) and the
+/// every-profile census (`resolve_scope`). Unset — library callers, tests —
+/// reads as explicit, so the per-profile behaviour is the default.
+static PROFILE_EXPLICIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn set_profile_explicit(explicit: bool) {
+    let _ = PROFILE_EXPLICIT.set(explicit);
+}
+
+pub fn profile_explicit() -> bool {
+    PROFILE_EXPLICIT.get().copied().unwrap_or(true)
+}
+
+/// Where a profile-scoped id verb runs: the profile that owns the session and
+/// the session's full id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    pub profile: String,
+    pub identifier: String,
+}
+
+/// Resolve the target of a profile-scoped id verb (`send`, `rm`, `session
+/// stop|restart|snooze|…`).
+///
+/// With an explicit profile nothing changes: the verb runs in that profile and
+/// `resolve_session` there still accepts a full id, a unique id prefix, a
+/// title or a project path. Without one, `identifier` is looked up across
+/// EVERY profile's session registry (the census `session move` walks), and
+/// only two shapes count: a full session id, or a title exactly one session in
+/// the whole census carries. Everything else fails closed: an id registered in
+/// two profiles or a title two sessions share lists the candidates and errors
+/// without acting; an id prefix, a project path or an unknown name is
+/// "Session not found". Nothing is ever picked by proximity.
+pub fn resolve_scope(profile: &str, identifier: &str) -> Result<Scope> {
+    resolve_scope_with(profile, profile_explicit(), identifier)
+}
+
+pub fn resolve_scope_with(profile: &str, explicit: bool, identifier: &str) -> Result<Scope> {
+    if explicit {
+        return Ok(Scope {
+            profile: profile.to_string(),
+            identifier: identifier.to_string(),
+        });
+    }
+    let profiles = crate::session::list_profiles()?;
+    resolve_scope_in(identifier, &profiles)
+}
+
+/// The census half of `resolve_scope`, over an explicit profile list so tests
+/// need no process-global state.
+pub fn resolve_scope_in(identifier: &str, profiles: &[String]) -> Result<Scope> {
+    let mut by_id: Vec<(String, Instance)> = Vec::new();
+    let mut by_title: Vec<(String, Instance)> = Vec::new();
+    for p in profiles {
+        let instances = match crate::session::Storage::new_unwatched(p).and_then(|s| s.load()) {
+            Ok(v) => v,
+            Err(err) => {
+                // A registry that will not load cannot vote; say so rather
+                // than silently narrowing the census.
+                eprintln!("warning: profile '{p}' skipped: {err}");
+                continue;
+            }
+        };
+        for inst in instances {
+            if inst.id == identifier {
+                by_id.push((p.clone(), inst));
+            } else if inst.title == identifier {
+                by_title.push((p.clone(), inst));
+            }
+        }
+    }
+
+    let describe = |hits: &[(String, Instance)]| -> String {
+        let mut lines: Vec<String> = hits
+            .iter()
+            .map(|(p, i)| format!("  {}: {} ({})", p, i.id, i.title))
+            .collect();
+        lines.sort();
+        lines.join("\n")
+    };
+
+    match by_id.len() {
+        1 => {
+            let (profile, inst) = by_id.remove(0);
+            return Ok(Scope {
+                profile,
+                identifier: inst.id,
+            });
+        }
+        0 => {}
+        n => bail!(
+            "Ambiguous session id {:?}: registered in {} profiles:\n{}\nPass -p <profile> to choose one. No action taken.",
+            identifier,
+            n,
+            describe(&by_id)
+        ),
+    }
+
+    match by_title.len() {
+        1 => {
+            let (profile, inst) = by_title.remove(0);
+            Ok(Scope {
+                profile,
+                identifier: inst.id,
+            })
+        }
+        0 => bail!(
+            "Session not found: {} (searched {} profiles for a full session id or an exact title; pass -p <profile> to match an id prefix or a project path within one profile)",
+            identifier,
+            profiles.len()
+        ),
+        n => bail!(
+            "Ambiguous session title {:?}: {} sessions carry it:\n{}\nUse the full session id, or -p <profile> where the title is unique. No action taken.",
+            identifier,
+            n,
+            describe(&by_title)
+        ),
+    }
+}
+
 /// Best-effort deletion of a structured-view session's durable transcript
 /// (the ACP event-store rows under `<app_dir>/acp_events.db`) during a CLI
 /// permanent purge (`aoe rm --purge`, `aoe session empty-trash`). The serve
@@ -250,6 +373,111 @@ mod tests {
     fn truncate_id_zero_max_returns_empty() {
         assert_eq!(truncate_id("abc", 0), "");
         assert_eq!(truncate_id("café", 0), "");
+    }
+
+    // `resolve_scope` (cross-profile id verbs): a full id or a unique title
+    // resolves to its owning profile; anything ambiguous or looser fails
+    // closed. Disk-backed (per-profile registries under an isolated app dir),
+    // hence serial.
+    fn seed_session(profile: &str, title: &str, id: Option<&str>) -> String {
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new(title, "/tmp/scope");
+        if let Some(id) = id {
+            inst.id = id.to_string();
+        }
+        let id = inst.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst);
+                Ok(())
+            })
+            .unwrap();
+        id
+    }
+
+    fn two_profiles() -> Vec<String> {
+        vec!["scope-one".to_string(), "scope-two".to_string()]
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_scope_full_id_resolves_to_the_owning_profile() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        seed_session("scope-one", "alpha", None);
+        let id = seed_session("scope-two", "beta", None);
+        let scope = resolve_scope_in(&id, &two_profiles()).unwrap();
+        assert_eq!(
+            scope,
+            Scope {
+                profile: "scope-two".to_string(),
+                identifier: id
+            }
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_scope_unique_title_resolves_to_its_full_id() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        seed_session("scope-one", "alpha", None);
+        let id = seed_session("scope-two", "beta", None);
+        let scope = resolve_scope_in("beta", &two_profiles()).unwrap();
+        assert_eq!(scope.profile, "scope-two");
+        assert_eq!(scope.identifier, id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_scope_ambiguous_title_refuses_and_lists_every_candidate() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let a = seed_session("scope-one", "twin", None);
+        let b = seed_session("scope-two", "twin", None);
+        let err = resolve_scope_in("twin", &two_profiles()).unwrap_err().to_string();
+        assert!(err.contains("Ambiguous session title"), "{err}");
+        assert!(err.contains("No action taken"), "{err}");
+        assert!(err.contains(&format!("scope-one: {a}")), "{err}");
+        assert!(err.contains(&format!("scope-two: {b}")), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_scope_same_id_in_two_profiles_refuses() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        seed_session("scope-one", "here", Some("dupdupdupdupdup1"));
+        seed_session("scope-two", "there", Some("dupdupdupdupdup1"));
+        let err = resolve_scope_in("dupdupdupdupdup1", &two_profiles())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Ambiguous session id"), "{err}");
+        assert!(err.contains("2 profiles"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_scope_id_prefix_and_unknown_are_session_not_found() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let id = seed_session("scope-one", "alpha", None);
+        let prefix = &id[..8];
+        let err = resolve_scope_in(prefix, &two_profiles()).unwrap_err().to_string();
+        assert!(err.starts_with(&format!("Session not found: {prefix}")), "{err}");
+        let err = resolve_scope_in("no-such-session", &two_profiles())
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("Session not found: no-such-session"), "{err}");
+    }
+
+    #[test]
+    fn resolve_scope_explicit_profile_passes_the_identifier_through_untouched() {
+        // No disk access at all: the caller's profile wins and the identifier
+        // (even a prefix) is left for that profile's `resolve_session`.
+        let scope = resolve_scope_with("named", true, "abc12345").unwrap();
+        assert_eq!(
+            scope,
+            Scope {
+                profile: "named".to_string(),
+                identifier: "abc12345".to_string()
+            }
+        );
     }
 
     #[test]

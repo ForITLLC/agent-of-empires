@@ -22,6 +22,16 @@ pub struct SendArgs {
 
 #[tracing::instrument(target = "cli.send", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
+    // Without `-p` the target may be registered in any profile; find its
+    // owner first (full id or unique title only — see `cli::resolve_scope`).
+    let scope = super::resolve_scope(profile, &args.identifier)?;
+    if scope.profile != profile {
+        eprintln!(
+            "  (session {} is registered in profile '{}')",
+            scope.identifier, scope.profile
+        );
+    }
+    let profile = scope.profile.as_str();
     let storage = Storage::open_unwatched(profile)?;
     let (mut instances, _) = storage.load_with_groups()?;
 
@@ -29,7 +39,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
         bail!("Message cannot be empty");
     }
 
-    let inst = super::resolve_session(&args.identifier, &instances)?;
+    let inst = super::resolve_session(&scope.identifier, &instances)?;
     let session_id = inst.id.clone();
     let session_title = inst.title.clone();
     let tool = inst.tool.clone();
