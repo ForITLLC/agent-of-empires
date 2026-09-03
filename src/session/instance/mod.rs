@@ -36,6 +36,7 @@ use crate::session::capture::{
 mod accessors;
 mod container;
 mod flags;
+mod folder_trust;
 mod hooks;
 mod kill;
 mod launch_command;
