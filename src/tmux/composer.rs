@@ -413,6 +413,36 @@ pub(crate) fn classify_machine_draft(
     MachineDraft::No
 }
 
+/// Is the Claude composer clear for a queued machine delivery right now?
+///
+/// The daemon drains the server-owned prompt queue into a terminal session
+/// only through this gate (`server::send_queue`): the composer must be
+/// rendered and accepting input, and hold nothing a human typed. Text
+/// already parked there is tolerated only when it is provably machine text
+/// (`classify_machine_draft`): the queued message's own earlier attempt, or
+/// a prior machine send whose Enter was swallowed, which the verified send
+/// then completes with a bare Enter. Anything else is an operator's unsent
+/// draft and the delivery waits. It never types beside the draft and never
+/// submits it, so the WO#1872 guarantee holds for queued traffic exactly as
+/// it does for a live send. A dialog or a booting pane is "not ready", not
+/// "clear".
+pub(crate) fn composer_clear_for_delivery(
+    raw_content: &str,
+    outgoing: &str,
+    machine_history: &[String],
+) -> bool {
+    if !claude_pane_input_ready(raw_content) {
+        return false;
+    }
+    match claude_composer_draft(raw_content) {
+        None => true,
+        Some(draft) => !matches!(
+            classify_machine_draft(&draft, outgoing, machine_history),
+            MachineDraft::No
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,5 +918,71 @@ mod tests {
             classify_machine_draft(outgoing, outgoing, &history_with_self),
             MachineDraft::Outgoing
         );
+    }
+}
+
+#[cfg(test)]
+mod delivery_gate_tests {
+    use super::composer_clear_for_delivery;
+
+    const EMPTY: &str = "\
+────────────────────────────────────────────────────────
+ ❯ 
+────────────────────────────────────────────────────────
+   ⏵⏵ bypass permissions on (shift+tab to cycle)";
+
+    fn with_draft(draft: &str) -> String {
+        format!(
+            "────────────────────────────────────────────────────────\n\
+             \x1b[38;5;246m❯\u{a0}\x1b[39m{draft}\n\
+             ────────────────────────────────────────────────────────\n\
+               ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        )
+    }
+
+    #[test]
+    fn empty_composer_is_clear() {
+        assert!(composer_clear_for_delivery(EMPTY, "STATUS: shipped", &[]));
+    }
+
+    #[test]
+    fn operator_draft_blocks_delivery() {
+        // The whole point: a human's half-typed words hold the queue.
+        let pane = with_draft("yes, authorize the vendor bump and send it");
+        assert!(!composer_clear_for_delivery(&pane, "STATUS: shipped", &[]));
+        // ...even when the queue holds other machine text.
+        assert!(!composer_clear_for_delivery(
+            &pane,
+            "STATUS: shipped",
+            &["WO#1897 queued report body".to_string()]
+        ));
+    }
+
+    #[test]
+    fn own_parked_copy_is_clear() {
+        // A prior attempt typed the message but lost its Enter: the verified
+        // send completes it with a bare Enter, so the gate opens.
+        let msg = "STATUS: shipped - WO#1897 queue landed, build 9f221e45 live on the VM";
+        let pane = with_draft(msg);
+        assert!(composer_clear_for_delivery(&pane, msg, &[]));
+    }
+
+    #[test]
+    fn prior_machine_message_is_clear() {
+        let earlier = "STATUS: blocked - WO#1889 gateway vocabulary still emits digit tokens";
+        let pane = with_draft(earlier);
+        assert!(composer_clear_for_delivery(
+            &pane,
+            "STATUS: shipped",
+            &[earlier.to_string()]
+        ));
+    }
+
+    #[test]
+    fn not_ready_pane_is_not_clear() {
+        // A numbered dialog (no `❯` prompt row): nothing may be typed.
+        let dialog = "Do you want to proceed?\n  1. Yes\n  2. No\n";
+        assert!(!composer_clear_for_delivery(dialog, "STATUS: shipped", &[]));
+        assert!(!composer_clear_for_delivery("", "STATUS: shipped", &[]));
     }
 }

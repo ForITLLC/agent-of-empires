@@ -406,10 +406,50 @@ impl HttpClient {
         Ok(res.json().await?)
     }
 
-    // No `queue_enqueue` here: since Tier 3 the native view never decides to
-    // queue. It POSTs every prompt to `/acp/prompt` and the daemon parks it if
-    // it must, so a client-side enqueue would be a second, competing decision.
-    // `POST /api/sessions/{id}/queue` still exists for the web's own paths.
+    /// `POST /api/sessions/{id}/queue`: park a text prompt on the server-owned
+    /// queue under a caller-minted id (a retry with the same id rewrites the
+    /// row rather than double-queueing).
+    ///
+    /// The native view never calls this: since Tier 3 it POSTs every prompt
+    /// to `/acp/prompt` and the daemon parks it if it must, so a client-side
+    /// enqueue there would be a second, competing decision. `aoe send` does
+    /// call it, and only AFTER its own live paste was refused for an
+    /// operator's unsent draft: the daemon then delivers the row as its own
+    /// turn once the composer clears (`server::send_queue`).
+    pub async fn queue_enqueue(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        text: &str,
+        origin_device: Option<&str>,
+    ) -> Result<crate::acp::state::QueuedPromptEntry, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue",
+            self.endpoint.base_url, session_id
+        );
+        let body = serde_json::json!({
+            "id": prompt_id,
+            "text": text,
+            "origin_device": origin_device,
+            "attachments": [],
+        });
+        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json().await?)
+    }
+
+    /// `DELETE /api/sessions/{id}/queue/{promptId}`: drop one queued prompt.
+    pub async fn queue_remove(&self, session_id: &str, prompt_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue/{}",
+            self.endpoint.base_url,
+            session_id,
+            utf8_percent_encode(prompt_id, PATH_SEGMENT)
+        );
+        let res = self.auth(self.http.delete(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
 
     /// `PATCH /api/sessions/{id}/queue/{promptId}`: replace a queued prompt's
     /// text in place, keeping its position. The prompt id is client-minted and
