@@ -4,17 +4,141 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Global count of active session-id poller threads for budget enforcement
 static ACTIVE_POLLER_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Ceiling on concurrent session-id poller threads.
+/// Default ceiling on concurrent session-id poller threads.
 ///
 /// Each session that loses its poller stops refreshing the agent session id
 /// shown in its TUI row, so this cap doubles as a "how many concurrent
-/// sessions can keep their identity live" budget.
-const SESSION_ID_POLLER_MAX_THREADS: u32 = 50;
+/// sessions can keep their identity live" budget. A fleet that registers
+/// more live sessions than this raises it through
+/// `[session] session_id_poller_max_threads`.
+pub const DEFAULT_SESSION_ID_POLLER_MAX_THREADS: u32 = 50;
+
+/// The live ceiling, process-wide. Seeded with the default; the configured
+/// value is applied once at startup by
+/// [`configure_session_id_poller_max_threads`].
+static SESSION_ID_POLLER_MAX_THREADS: AtomicU32 =
+    AtomicU32::new(DEFAULT_SESSION_ID_POLLER_MAX_THREADS);
+
+/// Apply the configured poller-thread ceiling for this process.
+///
+/// A value of 0 is treated as "unset" and keeps the default, so an empty or
+/// zeroed config key can never freeze every session id.
+pub fn configure_session_id_poller_max_threads(max: u32) {
+    let max = if max == 0 {
+        DEFAULT_SESSION_ID_POLLER_MAX_THREADS
+    } else {
+        max
+    };
+    SESSION_ID_POLLER_MAX_THREADS.store(max, Ordering::SeqCst);
+}
+
+/// The current poller-thread ceiling.
+pub fn session_id_poller_max_threads() -> u32 {
+    SESSION_ID_POLLER_MAX_THREADS.load(Ordering::SeqCst)
+}
+
+/// `(active, max)` for the session-id poller thread budget.
+pub fn session_id_poller_budget() -> (u32, u32) {
+    (
+        ACTIVE_POLLER_COUNT.load(Ordering::SeqCst),
+        session_id_poller_max_threads(),
+    )
+}
+
+/// True when no further poller thread can be started right now.
+///
+/// Callers that re-check a dead poller on a timer consult this before
+/// attempting a start, so an over-budget fleet does not pay a failed spawn
+/// plus a warning line per session per tick.
+pub fn session_id_poller_budget_exhausted() -> bool {
+    let (active, max) = session_id_poller_budget();
+    active >= max
+}
+
+/// First retry delay after a poller could not be (re)started.
+const POLLER_REPAIR_INITIAL_DELAY: Duration = Duration::from_secs(5);
+/// Longest retry delay; the schedule doubles up to this and then holds.
+const POLLER_REPAIR_MAX_DELAY: Duration = Duration::from_secs(60);
+/// At the capped delay, log a reminder every this many deferrals
+/// (60 s × 10 = one line per ten minutes per session).
+const POLLER_REPAIR_REMIND_EVERY: u32 = 10;
+
+/// Retry schedule for one session whose session-id poller could not be
+/// (re)started — typically because the process-wide thread budget is spent.
+///
+/// The daemon and the TUI both walk every registered session on a ~2 s
+/// tick and ask [`crate::session::Instance::repair_session_id_poller_if_needed`]
+/// to replace a missing poller. Without a schedule, a fleet over budget
+/// retries and warns for every over-budget session on every tick — the
+/// 2026-09-04 fleet logged ~2.5 warning lines per second from two sessions.
+/// This state lives on the instance (`#[serde(skip)]`) and is carried across
+/// reloads like the poller handle itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PollerRepairBackoff {
+    next_attempt: Option<Instant>,
+    delay: Option<Duration>,
+    deferrals: u32,
+}
+
+impl PollerRepairBackoff {
+    /// True when a repair attempt may run at `now`.
+    pub fn due(&self, now: Instant) -> bool {
+        match self.next_attempt {
+            None => true,
+            Some(at) => now >= at,
+        }
+    }
+
+    /// Record a failed (or skipped-for-budget) attempt at `now` and schedule
+    /// the next one: 5 s, then doubling to a 60 s ceiling.
+    ///
+    /// Returns the new delay when the caller should log — on the first
+    /// deferral, on every escalation, and as a periodic reminder once the
+    /// delay is capped — and `None` for the quiet in-between deferrals.
+    pub fn defer(&mut self, now: Instant) -> Option<Duration> {
+        let previous = self.delay;
+        let delay = match previous {
+            None => POLLER_REPAIR_INITIAL_DELAY,
+            Some(d) => (d * 2).min(POLLER_REPAIR_MAX_DELAY),
+        };
+        self.delay = Some(delay);
+        self.next_attempt = Some(now + delay);
+        self.deferrals += 1;
+        let escalated = previous != Some(delay);
+        let reminder =
+            delay == POLLER_REPAIR_MAX_DELAY && self.deferrals % POLLER_REPAIR_REMIND_EVERY == 0;
+        (escalated || reminder).then_some(delay)
+    }
+
+    /// Clear the schedule after a successful start.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Number of consecutive deferrals since the last reset.
+    pub fn deferrals(&self) -> u32 {
+        self.deferrals
+    }
+
+    /// The delay scheduled by the most recent deferral, if any.
+    pub fn current_delay(&self) -> Option<Duration> {
+        self.delay
+    }
+
+    /// Make the next attempt due immediately without clearing the schedule
+    /// (tests simulate elapsed time with this).
+    #[cfg(test)]
+    pub(crate) fn expire(&mut self) {
+        self.next_attempt = self
+            .next_attempt
+            .map(|_| Instant::now() - Duration::from_millis(1));
+    }
+}
 
 /// RAII guard that decrements `ACTIVE_POLLER_COUNT` on drop.
 ///
@@ -27,7 +151,7 @@ impl PollerCountGuard {
     fn try_acquire() -> Option<Self> {
         let mut current = ACTIVE_POLLER_COUNT.load(Ordering::SeqCst);
         loop {
-            if current >= SESSION_ID_POLLER_MAX_THREADS {
+            if current >= session_id_poller_max_threads() {
                 return None;
             }
             match ACTIVE_POLLER_COUNT.compare_exchange_weak(
@@ -283,11 +407,13 @@ impl SessionPoller {
         let _guard = match PollerCountGuard::try_acquire() {
             Some(g) => g,
             None => {
+                let (active, max) = session_id_poller_budget();
                 tracing::warn!(target: "session.create",
                     "Session-id poller budget exhausted ({}/{}), skipping poller for {}; \
-                     its session id will not refresh until another session stops",
-                    ACTIVE_POLLER_COUNT.load(Ordering::SeqCst),
-                    SESSION_ID_POLLER_MAX_THREADS,
+                     its session id will not refresh until another session stops \
+                     (raise [session] session_id_poller_max_threads for larger fleets)",
+                    active,
+                    max,
                     instance_id,
                 );
                 self.cmd_rx = Some(cmd_rx);
@@ -505,6 +631,40 @@ impl Default for SessionPoller {
     }
 }
 
+/// Test-only handles on the process-wide budget, for callers outside this
+/// module (instance repair tests) that must drive it deterministically.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Pins the budget to "spent" (ceiling 1, one slot taken) and restores
+    /// both counters on drop. Pair with `#[serial]`: the budget is global.
+    pub(crate) struct BudgetExhausted {
+        prev_count: u32,
+        prev_max: u32,
+    }
+
+    impl BudgetExhausted {
+        pub(crate) fn pin() -> Self {
+            let prev_count = ACTIVE_POLLER_COUNT.load(Ordering::SeqCst);
+            let prev_max = session_id_poller_max_threads();
+            SESSION_ID_POLLER_MAX_THREADS.store(1, Ordering::SeqCst);
+            ACTIVE_POLLER_COUNT.store(1, Ordering::SeqCst);
+            Self {
+                prev_count,
+                prev_max,
+            }
+        }
+    }
+
+    impl Drop for BudgetExhausted {
+        fn drop(&mut self) {
+            ACTIVE_POLLER_COUNT.store(self.prev_count, Ordering::SeqCst);
+            SESSION_ID_POLLER_MAX_THREADS.store(self.prev_max, Ordering::SeqCst);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +683,122 @@ mod tests {
         fn drop(&mut self) {
             ACTIVE_POLLER_COUNT.store(self.0, Ordering::SeqCst);
         }
+    }
+
+    /// Restores the configured ceiling to its original value on drop.
+    struct MaxRestorer(u32);
+    impl Drop for MaxRestorer {
+        fn drop(&mut self) {
+            SESSION_ID_POLLER_MAX_THREADS.store(self.0, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn configured_ceiling_bounds_the_budget() {
+        let _restore_max = MaxRestorer(session_id_poller_max_threads());
+        let _restore_count = CountRestorer(ACTIVE_POLLER_COUNT.load(Ordering::SeqCst));
+
+        configure_session_id_poller_max_threads(3);
+        assert_eq!(session_id_poller_max_threads(), 3);
+        ACTIVE_POLLER_COUNT.store(2, Ordering::SeqCst);
+        assert!(!session_id_poller_budget_exhausted());
+        assert_eq!(session_id_poller_budget(), (2, 3));
+        let guard = PollerCountGuard::try_acquire();
+        assert!(
+            guard.is_some(),
+            "third slot is within the configured ceiling"
+        );
+        assert!(session_id_poller_budget_exhausted());
+        assert!(
+            PollerCountGuard::try_acquire().is_none(),
+            "fourth slot exceeds the configured ceiling"
+        );
+        drop(guard);
+        assert!(!session_id_poller_budget_exhausted());
+
+        // Raising the ceiling at runtime admits the waiting session.
+        ACTIVE_POLLER_COUNT.store(50, Ordering::SeqCst);
+        configure_session_id_poller_max_threads(400);
+        assert!(!session_id_poller_budget_exhausted());
+        assert!(PollerCountGuard::try_acquire().is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn zero_ceiling_keeps_the_default() {
+        let _restore_max = MaxRestorer(session_id_poller_max_threads());
+        configure_session_id_poller_max_threads(0);
+        assert_eq!(
+            session_id_poller_max_threads(),
+            DEFAULT_SESSION_ID_POLLER_MAX_THREADS
+        );
+    }
+
+    #[test]
+    fn repair_backoff_doubles_to_a_minute_and_holds() {
+        let mut b = PollerRepairBackoff::default();
+        let now = Instant::now();
+        assert!(b.due(now), "a fresh schedule is due immediately");
+
+        let expected = [5u64, 10, 20, 40, 60, 60, 60];
+        for (i, secs) in expected.iter().enumerate() {
+            let logged = b.defer(now);
+            assert_eq!(
+                b.current_delay(),
+                Some(Duration::from_secs(*secs)),
+                "deferral {} should schedule {}s",
+                i + 1,
+                secs
+            );
+            assert_eq!(b.deferrals(), i as u32 + 1);
+            let should_log = i < 5; // first + four escalations; then quiet
+            assert_eq!(
+                logged.is_some(),
+                should_log,
+                "deferral {} log decision",
+                i + 1
+            );
+            assert!(!b.due(now), "just deferred: not due at the same instant");
+            assert!(
+                b.due(now + Duration::from_secs(*secs)),
+                "due once the scheduled delay has elapsed"
+            );
+            assert!(
+                !b.due(now + Duration::from_secs(*secs) - Duration::from_millis(1)),
+                "not due one millisecond early"
+            );
+        }
+    }
+
+    #[test]
+    fn repair_backoff_reminds_every_tenth_deferral_at_the_cap() {
+        let mut b = PollerRepairBackoff::default();
+        let now = Instant::now();
+        // Walk to the cap: deferrals 1..=5 log (5,10,20,40,60).
+        for _ in 0..5 {
+            b.defer(now);
+        }
+        let mut logged_at = Vec::new();
+        for _ in 0..25 {
+            if b.defer(now).is_some() {
+                logged_at.push(b.deferrals());
+            }
+        }
+        assert_eq!(logged_at, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn repair_backoff_reset_clears_the_schedule() {
+        let mut b = PollerRepairBackoff::default();
+        let now = Instant::now();
+        b.defer(now);
+        b.defer(now);
+        assert!(!b.due(now));
+        b.reset();
+        assert_eq!(b, PollerRepairBackoff::default());
+        assert!(b.due(now));
+        assert_eq!(b.defer(now), Some(Duration::from_secs(5)), "restarts at 5s");
     }
 
     #[test]
@@ -753,7 +1029,7 @@ mod tests {
     #[serial]
     fn test_thread_budget_cap() {
         let _restore_count = CountRestorer(ACTIVE_POLLER_COUNT.load(Ordering::SeqCst));
-        ACTIVE_POLLER_COUNT.store(SESSION_ID_POLLER_MAX_THREADS, Ordering::SeqCst);
+        ACTIVE_POLLER_COUNT.store(session_id_poller_max_threads(), Ordering::SeqCst);
 
         let mut poller = SessionPoller::new("test-session".to_string());
         poller.start(

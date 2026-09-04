@@ -89,6 +89,7 @@ impl Instance {
             last_error: None,
             session_id_poller: None,
             session_id_poller_retry_after: None,
+            poller_repair: Default::default(),
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
             file_watch: None,

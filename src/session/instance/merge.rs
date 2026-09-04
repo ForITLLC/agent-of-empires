@@ -108,6 +108,7 @@ impl Instance {
         self.last_start_time = previous.last_start_time;
         self.session_id_poller = previous.session_id_poller.clone();
         self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
+        self.poller_repair = previous.poller_repair.clone();
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
         self.acp_load_session_capable = previous.acp_load_session_capable;
     }

@@ -370,9 +370,43 @@ impl Instance {
         {
             return false;
         }
+        let now = std::time::Instant::now();
+        // A failed attempt schedules the next one (5 s doubling to 60 s), so
+        // an over-budget fleet is not re-probed — and re-warned — for every
+        // session on every 2 s tick.
+        if !self.poller_repair.due(now) {
+            return false;
+        }
+        if crate::session::poller::session_id_poller_budget_exhausted() {
+            self.defer_poller_repair(now, "budget exhausted");
+            return false;
+        }
         self.session_id_poller = None;
         self.maybe_start_poller();
-        self.session_id_poller_is_running()
+        if self.session_id_poller_is_running() {
+            self.poller_repair.reset();
+            true
+        } else {
+            self.defer_poller_repair(now, "start failed");
+            false
+        }
+    }
+
+    /// Schedule the next repair attempt and log at the backoff's cadence
+    /// (first miss, each escalation, then every ~10 min at the cap).
+    fn defer_poller_repair(&mut self, now: std::time::Instant, why: &str) {
+        let (active, max) = crate::session::poller::session_id_poller_budget();
+        if let Some(delay) = self.poller_repair.defer(now) {
+            tracing::warn!(
+                target: "session.create",
+                "Session-id poller for {} not restarted ({why}; {active}/{max} threads); \
+                 next attempt in {}s after {} deferral(s). Raise \
+                 [session] session_id_poller_max_threads if the fleet outgrew the budget",
+                self.id,
+                delay.as_secs(),
+                self.poller_repair.deferrals(),
+            );
+        }
     }
 
     pub(super) fn stop_poller(&self) {
@@ -436,6 +470,66 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use crate::session::{Instance, SandboxInfo, Status};
+
+    /// The 2026-09-04 fleet shape: two sessions past the poller budget were
+    /// re-probed by the daemon every 2 s tick, each attempt logging a
+    /// "budget exhausted" + "Failed to start session poller" pair (~2.5
+    /// lines/s). Repair must schedule its retry instead.
+    #[test]
+    #[serial_test::serial]
+    fn repair_defers_with_backoff_while_the_poller_budget_is_spent() {
+        let budget = crate::session::poller::test_support::BudgetExhausted::pin();
+        let mut inst = Instance::new("repair-backoff", "/tmp/repair-backoff");
+        let live = crate::tmux::LiveSessionSnapshot::from_parts(
+            Some(vec![crate::tmux::Session::generate_name(
+                &inst.id,
+                &inst.title,
+            )]),
+            None,
+        );
+        assert!(
+            inst.has_live_tmux_pane_in(&live),
+            "fixture pane must read live"
+        );
+        assert!(inst.supports_session_poller());
+
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        assert!(
+            inst.session_id_poller.is_none(),
+            "no start attempted over budget"
+        );
+        assert_eq!(inst.poller_repair.deferrals(), 1);
+        assert_eq!(
+            inst.poller_repair.current_delay(),
+            Some(std::time::Duration::from_secs(5))
+        );
+
+        // The next tick lands inside the scheduled delay: no probe, no log.
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        assert_eq!(
+            inst.poller_repair.deferrals(),
+            1,
+            "tick inside the delay is a no-op"
+        );
+
+        // Once due and still over budget, the delay escalates.
+        inst.poller_repair.expire();
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        assert_eq!(inst.poller_repair.deferrals(), 2);
+        assert_eq!(
+            inst.poller_repair.current_delay(),
+            Some(std::time::Duration::from_secs(10))
+        );
+
+        // Budget freed (another session stopped, or the ceiling was raised):
+        // the due attempt starts the poller and clears the schedule.
+        drop(budget);
+        inst.poller_repair.expire();
+        assert!(inst.repair_session_id_poller_if_needed(&live));
+        assert!(inst.session_id_poller_is_running());
+        assert_eq!(inst.poller_repair, Default::default());
+        inst.stop_poller();
+    }
 
     // Restart, stop, standalone attach, and sid_persist all tear down through
     // this helper. Restart was missed when only `stop` flushed.

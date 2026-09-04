@@ -686,6 +686,24 @@ pub struct Instance {
     #[serde(skip)]
     pub session_id_poller: Option<Arc<Mutex<SessionPoller>>>,
     /// Runtime backoff after managed-store ownership or lease contention.
+    /// Retry schedule for replacing a missing session-id poller when the
+    /// process-wide thread budget (or a start failure) blocked the last
+    /// attempt. Runtime-only; carried across reloads like the poller.
+    #[serde(skip)]
+    pub(crate) poller_repair: crate::session::poller::PollerRepairBackoff,
+
+    /// Runtime-only set of session IDs that retroactive capture must NOT
+    /// re-discover from on-disk artifacts after an explicit resume-target
+    /// invalidation. On-disk artifacts (opencode db, vibe meta.json, codex
+    /// state, etc.) can retain the old row for several minutes.
+    ///
+    /// `#[serde(skip)]` is intentional. If the daemon dies between the
+    /// explicit invalidation clearing the on-disk sid and the artifact decaying
+    /// (~5-10 min), the next launch starts with this set empty and the
+    /// freshly-spawned poller can re-import the bad sid once. The next
+    /// `start_with_resume_fallback` then re-runs the invalidation and clears it
+    /// again. Self-healing within one cycle; persisting a TTL set isn't
+    /// worth the schema cost.
     #[serde(skip)]
     pub(crate) session_id_poller_retry_after: Option<std::time::Instant>,
     /// Session IDs invalidated at a fresh-generation boundary. Persisting this
