@@ -212,6 +212,9 @@ impl Instance {
         // the trust prompt with nothing on screen. A failure aborts the launch
         // loudly (`fail_reserved_launch` records it as the session's error).
         self.seed_host_folder_trust()?;
+        // Same tree, same moment: an account with no user-scope MCP servers
+        // starts every session tool-less with nothing on screen (WO#1894).
+        self.seed_host_mcp_servers()?;
 
         let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan {
             let launched_at_ms = SystemTime::now()

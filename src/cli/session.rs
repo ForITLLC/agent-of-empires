@@ -828,8 +828,8 @@ async fn move_session(args: MoveArgs) -> Result<()> {
     // now, whether the restart happens below or days later (`--no-restart`),
     // and refuse the move outright when the record cannot be written: a loud
     // refusal here beats a silent dead pane at the next launch.
-    let target_environment =
-        crate::session::config::profile_config::resolve_config_or_warn(&target).environment;
+    let target_config = crate::session::config::profile_config::resolve_config_or_warn(&target);
+    let target_environment = target_config.environment;
     let home = dirs::home_dir().context("cannot seed destination folder trust: no home dir")?;
     let (trusted_json, trusted_key) =
         seed_destination_folder_trust(&target_environment, &home, &record.project_path)
@@ -845,6 +845,41 @@ async fn move_session(args: MoveArgs) -> Result<()> {
         trusted_key,
         trusted_json.display()
     );
+    // The destination account must also carry the fleet's user-scope MCP
+    // servers, or the moved session comes up with no MCP tools (WO#1894).
+    // Seeded from the one configured template; an account that already lists
+    // servers is left as it is. A configured-but-broken template refuses the
+    // move for the same reason trust does: loud now beats silent later.
+    let destination_json = match extract_config_dir(&target_environment) {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir).join(".claude.json"),
+        _ => home.join(".claude.json"),
+    };
+    match crate::session::seed_mcp_servers_from_template(
+        target_config.session.claude_mcp_servers_seed.as_deref(),
+        &destination_json,
+        &home,
+    )
+    .with_context(|| {
+        format!(
+            "refusing to move '{}' ({}) to profile '{}': its user-scope MCP servers could not \
+             be seeded into {} (the pane would start with no MCP tools)",
+            title,
+            id,
+            target,
+            destination_json.display()
+        )
+    })? {
+        Some((template, true)) => println!(
+            "✓ Destination MCP servers seeded: {} <- {}",
+            destination_json.display(),
+            template.display()
+        ),
+        Some((_, false)) => println!(
+            "✓ Destination MCP servers already present: {}",
+            destination_json.display()
+        ),
+        None => {}
+    }
 
     // Build the relocated record: re-home it on the target profile and drop
     // the per-profile group association (group_path is meaningful only

@@ -68,6 +68,7 @@ pub use groups::{
     ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
     TRASH_SECTION_PATH,
 };
+pub(crate) use instance::seed_mcp_servers_from_template;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
     persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
