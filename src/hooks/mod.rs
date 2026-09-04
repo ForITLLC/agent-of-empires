@@ -57,7 +57,7 @@ pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
 };
 pub use trust::{
-    disable_gemini_folder_trust, trust_claude_project, trust_codex_project, trust_gemini_project,
+    disable_gemini_folder_trust, seed_claude_mcp_servers, trust_claude_project, trust_codex_project, trust_gemini_project,
     trust_host_project,
 };
 
