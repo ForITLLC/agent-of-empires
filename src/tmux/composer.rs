@@ -481,6 +481,46 @@ pub(crate) enum PasteResidue {
     Unverifiable,
 }
 
+/// Verdict of an abort's final composer read (`final_n` and `expect` are
+/// whitespace-stripped). A composer holding the human's bytes PLUS MORE is
+/// still restored: the extra bytes are keystrokes the human landed after the
+/// retype, in order, behind their own text (they kept typing). Fewer bytes,
+/// or a different prefix, is a failed restore.
+pub(crate) struct RestoreVerdict {
+    pub restored: bool,
+    /// Human characters typed after the restore, before the final read.
+    pub typed_after: usize,
+    pub detail: String,
+}
+
+pub(crate) fn restore_verdict(final_n: &str, expect: &str) -> RestoreVerdict {
+    let expect_chars = expect.chars().count();
+    if let Some(extra) = final_n.strip_prefix(expect) {
+        let typed_after = extra.chars().count();
+        let detail = if typed_after == 0 {
+            format!("composer holds the human's {expect_chars} char(s) again")
+        } else {
+            format!(
+                "composer holds the human's {expect_chars} char(s) again, \
+                 plus {typed_after} typed since the restore"
+            )
+        };
+        return RestoreVerdict {
+            restored: true,
+            typed_after,
+            detail,
+        };
+    }
+    RestoreVerdict {
+        restored: false,
+        typed_after: 0,
+        detail: format!(
+            "composer holds {} char(s), expected the human's {expect_chars}",
+            final_n.chars().count()
+        ),
+    }
+}
+
 pub(crate) fn paste_residue(draft: Option<&str>, text: &str) -> PasteResidue {
     let Some(draft) = draft else {
         return PasteResidue::Pending;
@@ -554,6 +594,31 @@ pub(crate) fn composer_clear_for_delivery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_verdict_exact_is_restored() {
+        let v = restore_verdict("HUMA", "HUMA");
+        assert!(v.restored);
+        assert_eq!(v.typed_after, 0);
+        assert!(v.detail.contains("4 char(s) again"), "{}", v.detail);
+    }
+
+    #[test]
+    fn restore_verdict_keeps_typing_after_the_restore_is_still_restored() {
+        // Leg 2 of WO#1897-R: the final read raced a human typing at 150 ms
+        // per char; "HUMAN" behind an expected "HUMA" is intact, not broken.
+        let v = restore_verdict("HUMAN", "HUMA");
+        assert!(v.restored);
+        assert_eq!(v.typed_after, 1);
+        assert!(v.detail.contains("plus 1 typed since"), "{}", v.detail);
+    }
+
+    #[test]
+    fn restore_verdict_short_or_diverged_is_not_restored() {
+        assert!(!restore_verdict("HUM", "HUMA").restored);
+        assert!(!restore_verdict("XUMAN", "HUMA").restored);
+        assert!(restore_verdict("", "").restored);
+    }
 
     #[test]
     fn input_ready_on_fresh_composer() {
