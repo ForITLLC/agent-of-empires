@@ -131,6 +131,39 @@ pub enum SessionCommands {
     /// requested model. Pass an empty model (`""`) to CLEAR the pin and fall
     /// back to the account's default model.
     SetModel(SetModelArgs),
+
+    /// Show a session's server-owned prompt queue: the sends parked behind an
+    /// operator's unsent draft (`aoe send` and `POST /send` queue them instead
+    /// of dropping them), delivered by the daemon as their own turns once the
+    /// composer clears. `aoe session queue <id>` lists sender, age and the
+    /// first 80 chars of each; `aoe session queue drop <id> <qid>` removes
+    /// one. Looked up across ALL profiles, so no `-p` is needed.
+    Queue(QueueArgs),
+}
+
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct QueueArgs {
+    #[command(subcommand)]
+    pub action: Option<QueueAction>,
+
+    /// Session ID or title (looked up across ALL profiles)
+    pub identifier: Option<String>,
+
+    /// Output as JSON (the queue rows exactly as the daemon holds them)
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand)]
+pub enum QueueAction {
+    /// Remove one queued message by its queue id
+    Drop {
+        /// Session ID or title (looked up across ALL profiles)
+        identifier: String,
+        /// Queue id as printed by `aoe session queue <id>` (e.g. `send-0123456789ab`)
+        qid: String,
+    },
 }
 
 #[derive(Args)]
@@ -518,6 +551,151 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::EmptyTrash => empty_trash(profile).await,
         SessionCommands::Move(args) => move_session(args).await,
         SessionCommands::SetModel(args) => set_model_session(args).await,
+        SessionCommands::Queue(args) => queue_session(args).await,
+    }
+}
+
+/// `aoe session queue <id>` / `aoe session queue drop <id> <qid>`.
+async fn queue_session(args: QueueArgs) -> Result<()> {
+    match args.action {
+        Some(QueueAction::Drop { identifier, qid }) => queue_drop(&identifier, &qid).await,
+        None => {
+            let identifier = args.identifier.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "usage: aoe session queue <session> | aoe session queue drop <session> <qid>"
+                )
+            })?;
+            queue_list(&identifier, args.json).await
+        }
+    }
+}
+
+async fn queue_list(identifier: &str, json: bool) -> Result<()> {
+    let (profile, inst) = find_session_across_profiles(identifier)?;
+    // Daemon-first: the daemon owns the queue and its view is authoritative
+    // for a row it has just retired. Disk is the fallback when no daemon is
+    // reachable (the rows are persisted there too).
+    let (rows, source) = match daemon_queue_list(&inst.id).await {
+        Some(rows) => (rows, "daemon"),
+        None => {
+            let mut rows = inst.queued_prompts.clone();
+            rows.sort_by_key(|e| e.seq);
+            (rows, "disk")
+        }
+    };
+    if json {
+        return super::output::print_json(&rows);
+    }
+    if rows.is_empty() {
+        println!(
+            "No queued messages for '{}' (profile '{}', via {source})",
+            inst.title, profile
+        );
+        return Ok(());
+    }
+    println!(
+        "Queued for '{}' (profile '{}', {} pending, via {source}):",
+        inst.title,
+        profile,
+        rows.len()
+    );
+    println!("{:<18} {:>6}  {:<24} TEXT", "QID", "AGE", "SENDER");
+    let now = chrono::Utc::now();
+    for e in &rows {
+        println!("{}", format_queue_row(e, now));
+    }
+    Ok(())
+}
+
+async fn queue_drop(identifier: &str, qid: &str) -> Result<()> {
+    let (profile, inst) = find_session_across_profiles(identifier)?;
+    match daemon_queue_remove(&inst.id, qid).await? {
+        Some(true) => {
+            println!("Dropped {qid} from '{}' (daemon-side)", inst.title);
+            return Ok(());
+        }
+        Some(false) => bail!("No queued message {qid:?} on '{}'", inst.title),
+        None => {}
+    }
+    let storage = Storage::open_unwatched(&profile)?;
+    let target = inst.id.clone();
+    let found = storage.update(|instances, _groups| {
+        Ok(instances
+            .iter_mut()
+            .find(|i| i.id == target)
+            .map(|i| {
+                let before = i.queued_prompts.len();
+                i.queued_prompts.retain(|q| q.id != qid);
+                i.queued_prompts.len() != before
+            })
+            .unwrap_or(false))
+    })?;
+    if !found {
+        bail!("No queued message {qid:?} on '{}'", inst.title);
+    }
+    println!(
+        "Dropped {qid} from '{}' (on disk, profile '{profile}'; no daemon reachable)",
+        inst.title
+    );
+    Ok(())
+}
+
+/// The daemon's view of the queue, or `None` when no daemon is reachable.
+async fn daemon_queue_list(session_id: &str) -> Option<Vec<crate::acp::state::QueuedPromptEntry>> {
+    use crate::acp::client::{discovery, HttpClient};
+    let endpoint = discovery::discover_local().ok()?;
+    let client = HttpClient::new(endpoint).ok()?;
+    client.queue_list(session_id).await.ok()
+}
+
+/// `Ok(Some(true))` dropped, `Ok(Some(false))` the daemon has no such row,
+/// `Ok(None)` no daemon reachable (fall back to disk).
+async fn daemon_queue_remove(session_id: &str, qid: &str) -> Result<Option<bool>> {
+    use crate::acp::client::{discovery, HttpClient, HttpError};
+    let Ok(endpoint) = discovery::discover_local() else {
+        return Ok(None);
+    };
+    let Ok(client) = HttpClient::new(endpoint) else {
+        return Ok(None);
+    };
+    match client.queue_remove(session_id, qid).await {
+        Ok(()) => Ok(Some(true)),
+        Err(HttpError::Transport(_)) => Ok(None),
+        Err(HttpError::SessionNotFound(_)) => Ok(Some(false)),
+        Err(e) => bail!("daemon refused to drop {qid}: {e}"),
+    }
+}
+
+/// `<qid> <age> <sender> <first 80 chars>`: one queued row for a human.
+/// Whitespace is collapsed so a multi-line report reads as one line.
+fn format_queue_row(
+    entry: &crate::acp::state::QueuedPromptEntry,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let age = chrono::DateTime::parse_from_rfc3339(&entry.created_at)
+        .map(|t| humanize_age((now - t.with_timezone(&chrono::Utc)).num_seconds().max(0)))
+        .unwrap_or_else(|_| "?".to_string());
+    let sender: String = entry
+        .origin_device
+        .as_deref()
+        .unwrap_or("-")
+        .chars()
+        .take(24)
+        .collect();
+    let collapsed = entry.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut text: String = collapsed.chars().take(80).collect();
+    if collapsed.chars().count() > 80 {
+        text.push('…');
+    }
+    format!("{:<18} {:>6}  {:<24} {}", entry.id, age, sender, text)
+}
+
+fn humanize_age(secs: i64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
     }
 }
 
@@ -3572,6 +3750,81 @@ mod restart_args_tests {
             }
             _ => panic!("wrong subcommand"),
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_command_tests {
+    use super::{format_queue_row, humanize_age, QueueAction, SessionCommands};
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        cmd: SessionCommands,
+    }
+
+    #[test]
+    fn queue_list_parses_identifier() {
+        let cli = Cli::try_parse_from(["aoe", "queue", "probe-target", "--json"])
+            .expect("queue <id> must parse");
+        match cli.cmd {
+            SessionCommands::Queue(args) => {
+                assert!(args.action.is_none());
+                assert_eq!(args.identifier.as_deref(), Some("probe-target"));
+                assert!(args.json);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn queue_drop_parses_identifier_and_qid() {
+        let cli =
+            Cli::try_parse_from(["aoe", "queue", "drop", "probe-target", "send-0123456789ab"])
+                .expect("queue drop must parse");
+        match cli.cmd {
+            SessionCommands::Queue(args) => match args.action {
+                Some(QueueAction::Drop { identifier, qid }) => {
+                    assert_eq!(identifier, "probe-target");
+                    assert_eq!(qid, "send-0123456789ab");
+                }
+                _ => panic!("expected drop"),
+            },
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn queue_row_shows_sender_age_and_first_80_chars() {
+        let long = "STATUS: shipped ".repeat(10);
+        let entry = crate::acp::state::QueuedPromptEntry {
+            id: "send-0123456789ab".to_string(),
+            seq: 3,
+            text: format!("{long}\n\nEVIDENCE: build 9f221e45"),
+            attachments: Vec::new(),
+            created_at: "2026-09-04T08:00:00Z".to_string(),
+            origin_device: Some("aoe send from for-dev".to_string()),
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-04T08:05:30Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let row = format_queue_row(&entry, now);
+        assert!(row.starts_with("send-0123456789ab "), "{row}");
+        assert!(row.contains("    5m  "), "{row}");
+        assert!(row.contains("aoe send from for-dev"), "{row}");
+        let text = row.rsplit("  ").next().unwrap();
+        // 80 chars + the ellipsis, whitespace collapsed (no newline survives).
+        assert_eq!(text.chars().count(), 81, "{text}");
+        assert!(text.ends_with('…') && !text.contains('\n'));
+    }
+
+    #[test]
+    fn age_humanizes_by_magnitude() {
+        assert_eq!(humanize_age(42), "42s");
+        assert_eq!(humanize_age(330), "5m");
+        assert_eq!(humanize_age(7_200), "2h");
+        assert_eq!(humanize_age(200_000), "2d");
     }
 }
 

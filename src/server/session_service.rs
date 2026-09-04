@@ -1297,6 +1297,23 @@ impl SessionService {
         self.retire_drained_rows(id, sent_ids).await;
     }
 
+    /// Retire ONE queue row after a terminal-session delivery (see
+    /// `server::send_queue`): the row and any attachment bytes buffered for
+    /// it leave together, as [`Self::retire_drained_rows`] does for the ACP
+    /// drain. Delivery is a recency gesture too (the session has just been
+    /// given input), so `last_accessed_at` advances by monotone max rather
+    /// than `touch_last_accessed()`, for the reasons `enqueue_prompt` gives.
+    pub(crate) async fn retire_delivered_prompt(self: &Arc<Self>, id: &str, prompt_id: &str) {
+        self.acp_event_store
+            .delete_pending_attachments_for_ref(id, prompt_id);
+        let retire = prompt_id.to_string();
+        self.mutate_instance_persisted(id, move |inst| {
+            inst.queued_prompts.retain(|q| q.id != retire);
+            inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
+        })
+        .await;
+    }
+
     /// Drop a set of queue rows and the attachment bytes buffered for them.
     /// Shared by the delivered path and the undeliverable-husk path so both
     /// leave the queue and the pending-attachment store consistent.

@@ -223,18 +223,29 @@ pub async fn relay_send(
         req.from_board.as_deref(),
         req.from_session.as_deref(),
     );
+    // The queue row's sender label: the same board/session tag the message
+    // itself carries, so `aoe session queue` says who is waiting.
+    let sender =
+        compose_relayed_message("", req.from_board.as_deref(), req.from_session.as_deref())
+            .trim()
+            .to_string();
     let inner = super::sessions::send_message(
         State(state.clone()),
         axum::extract::Path(target_id.clone()),
         Ok(Json(super::sessions::SendMessageRequest {
             message: composed,
             revive: true,
+            queue: true,
+            sender: Some(sender),
         })),
     )
     .await
     .into_response();
 
-    if inner.status().is_success() {
+    // 202 = parked on the target's queue (operator draft in its composer):
+    // pass the queued body through untouched so the board sees `sent:false,
+    // queued:true, queue_id` rather than a false "delivered".
+    if inner.status() == StatusCode::OK {
         (
             StatusCode::OK,
             Json(serde_json::json!({

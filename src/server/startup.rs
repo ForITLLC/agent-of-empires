@@ -19,6 +19,7 @@ use super::disk_watch::{disk_watcher_consumer, init_disk_watch_subscriptions};
 use super::ip_discovery::{discover_tagged_ips, IpKind};
 use super::reload::load_all_instances;
 use super::router::build_router;
+use super::send_queue::send_queue_drain_loop;
 use super::serve_snapshot::{
     spawn_serve_snapshot_loop, FormFactorCounters, StructuredTelemetryCounters,
 };
@@ -872,6 +873,19 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         crate::task_util::PanicPolicy::Log,
         async move {
             status_poll_loop(poll_state).await;
+        },
+    );
+
+    // Terminal-session prompt-queue drain: delivers sends that
+    // `POST /send` parked behind an operator's unsent draft once the
+    // composer clears (`server::send_queue`). Structured sessions drain
+    // through the ACP reconciler instead.
+    let drain_state = state.clone();
+    crate::task_util::spawn_supervised(
+        "server.send_queue_drain_loop",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            send_queue_drain_loop(drain_state).await;
         },
     );
 

@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use super::{
     composer::{
         classify_machine_draft, claude_composer_draft, claude_message_stuck_in_composer,
-        claude_pane_input_ready, MachineDraft, ParkedDraftRefusal, SubmitUnconfirmed,
-        DRAFT_TIMEOUT, MAX_SUBMIT_RETRIES, READY_POLL, READY_TIMEOUT, VERIFY_CAPTURE_LINES,
-        VERIFY_SETTLE,
+        claude_pane_input_ready, composer_clear_for_delivery, MachineDraft, ParkedDraftRefusal,
+        SubmitUnconfirmed, DRAFT_TIMEOUT, MAX_SUBMIT_RETRIES, READY_POLL, READY_TIMEOUT,
+        VERIFY_CAPTURE_LINES, VERIFY_SETTLE,
     },
     composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
@@ -1458,6 +1458,29 @@ impl Session {
     /// read here.
     pub fn send_keys_verified(&self, text: &str, enter_delay_ms: u64, tool: &str) -> Result<()> {
         self.send_keys_verified_with_history(text, enter_delay_ms, tool, &[])
+    }
+
+    /// Whether a queued machine delivery may proceed into this pane NOW: one
+    /// capture, no waiting (see [`composer_clear_for_delivery`]). The queue
+    /// drain asks this every tick for every session holding a queue, so a
+    /// pane whose operator is mid-sentence costs one capture per tick, not a
+    /// ten-second draft wait. Tools other than Claude have no composer read
+    /// here and are always clear. A pane that does not exist is never clear:
+    /// there is nothing to deliver into, and the drain does not revive.
+    pub fn composer_clear_for_delivery(
+        &self,
+        text: &str,
+        tool: &str,
+        machine_history: &[String],
+    ) -> Result<bool> {
+        if !self.exists() {
+            return Ok(false);
+        }
+        if tool != "claude" {
+            return Ok(true);
+        }
+        let content = self.capture_pane(VERIFY_CAPTURE_LINES)?;
+        Ok(composer_clear_for_delivery(&content, text, machine_history))
     }
 
     /// [`send_keys_verified`](Self::send_keys_verified) with the pane's
