@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 
 use super::{
     composer::{
-        classify_machine_draft, claude_composer_draft, claude_message_stuck_in_composer,
-        claude_pane_input_ready, composer_clear_for_delivery, MachineDraft, ParkedDraftRefusal,
-        SubmitUnconfirmed, DRAFT_TIMEOUT, MAX_SUBMIT_RETRIES, READY_POLL, READY_TIMEOUT,
-        VERIFY_CAPTURE_LINES, VERIFY_SETTLE,
+        classify_machine_draft, claude_composer_draft, claude_composer_draft_region,
+        claude_message_stuck_in_composer, claude_pane_input_ready, composer_clear_for_delivery,
+        paste_residue, strip_whitespace, MachineDraft, ParkedDraftRefusal, PasteResidue,
+        SubmitUnconfirmed, ABORT_MAX_ROUNDS, DRAFT_TIMEOUT, MAX_SUBMIT_RETRIES,
+        PRE_ENTER_CAPTURE_LINES, PRE_ENTER_REGION, PRE_ENTER_RENDER_GRACE, READY_POLL,
+        READY_TIMEOUT, VERIFY_CAPTURE_LINES, VERIFY_SETTLE,
     },
     composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
@@ -26,6 +28,44 @@ use crate::process;
 use crate::session::environment::shell_escape_script_word;
 use crate::session::Status;
 use crate::util::now_ms;
+
+/// Outcome of phases 1-2 of a verified send.
+enum ComposerPrep {
+    /// The outgoing text was already parked and has been submitted.
+    Submitted,
+    /// The composer is empty; the caller may type.
+    Clear,
+}
+
+/// Outcome of a guarded queued delivery
+/// ([`Session::send_keys_verified_guarded`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardedSend {
+    /// Typed, verified alone in the composer, submitted, confirmed.
+    Delivered,
+    /// A human's bytes appeared beside the paste before Enter. Nothing was
+    /// submitted; the paste was stripped and the human's bytes restored.
+    Aborted(KeystrokeAbort),
+}
+
+/// Counts describing an aborted delivery. Never the human's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeystrokeAbort {
+    /// Human characters found before the paste at abort time.
+    pub before_chars: usize,
+    /// Human characters found after the paste at abort time.
+    pub after_chars: usize,
+    /// Further human characters that landed while the abort ran.
+    pub typed_during_abort: usize,
+    /// The paste had rendered as a Claude "[Pasted text ...]" chip.
+    pub chip: bool,
+    /// Capture/keystroke rounds the abort took.
+    pub rounds: usize,
+    /// The composer verifiably holds exactly the human's bytes again.
+    pub restored: bool,
+    /// One line for the log.
+    pub detail: String,
+}
 
 pub struct Session {
     name: String,
@@ -1388,8 +1428,21 @@ impl Session {
         if !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
-
         let target = format!("{}:^.0", self.name);
+        Self::type_text(&target, text)?;
+        if enter_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
+        }
+        // Enter to submit
+        Self::tmux_send(&target, &["Enter"])
+    }
+
+    /// Types `text` into the pane WITHOUT the submitting Enter: the
+    /// paste-buffer / `send-keys -l` half of
+    /// [`send_keys_with_delay`](Self::send_keys_with_delay), split out so a
+    /// guarded delivery can read the composer back between the paste and
+    /// its Enter.
+    fn type_text(target: &str, text: &str) -> Result<()> {
         let byte_len = text.len();
         let line_count = text.lines().count();
         let max_line = text.lines().map(str::len).max().unwrap_or(0);
@@ -1427,22 +1480,40 @@ impl Session {
         );
 
         if use_paste_buffer {
-            Self::send_via_paste_buffer(&target, text)?;
+            Self::send_via_paste_buffer(target, text)
         } else {
             let payload = pad_slash_command_for_autocomplete(text);
             // `--` ends option parsing so lines beginning with `-` (markdown
             // bullets, CLI flags in prompts) are not misread as tmux flags.
-            Self::tmux_send(&target, &["-l", "--", &payload])?;
+            Self::tmux_send(target, &["-l", "--", &payload])
         }
+    }
 
-        if enter_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
+    /// How long since a tmux CLIENT last sent a key into this session
+    /// (`#{session_activity}`, one-second granularity). Measured on tmux 3.4:
+    /// `send-keys` does NOT move it, only keys from an attached client do, so
+    /// it is a clean "a human is at this pane" signal for the queue's quiet
+    /// window. `None` when tmux cannot answer.
+    pub fn client_key_age(&self) -> Option<Duration> {
+        let out = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-t",
+                &self.name,
+                "-p",
+                "#{session_activity}",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
         }
-
-        // Enter to submit
-        Self::tmux_send(&target, &["Enter"])?;
-
-        Ok(())
+        let at: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(Duration::from_secs(now.saturating_sub(at)))
     }
 
     /// Like [`send_keys_with_delay`](Self::send_keys_with_delay), but for a
@@ -1504,7 +1575,24 @@ impl Session {
         if !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
+        if let ComposerPrep::Submitted = self.prepare_composer(text, tool, machine_history)? {
+            return Ok(());
+        }
+        // Phase 3: type + Enter, then Phase 4: confirm the Enter registered.
+        self.send_keys_with_delay(text, enter_delay_ms)?;
+        self.confirm_submitted(text, tool, false)
+    }
 
+    /// Phases 1-2 of a verified send: wait for the composer to render, then
+    /// deal with anything parked in it. `Submitted` means the outgoing text
+    /// was already there and has now been submitted (delivery complete);
+    /// `Clear` means the composer is empty and the caller may type.
+    fn prepare_composer(
+        &self,
+        text: &str,
+        tool: &str,
+        machine_history: &[String],
+    ) -> Result<ComposerPrep> {
         // Phase 1: the composer must be rendered. Measured on a live boot,
         // the pane's shell is replaced ~600ms before the composer renders and
         // a paste landing in that gap keeps its text but loses its Enter.
@@ -1532,7 +1620,8 @@ impl Session {
                     tracing::info!(target: "tmux.command",
                         "send_keys_verified: outgoing text already parked in {}; submitting bare Enter",
                         self.name);
-                    return self.submit_parked(text, tool, false);
+                    self.submit_parked(text, tool, false)?;
+                    return Ok(ComposerPrep::Submitted);
                 }
                 MachineDraft::Prior => {
                     tracing::info!(target: "tmux.command",
@@ -1553,10 +1642,248 @@ impl Session {
                 }
             }
         }
+        Ok(ComposerPrep::Clear)
+    }
 
-        // Phase 3: type + Enter, then Phase 4: confirm the Enter registered.
-        self.send_keys_with_delay(text, enter_delay_ms)?;
-        self.confirm_submitted(text, tool, false)
+    /// A queued delivery's verified send with the keystroke-race guard
+    /// (WO#1897-R): phases 1-2 as [`send_keys_verified_with_history`]
+    /// (Self::send_keys_verified_with_history), then the text is typed
+    /// WITHOUT Enter, the composer is given `settle` to render it, and it is
+    /// read back and decomposed against the text ([`paste_residue`]). Only a
+    /// composer holding exactly the paste gets the Enter, immediately after
+    /// that read. Any other byte beside the paste is a human's keystroke:
+    /// the paste is removed, the human's bytes are restored, nothing is
+    /// submitted, and the caller re-queues the row.
+    ///
+    /// Two shapes the read cannot decide are handled explicitly and logged:
+    /// a composer whose region is clipped past the capture (a very long
+    /// inline paste) is submitted as before, a documented limitation; text
+    /// the paste does not explain at all withholds the Enter and leaves the
+    /// row queued for the next tick's classification.
+    pub fn send_keys_verified_guarded(
+        &self,
+        text: &str,
+        enter_delay_ms: u64,
+        tool: &str,
+        machine_history: &[String],
+        settle: Duration,
+    ) -> Result<GuardedSend> {
+        if tool != "claude" {
+            self.send_keys_with_delay(text, enter_delay_ms)?;
+            return Ok(GuardedSend::Delivered);
+        }
+        if !self.exists() {
+            bail!("Session does not exist: {}", self.name);
+        }
+        if let ComposerPrep::Submitted = self.prepare_composer(text, tool, machine_history)? {
+            return Ok(GuardedSend::Delivered);
+        }
+
+        let target = format!("{}:^.0", self.name);
+        Self::type_text(&target, text)?;
+        let typed_at = Instant::now();
+        let settle = settle.max(Duration::from_millis(enter_delay_ms));
+        std::thread::sleep(settle);
+        let render_deadline = typed_at + settle + PRE_ENTER_RENDER_GRACE;
+        loop {
+            // This read is the "still clear immediately before Enter" check:
+            // the Enter below follows it by one tmux call.
+            let draft = self.pre_enter_draft()?;
+            match paste_residue(draft.as_deref(), text) {
+                PasteResidue::Clean { chip } => {
+                    tracing::debug!(target: "tmux.command",
+                        "guarded send: composer holds exactly the paste (chip={chip}) in {}; submitting",
+                        self.name);
+                    break;
+                }
+                PasteResidue::Human {
+                    before,
+                    after,
+                    chip,
+                } => {
+                    let abort = self.abort_paste(&target, text, &before, &after, chip)?;
+                    return Ok(GuardedSend::Aborted(abort));
+                }
+                PasteResidue::Pending => {
+                    if Instant::now() < render_deadline {
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    match draft {
+                        None => {
+                            // The paste is gone without our Enter: the pane
+                            // submitted it (a human Enter, or a boot-time
+                            // mode churn). Nothing is left to type; treating
+                            // it as undelivered would paste it twice.
+                            tracing::warn!(target: "tmux.command",
+                                "guarded send: paste vanished from {} before Enter; treating as submitted",
+                                self.name);
+                            return Ok(GuardedSend::Delivered);
+                        }
+                        Some(_) => {
+                            tracing::warn!(target: "tmux.command",
+                                "guarded send: composer region in {} is clipped past {} rows; residue check \
+                                 cannot see its end (documented limitation); submitting",
+                                self.name, PRE_ENTER_REGION);
+                            break;
+                        }
+                    }
+                }
+                PasteResidue::Unverifiable => {
+                    tracing::warn!(target: "tmux.command",
+                        "guarded send: composer text in {} does not match the paste; Enter withheld, \
+                         row stays queued for the next classification",
+                        self.name);
+                    bail!("pre-Enter composer read unverifiable; Enter withheld");
+                }
+            }
+        }
+        Self::tmux_send(&target, &["Enter"])?;
+        self.confirm_submitted(text, tool, false)?;
+        Ok(GuardedSend::Delivered)
+    }
+
+    /// The composer's content for the pre-Enter check: a deeper capture and
+    /// region than the draft gate uses, because the composer legitimately
+    /// holds a whole machine message here.
+    fn pre_enter_draft(&self) -> Result<Option<String>> {
+        let content = self.capture_pane(PRE_ENTER_CAPTURE_LINES)?;
+        Ok(claude_composer_draft_region(&content, PRE_ENTER_REGION))
+    }
+
+    /// Removes the paste from a composer a human is typing in, leaving their
+    /// bytes. The caret sits at the end of the composer, so the human's
+    /// bytes AFTER the paste are deleted first (remembered), then the paste
+    /// (one Backspace for a chip, one per character inline), then the
+    /// remembered bytes are typed back. Every round re-reads the composer,
+    /// so keystrokes the human lands DURING the abort are picked up and
+    /// restored too, in order; the loop is bounded and stops touching the
+    /// pane the moment the composer stops matching what it expects. The
+    /// human's text is counted in the log, never written to it.
+    fn abort_paste(
+        &self,
+        target: &str,
+        text: &str,
+        before: &str,
+        after: &str,
+        chip: bool,
+    ) -> Result<KeystrokeAbort> {
+        tracing::warn!(target: "tmux.command",
+            "guarded send: human bytes beside the paste in {} (before={} after={} chip={chip}); \
+             aborting, stripping the paste, keeping the human's bytes",
+            self.name, before.chars().count(), after.chars().count());
+        let before_n = strip_whitespace(before);
+        let text_n = strip_whitespace(text);
+        let paste_chars = if chip { 1 } else { text.chars().count() };
+        let mut human_tail = String::new();
+        let mut rounds = 0usize;
+        let mut restored = false;
+        let mut detail = String::new();
+        loop {
+            if rounds >= ABORT_MAX_ROUNDS {
+                detail = format!("gave up after {rounds} rounds");
+                break;
+            }
+            rounds += 1;
+            let draft = self.pre_enter_draft()?;
+            match paste_residue(draft.as_deref(), text) {
+                PasteResidue::Human { after, .. } if !after.is_empty() => {
+                    // Human bytes after the paste: remember, then delete.
+                    let n = after.chars().count();
+                    human_tail.push_str(&after);
+                    Self::backspace(target, n)?;
+                }
+                PasteResidue::Human { .. } | PasteResidue::Clean { .. } => {
+                    // The paste is now the composer's tail: delete it whole.
+                    Self::backspace(target, paste_chars)?;
+                }
+                PasteResidue::Pending => match draft {
+                    None => {
+                        // Composer empty: everything is gone; retype below.
+                        break;
+                    }
+                    Some(d) => {
+                        // A prefix of the paste remains (nothing before it).
+                        Self::backspace(target, d.chars().count().max(1))?;
+                    }
+                },
+                PasteResidue::Unverifiable => {
+                    // The paste is no longer findable. Compare what is left
+                    // against the human's leading bytes.
+                    let dn = strip_whitespace(draft.as_deref().unwrap_or(""));
+                    if dn == before_n {
+                        break;
+                    }
+                    if let Some(extra) = dn.strip_prefix(before_n.as_str()) {
+                        // Leftover past the human's prefix: the longest run
+                        // that is a prefix of the paste is paste remnant;
+                        // anything after it was typed since the last read.
+                        let k = (0..=extra.len())
+                            .rev()
+                            .find(|&k| extra.is_char_boundary(k) && text_n.starts_with(&extra[..k]))
+                            .unwrap_or(0);
+                        let newer = &extra[k..];
+                        if !newer.is_empty() {
+                            human_tail.push_str(newer);
+                        }
+                        Self::backspace(target, extra.chars().count().max(1))?;
+                    } else if let Some(missing) = before_n.strip_prefix(dn.as_str()) {
+                        // Over-deleted into the human's prefix: put it back.
+                        Self::tmux_send(target, &["-l", "--", missing])?;
+                    } else {
+                        detail =
+                            "composer diverged from the human's prefix; left as is".to_string();
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        if !human_tail.is_empty() {
+            Self::tmux_send(target, &["-l", "--", &human_tail])?;
+            std::thread::sleep(Duration::from_millis(120));
+        }
+        if detail.is_empty() {
+            let expect = format!("{before_n}{}", strip_whitespace(&human_tail));
+            let final_n = strip_whitespace(self.pre_enter_draft()?.as_deref().unwrap_or(""));
+            restored = final_n == expect;
+            detail = if restored {
+                format!(
+                    "composer holds the human's {} char(s) again",
+                    expect.chars().count()
+                )
+            } else {
+                format!(
+                    "composer holds {} char(s), expected the human's {}",
+                    final_n.chars().count(),
+                    expect.chars().count()
+                )
+            };
+        }
+        let abort = KeystrokeAbort {
+            before_chars: before.chars().count(),
+            after_chars: after.chars().count(),
+            typed_during_abort: human_tail
+                .chars()
+                .count()
+                .saturating_sub(after.chars().count()),
+            chip,
+            rounds,
+            restored,
+            detail,
+        };
+        tracing::warn!(target: "tmux.command",
+            "guarded send: aborted in {}: {}", self.name, abort.detail);
+        Ok(abort)
+    }
+
+    /// `n` Backspaces in one tmux call (`send-keys -N`).
+    fn backspace(target: &str, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let count = n.to_string();
+        Self::tmux_send(target, &["-N", &count, "BSpace"])
     }
 
     /// Submits text already parked in the composer with a bare Enter and

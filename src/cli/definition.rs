@@ -39,7 +39,11 @@ use super::update::UpdateArgs;
 use super::url::UrlArgs;
 use super::worktree::WorktreeCommands;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+// The git-stamped build identity (`1.15.3+g<sha>`), not the bare package
+// version: upstream ships commits without bumping `Cargo.toml`, so two
+// binaries a dozen features apart both said `1.15.3` and a fleet operator
+// could not tell from `aoe --version` which one was installed.
+const VERSION: &str = crate::build_info::BUILD_VERSION;
 
 #[derive(Parser)]
 #[command(name = "aoe")]

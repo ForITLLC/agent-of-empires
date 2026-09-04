@@ -35,6 +35,19 @@ pub(crate) const VERIFY_SETTLE: std::time::Duration = std::time::Duration::from_
 pub(crate) const MAX_SUBMIT_RETRIES: u32 = 3;
 /// Rows captured for the ready / draft / stuck checks.
 pub(crate) const VERIFY_CAPTURE_LINES: usize = 30;
+/// Rows captured, and continuation rows scanned below `❯`, for the
+/// pre-Enter residue check of a queued delivery. A machine message wraps
+/// over many more rows than a human's draft; the region must hold all of it
+/// or a human byte at its end is invisible.
+pub(crate) const PRE_ENTER_CAPTURE_LINES: usize = 80;
+pub(crate) const PRE_ENTER_REGION: usize = 60;
+/// After the settle, how much longer a paste is given to render before the
+/// check gives up waiting for it.
+pub(crate) const PRE_ENTER_RENDER_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(1000);
+/// Capture -> decide -> keystroke rounds an abort may spend removing the
+/// paste from beside a human's bytes before it stops touching the pane.
+pub(crate) const ABORT_MAX_ROUNDS: usize = 40;
 
 /// A numbered menu option, optionally preceded by the `❯`/`>` selection
 /// cursor: `❯ 1. Yes`, `2. No`, `3. No, and tell Claude ...`. The
@@ -169,6 +182,14 @@ pub(crate) fn claude_pane_input_ready(raw_content: &str) -> bool {
 /// box are interior, not content, and must not be filtered out before the
 /// rows are located.
 pub(crate) fn claude_composer_draft(raw_content: &str) -> Option<String> {
+    claude_composer_draft_region(raw_content, CLAUDE_COMPOSER_MAX_REGION)
+}
+
+/// [`claude_composer_draft`] with the continuation-row budget chosen by the
+/// caller. The pre-Enter residue check (`paste_residue`) reads a composer
+/// that legitimately holds a whole machine message, which can wrap over far
+/// more rows than a human's draft, so it captures deeper and scans further.
+pub(crate) fn claude_composer_draft_region(raw_content: &str, max_region: usize) -> Option<String> {
     let clean = strip_ansi(&strip_dim_spans(raw_content));
     let lines: Vec<&str> = clean.lines().collect();
 
@@ -201,7 +222,7 @@ pub(crate) fn claude_composer_draft(raw_content: &str) -> Option<String> {
     let mut body = vec![prompt_text.to_string()];
     let mut closed = false;
     let mut row = prompt_row + 1;
-    while row < lines.len() && row - prompt_row <= CLAUDE_COMPOSER_MAX_REGION {
+    while row < lines.len() && row - prompt_row <= max_region {
         let trimmed = lines[row].trim();
         if claude_line_is_horizontal_rule(trimmed) {
             closed = true;
@@ -411,6 +432,93 @@ pub(crate) fn classify_machine_draft(
         return MachineDraft::Prior;
     }
     MachineDraft::No
+}
+
+/// Claude Code's collapsed-paste chip. Measured live on Claude Code
+/// 2.1.258: a bracketed paste of four or more lines renders as
+/// `[Pasted text #N +M lines]` (three lines stay inline), a human's later
+/// keystrokes append after the chip, and one Backspace removes the whole
+/// chip as a unit.
+fn paste_chip_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\[Pasted text #\d+ \+\d+ lines\]").expect("static regex"))
+}
+
+/// Every non-whitespace character, in order. The composer wraps rows at
+/// pane width and the capture trims them, so a token can split across a
+/// row boundary; this form compares content regardless.
+pub(crate) fn strip_whitespace(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// What the composer holds RELATIVE to the text a queued delivery has just
+/// pasted, read in the settle window between the paste and its Enter.
+///
+/// This is the keystroke-race check (WO#1897-R). A human who clears their
+/// draft and starts typing races the drain: the daemon sees the composer
+/// clear, pastes, and its Enter submits the paste fused with whatever the
+/// human typed in between — observed live as a machine message ending in a
+/// stray `c` and a human draft missing its first letter. Before Enter the
+/// composer is read again and decomposed against the pasted text: exactly
+/// the paste means submit; anything beside it is the human's and means
+/// abort, strip the paste, leave their bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PasteResidue {
+    /// Exactly the paste (inline, or collapsed to a chip) and nothing else.
+    Clean { chip: bool },
+    /// Bytes that are not the paste sit beside it: a human's keystrokes.
+    /// `before` / `after` are the whitespace-normalized foreign text on
+    /// each side of the paste; never logged, only counted.
+    Human {
+        before: String,
+        after: String,
+        chip: bool,
+    },
+    /// The composer is empty or holds a strict prefix of the text: the paste
+    /// has not rendered yet, or the captured region is clipped.
+    Pending,
+    /// The composer holds text the paste does not explain at all.
+    Unverifiable,
+}
+
+pub(crate) fn paste_residue(draft: Option<&str>, text: &str) -> PasteResidue {
+    let Some(draft) = draft else {
+        return PasteResidue::Pending;
+    };
+    let d = normalize_draft_text(draft);
+    let t = normalize_draft_text(text);
+    if t.is_empty() {
+        return PasteResidue::Unverifiable;
+    }
+    if let Some(i) = d.find(&t) {
+        return residue_around(&d[..i], &d[i + t.len()..], false);
+    }
+    if let Some(m) = paste_chip_regex().find(&d) {
+        return residue_around(&d[..m.start()], &d[m.end()..], true);
+    }
+    // Wrapped mid-token: the paste is there but a row boundary split a word.
+    let dn = strip_whitespace(&d);
+    let tn = strip_whitespace(&t);
+    if let Some(i) = dn.find(&tn) {
+        return residue_around(&dn[..i], &dn[i + tn.len()..], false);
+    }
+    if tn.starts_with(&dn) {
+        return PasteResidue::Pending;
+    }
+    PasteResidue::Unverifiable
+}
+
+fn residue_around(before: &str, after: &str, chip: bool) -> PasteResidue {
+    let (before, after) = (before.trim(), after.trim());
+    if before.is_empty() && after.is_empty() {
+        PasteResidue::Clean { chip }
+    } else {
+        PasteResidue::Human {
+            before: before.to_string(),
+            after: after.to_string(),
+            chip,
+        }
+    }
 }
 
 /// Is the Claude composer clear for a queued machine delivery right now?
@@ -984,5 +1092,97 @@ mod delivery_gate_tests {
         let dialog = "Do you want to proceed?\n  1. Yes\n  2. No\n";
         assert!(!composer_clear_for_delivery(dialog, "STATUS: shipped", &[]));
         assert!(!composer_clear_for_delivery("", "STATUS: shipped", &[]));
+    }
+}
+
+#[cfg(test)]
+mod residue_tests {
+    use super::{paste_residue, PasteResidue};
+
+    const MSG: &str = "STATUS: shipped - WO#1897 queue landed, build 9f221e45 live on the VM";
+
+    #[test]
+    fn exact_paste_is_clean() {
+        assert_eq!(
+            paste_residue(Some(MSG), MSG),
+            PasteResidue::Clean { chip: false }
+        );
+        // Re-wrapped to pane width, still clean.
+        let wrapped = "STATUS: shipped - WO#1897 queue\nlanded, build 9f221e45 live on\nthe VM";
+        assert_eq!(
+            paste_residue(Some(wrapped), MSG),
+            PasteResidue::Clean { chip: false }
+        );
+        // Wrapped mid-token (the capture trims each row).
+        let split = "STATUS: shipped - WO#1897 queue land\ned, build 9f221e45 live on the VM";
+        assert_eq!(
+            paste_residue(Some(split), MSG),
+            PasteResidue::Clean { chip: false }
+        );
+    }
+
+    #[test]
+    fn human_byte_after_the_paste_is_detected() {
+        // The live defect: the human typed `c` between the paste and Enter.
+        let fused = format!("{MSG}c");
+        assert_eq!(
+            paste_residue(Some(&fused), MSG),
+            PasteResidue::Human {
+                before: String::new(),
+                after: "c".to_string(),
+                chip: false
+            }
+        );
+        let typed = format!("{MSG} can we extend");
+        assert!(matches!(
+            paste_residue(Some(&typed), MSG),
+            PasteResidue::Human { ref after, .. } if after == "can we extend"
+        ));
+    }
+
+    #[test]
+    fn human_bytes_before_the_paste_are_detected() {
+        // The human's first keystroke landed before the paste arrived.
+        let fused = format!("ca{MSG}");
+        assert!(matches!(
+            paste_residue(Some(&fused), MSG),
+            PasteResidue::Human { ref before, ref after, .. } if before == "ca" && after.is_empty()
+        ));
+    }
+
+    #[test]
+    fn chip_with_and_without_human_bytes() {
+        let multi = "line one\nline two\nline three\nline four\nline five";
+        assert_eq!(
+            paste_residue(Some("[Pasted text #7 +5 lines]"), multi),
+            PasteResidue::Clean { chip: true }
+        );
+        assert_eq!(
+            paste_residue(Some("[Pasted text #7 +5 lines]csn"), multi),
+            PasteResidue::Human {
+                before: String::new(),
+                after: "csn".to_string(),
+                chip: true
+            }
+        );
+        assert!(matches!(
+            paste_residue(Some("x [Pasted text #7 +5 lines]"), multi),
+            PasteResidue::Human { ref before, chip: true, .. } if before == "x"
+        ));
+    }
+
+    #[test]
+    fn empty_or_partial_composer_is_pending() {
+        assert_eq!(paste_residue(None, MSG), PasteResidue::Pending);
+        assert_eq!(paste_residue(Some(&MSG[..20]), MSG), PasteResidue::Pending);
+    }
+
+    #[test]
+    fn foreign_text_is_unverifiable() {
+        assert_eq!(
+            paste_residue(Some("something else entirely"), MSG),
+            PasteResidue::Unverifiable
+        );
+        assert_eq!(paste_residue(Some(MSG), "   "), PasteResidue::Unverifiable);
     }
 }
