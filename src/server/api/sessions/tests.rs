@@ -3143,6 +3143,8 @@ async fn send_message_refreshes_instance_after_instance_lock() {
         Ok(Json(SendMessageRequest {
             message: "hello".into(),
             revive: false,
+            queue: true,
+            sender: None,
         })),
     );
     tokio::pin!(handler);

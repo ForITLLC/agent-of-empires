@@ -33,13 +33,13 @@ const MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
 /// mutation rewrites the whole profile session file, so depth costs disk I/O on
 /// each enqueue rather than just memory. Well above any plausible run of
 /// follow-ups a person lines up behind one turn.
-const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
+pub(super) const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
 
 /// Cap on a single queued prompt's text. Matches nothing upstream because
 /// `/acp/prompt` streams straight to the agent, while this text is persisted to
 /// the session file and rewritten on every subsequent queue mutation. 256 KiB
 /// is far past a pasted stack trace and still bounds that rewrite.
-const MAX_QUEUED_TEXT_BYTES: usize = 256 * 1024;
+pub(super) const MAX_QUEUED_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct EnqueueRequest {

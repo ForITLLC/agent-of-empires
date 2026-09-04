@@ -19,10 +19,131 @@ pub struct SendMessageRequest {
     /// `--no-revive` CLI flag).
     #[serde(default = "default_revive")]
     pub revive: bool,
+    /// When the composer holds an operator's unsent draft, park the message
+    /// on the session's server-owned prompt queue (202, `queued: true`)
+    /// instead of refusing it (423 `parked_draft`); the daemon delivers it
+    /// as its own turn once the composer clears (`server::send_queue`).
+    /// Defaults to `true`; `false` restores the plain refusal (parity with
+    /// `aoe send --no-queue`).
+    #[serde(default = "default_queue")]
+    pub queue: bool,
+    /// Free-text sender label recorded on the queued row (`origin_device`),
+    /// so `aoe session queue <id>` can say who is waiting. Optional.
+    #[serde(default)]
+    pub sender: Option<String>,
 }
 
 fn default_revive() -> bool {
     true
+}
+
+fn default_queue() -> bool {
+    true
+}
+
+/// Queue ids minted for parked sends: `send-` + 12 hex, short enough to
+/// type into `aoe session queue drop <id> <qid>`.
+fn new_send_queue_id() -> String {
+    let raw = uuid::Uuid::new_v4().simple().to_string();
+    format!("send-{}", &raw[..12])
+}
+
+/// Why a parked send could NOT be queued; the caller then answers with the
+/// plain 423 refusal, annotated.
+#[derive(Debug, PartialEq, Eq)]
+enum NotQueued {
+    /// The queue is at its depth cap (`depth` rows).
+    Full(usize),
+    /// The message exceeds the per-row text cap.
+    TooLarge,
+    /// The session vanished between the refusal and the enqueue.
+    Gone,
+}
+
+/// Park a refused send on the session's server-owned prompt queue. The
+/// caller holds the instance lock; the submission guard is claimed here in
+/// the same order the drain uses (instance lock, then submission), so the
+/// row can never be appended inside a drain's snapshot-to-send window
+/// (#3621). Returns the row and its 1-based FIFO position.
+async fn queue_parked_send(
+    state: &Arc<AppState>,
+    id: &str,
+    message: String,
+    sender: Option<String>,
+) -> Result<(crate::acp::state::QueuedPromptEntry, usize), NotQueued> {
+    if message.len() > crate::server::api::queue::MAX_QUEUED_TEXT_BYTES {
+        return Err(NotQueued::TooLarge);
+    }
+    let _submission = state.session_service.prompt_submission(id).await;
+    let depth = state
+        .session_service
+        .queued_prompts_snapshot(id)
+        .await
+        .len();
+    if depth >= crate::server::api::queue::MAX_QUEUED_PROMPTS_PER_SESSION {
+        return Err(NotQueued::Full(depth));
+    }
+    let origin = sender
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "api send".to_string());
+    let entry = state
+        .session_service
+        .enqueue_prompt(
+            id,
+            new_send_queue_id(),
+            message,
+            Vec::new(),
+            Some(origin),
+            chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        .ok_or(NotQueued::Gone)?;
+    let position = state
+        .session_service
+        .queued_prompts_snapshot(id)
+        .await
+        .iter()
+        .position(|e| e.id == entry.id)
+        .map(|p| p + 1)
+        .unwrap_or(depth + 1);
+    Ok((entry, position))
+}
+
+/// The wire contract for a send parked on the queue instead of refused.
+///
+/// 202 Accepted, not 423: the message is now the daemon's to deliver, and
+/// an HTTP client that treats every 4xx as failure would retry and queue
+/// it twice. Existing callers keep branching on `sent` (still `false`) and
+/// `error` (still `parked_draft`), so a consumer that never learned
+/// `queued` reads it as not-delivered-yet, and one that has looks at
+/// `queue_id` / `position`. `retry_safe` is `false` for the same reason
+/// (a resend double-queues). Draft size only, never its text.
+fn queued_send_parts(
+    refusal: &crate::tmux::ParkedDraftRefusal,
+    entry: &crate::acp::state::QueuedPromptEntry,
+    position: usize,
+) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::ACCEPTED,
+        serde_json::json!({
+            "error": "parked_draft",
+            "reason": "operator_draft_in_composer",
+            "sent": false,
+            "queued": true,
+            "queue_id": entry.id,
+            "position": position,
+            "queued_at": entry.created_at,
+            "retry_safe": false,
+            "delivery": "auto_when_composer_clear",
+            "draft_chars": refusal.chars,
+            "draft_lines": refusal.lines,
+            "detail": format!(
+                "{refusal} Queued as {} at position {position}: the daemon delivers it as \
+                 its own turn once the composer is clear. Do not resend.",
+                entry.id
+            ),
+        }),
+    )
 }
 
 #[derive(Debug)]
@@ -164,6 +285,9 @@ pub async fn send_message(
     let tool = instance.tool.clone();
     let message = req.message;
     let revive = req.revive;
+    let queue_on_parked = req.queue;
+    let sender = req.sender;
+    let message_for_queue = message.clone();
     let send_result = tokio::task::spawn_blocking(move || -> SendKeysResult {
         // Revive the pane before sending. Without this, a send to a dead
         // pane silently writes keystrokes to a corpse with no agent.
@@ -342,6 +466,46 @@ pub async fn send_message(
                         let mut instances = state.instances.write().await;
                         if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                             apply_cascade_state_sync(i, &sync_base, &started);
+                        }
+                    }
+                    if queue_on_parked {
+                        // The message is NOT lost: park it on the session's
+                        // server-owned prompt queue. `server::send_queue`
+                        // delivers it as its own turn once the composer
+                        // clears, and the row survives a daemon restart.
+                        match queue_parked_send(&state, &id, message_for_queue, sender).await {
+                            Ok((entry, position)) => {
+                                tracing::info!(target: "http.api.sessions",
+                                    "send_message: queued for {id} as {} (position {position})", entry.id);
+                                let (status, body) = queued_send_parts(refusal, &entry, position);
+                                return (status, Json(body)).into_response();
+                            }
+                            Err(NotQueued::Gone) => {
+                                return (
+                                    StatusCode::NOT_FOUND,
+                                    Json(serde_json::json!({"error": "not_found"})),
+                                )
+                                    .into_response();
+                            }
+                            Err(why) => {
+                                // Plain refusal, annotated with why the
+                                // queue would not take it.
+                                tracing::warn!(target: "http.api.sessions",
+                                    "send_message: refused for {id} and NOT queued: {why:?}");
+                                let (status, mut body) = send_error_parts(&send_err);
+                                body["queued"] = serde_json::json!(false);
+                                match why {
+                                    NotQueued::Full(depth) => {
+                                        body["queue_full"] = serde_json::json!(true);
+                                        body["queue_depth"] = serde_json::json!(depth);
+                                    }
+                                    NotQueued::TooLarge => {
+                                        body["queue_too_large"] = serde_json::json!(true);
+                                    }
+                                    NotQueued::Gone => unreachable!(),
+                                }
+                                return (status, Json(body)).into_response();
+                            }
                         }
                     }
                 }
@@ -848,6 +1012,63 @@ mod send_error_contract_tests {
             "refusal body leaked the draft: {wire}"
         );
         assert!(body["detail"].as_str().unwrap().contains("NOT SENT"));
+    }
+
+    /// A parked send that was QUEUED is 202 Accepted: still `sent: false`
+    /// and `error: parked_draft` for callers that branch on those, plus the
+    /// queue row's id and position; a resend is flagged unsafe (it would
+    /// double-queue). The draft's text is still withheld.
+    #[test]
+    fn queued_parked_send_is_202_with_queue_id_and_position() {
+        let draft = "yes, authorize the vendor bump and send the escalation emails";
+        let refusal = crate::tmux::ParkedDraftRefusal::from_draft(draft);
+        let entry = crate::acp::state::QueuedPromptEntry {
+            id: "send-0123456789ab".to_string(),
+            seq: 7,
+            text: "STATUS: shipped".to_string(),
+            attachments: Vec::new(),
+            created_at: "2026-09-04T08:30:00Z".to_string(),
+            origin_device: Some("aoe send".to_string()),
+        };
+        let (status, body) = queued_send_parts(&refusal, &entry, 2);
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["error"], "parked_draft");
+        assert_eq!(body["sent"], false);
+        assert_eq!(body["queued"], true);
+        assert_eq!(body["queue_id"], "send-0123456789ab");
+        assert_eq!(body["position"], 2);
+        assert_eq!(body["retry_safe"], false);
+        assert_eq!(body["delivery"], "auto_when_composer_clear");
+        assert_eq!(body["draft_chars"], draft.chars().count());
+        let wire = body.to_string();
+        assert!(
+            !wire.contains("vendor"),
+            "queued body leaked the draft: {wire}"
+        );
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("send-0123456789ab"));
+    }
+
+    #[test]
+    fn send_queue_ids_are_short_and_prefixed() {
+        let a = new_send_queue_id();
+        let b = new_send_queue_id();
+        assert!(a.starts_with("send-") && a.len() == 17, "{a}");
+        assert_ne!(a, b);
+    }
+
+    /// The request defaults: queueing is on unless the caller opts out.
+    #[test]
+    fn send_request_defaults_to_queue() {
+        let req: SendMessageRequest = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
+        assert!(req.queue);
+        assert!(req.sender.is_none());
+        let req: SendMessageRequest =
+            serde_json::from_str(r#"{"message":"hi","queue":false,"sender":"for-dev"}"#).unwrap();
+        assert!(!req.queue);
+        assert_eq!(req.sender.as_deref(), Some("for-dev"));
     }
 
     /// Typed-but-unsubmitted is 502 and says so: sent=false, typed=true.
