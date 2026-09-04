@@ -127,6 +127,43 @@ pub fn trust_claude_project(
     Ok(())
 }
 
+/// Seed Claude Code's user-scope `mcpServers` in `config_path` from `servers`
+/// when the account has none.
+///
+/// An account whose `.claude.json` already lists at least one server is left
+/// exactly as it is: this is a bootstrap for a never-configured (or
+/// freshly-created / move-destination) account, never a sync that overwrites
+/// an operator's edits. Every other key is preserved and a malformed file is
+/// treated as empty, mirroring [`trust_claude_project`]. Returns `true` when
+/// the file was written.
+pub fn seed_claude_mcp_servers(
+    config_path: &Path,
+    servers: &serde_json::Map<String, Value>,
+    policy: SymlinkPolicy,
+) -> Result<bool> {
+    let written = edit_json_config(
+        config_path,
+        policy,
+        &policy.lock_path(config_path)?,
+        |root| {
+            let has_servers = root
+                .get("mcpServers")
+                .and_then(Value::as_object)
+                .is_some_and(|m| !m.is_empty());
+            if !has_servers {
+                root.insert("mcpServers".to_string(), Value::Object(servers.clone()));
+            }
+        },
+        "Claude config root is not a JSON object",
+    )?;
+    if written {
+        tracing::info!(target: "hooks.install",
+            "Seeded {} user-scope MCP server(s) into Claude config {}",
+            servers.len(), config_path.display());
+    }
+    Ok(written)
+}
+
 /// Merge `"<project_path>": "TRUST_FOLDER"` into Gemini's `trustedFolders.json`:
 /// the per-path counterpart that the host uses instead of disabling trust globally.
 pub fn trust_gemini_project(

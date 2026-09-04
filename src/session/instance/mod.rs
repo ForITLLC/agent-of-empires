@@ -39,6 +39,8 @@ mod flags;
 mod folder_trust;
 mod hooks;
 mod identity_sidecar;
+mod mcp_seed;
+pub(crate) use mcp_seed::seed_mcp_servers_from_template;
 mod kill;
 mod launch_command;
 mod lifecycle;
