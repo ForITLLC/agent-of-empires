@@ -10,8 +10,8 @@ use super::{
     composer::{
         classify_machine_draft, claude_composer_draft, claude_composer_draft_region,
         claude_message_stuck_in_composer, claude_pane_input_ready, composer_clear_for_delivery,
-        paste_residue, strip_whitespace, MachineDraft, ParkedDraftRefusal, PasteResidue,
-        SubmitUnconfirmed, ABORT_MAX_ROUNDS, DRAFT_TIMEOUT, MAX_SUBMIT_RETRIES,
+        paste_residue, restore_verdict, strip_whitespace, MachineDraft, ParkedDraftRefusal,
+        PasteResidue, SubmitUnconfirmed, ABORT_MAX_ROUNDS, DRAFT_TIMEOUT, MAX_SUBMIT_RETRIES,
         PRE_ENTER_CAPTURE_LINES, PRE_ENTER_REGION, PRE_ENTER_RENDER_GRACE, READY_POLL,
         READY_TIMEOUT, VERIFY_CAPTURE_LINES, VERIFY_SETTLE,
     },
@@ -1843,22 +1843,14 @@ impl Session {
             Self::tmux_send(target, &["-l", "--", &human_tail])?;
             std::thread::sleep(Duration::from_millis(120));
         }
+        let mut typed_after = 0usize;
         if detail.is_empty() {
             let expect = format!("{before_n}{}", strip_whitespace(&human_tail));
             let final_n = strip_whitespace(self.pre_enter_draft()?.as_deref().unwrap_or(""));
-            restored = final_n == expect;
-            detail = if restored {
-                format!(
-                    "composer holds the human's {} char(s) again",
-                    expect.chars().count()
-                )
-            } else {
-                format!(
-                    "composer holds {} char(s), expected the human's {}",
-                    final_n.chars().count(),
-                    expect.chars().count()
-                )
-            };
+            let verdict = restore_verdict(&final_n, &expect);
+            restored = verdict.restored;
+            typed_after = verdict.typed_after;
+            detail = verdict.detail;
         }
         let abort = KeystrokeAbort {
             before_chars: before.chars().count(),
@@ -1866,7 +1858,8 @@ impl Session {
             typed_during_abort: human_tail
                 .chars()
                 .count()
-                .saturating_sub(after.chars().count()),
+                .saturating_sub(after.chars().count())
+                + typed_after,
             chip,
             rounds,
             restored,
