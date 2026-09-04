@@ -1485,6 +1485,51 @@ pub fn trust_claude_project(
     })
 }
 
+/// Seed Claude Code's user-scope `mcpServers` in `config_path` from `servers`
+/// when the account has none.
+///
+/// An account whose `.claude.json` already lists at least one server is left
+/// exactly as it is: this is a bootstrap for a never-configured (or
+/// freshly-created / move-destination) account, never a sync that overwrites
+/// an operator's edits. Every other key is preserved and a malformed file is
+/// treated as empty, mirroring [`trust_claude_project`]. Returns `true` when
+/// the file was written.
+pub fn seed_claude_mcp_servers(
+    config_path: &Path,
+    servers: &serde_json::Map<String, Value>,
+    policy: SymlinkPolicy,
+) -> Result<bool> {
+    with_config_lock_policy(&policy.lock_path(config_path)?, "json.lock", policy, || {
+        let mut config: Value = if let Some(content) = policy.read(config_path)? {
+            serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", config_path.display(), e);
+                serde_json::json!({})
+            })
+        } else {
+            serde_json::json!({})
+        };
+
+        let root = config
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Claude config root is not a JSON object"))?;
+        let has_servers = root
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .is_some_and(|m| !m.is_empty());
+        if has_servers {
+            return Ok(false);
+        }
+        root.insert("mcpServers".to_string(), Value::Object(servers.clone()));
+
+        let formatted = serde_json::to_string_pretty(&config)?;
+        policy.write(config_path, formatted.as_bytes())?;
+        tracing::info!(target: "hooks.install",
+            "Seeded {} user-scope MCP server(s) into Claude config {}",
+            servers.len(), config_path.display());
+        Ok(true)
+    })
+}
+
 /// Mark `project_path` as trusted in Gemini's `trustedFolders.json` by merging
 /// `"<project_path>": "TRUST_FOLDER"`.
 ///

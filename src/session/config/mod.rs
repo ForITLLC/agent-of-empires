@@ -952,6 +952,24 @@ pub struct SessionConfig {
     )]
     pub pre_trust_agent_folders: bool,
 
+    /// Path of a JSON file holding the user-scope MCP servers every Claude
+    /// account should start with: `{"mcpServers": {...}}` (a `.claude.json`
+    /// excerpt) or the bare map. On each host Claude launch and on
+    /// `session move`, an account whose `.claude.json` lists no `mcpServers`
+    /// is seeded from this ONE template; an account that already lists
+    /// servers is never touched. The file is read at launch and usually holds
+    /// credentials, so keep it mode 0600 and out of version control. A
+    /// configured template that cannot be read or applied aborts the launch.
+    /// Unset = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(
+        label = "Claude MCP servers seed file",
+        widget = "optional_text",
+        category = "Agents",
+        web = "local_only:names a host file whose contents are written into agent config"
+    )]
+    pub claude_mcp_servers_seed: Option<String>,
+
     /// Show the compact system-health strip below the session list. It reports
     /// CPU, memory pressure, and running agent and process counts. Off by
     /// default; also toggleable from the command palette.
@@ -1725,6 +1743,7 @@ impl Default for SessionConfig {
             default_tool: None,
             yolo_mode_default: false,
             pre_trust_agent_folders: false,
+            claude_mcp_servers_seed: None,
             show_diagnostics_pane: false,
             daemon_sidebar: true,
             inherit_host_environment: false,
@@ -4057,6 +4076,20 @@ mod tests {
         let config: Config =
             toml::from_str("[session]\nsession_id_poller_max_threads = 400\n").unwrap();
         assert_eq!(config.session.session_id_poller_max_threads, 400);
+    }
+
+    #[test]
+    fn claude_mcp_servers_seed_is_off_by_default_and_parses() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.session.claude_mcp_servers_seed.is_none());
+        let config: Config = toml::from_str(
+            "[session]\nclaude_mcp_servers_seed = \"~/.claude-accounts/_shared/mcp-servers.json\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.session.claude_mcp_servers_seed.as_deref(),
+            Some("~/.claude-accounts/_shared/mcp-servers.json")
+        );
     }
 
     #[test]
