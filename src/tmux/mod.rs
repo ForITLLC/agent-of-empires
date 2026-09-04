@@ -18,7 +18,10 @@ pub(crate) mod vt;
 
 pub use composer::{ParkedDraftRefusal, SubmitUnconfirmed};
 pub use composite::PaneGeom;
-pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
+pub use session::{
+    GuardedSend, KeystrokeAbort, PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT,
+    SIZE_OWNER_TTL,
+};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::{
     detect_claude, detect_status_from_content, detect_status_from_content_in, detect_via_manifest,
