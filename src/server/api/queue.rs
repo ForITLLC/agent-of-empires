@@ -29,13 +29,15 @@ const MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
 
 /// Cap on queue depth per session. The queue lives on the `Instance` and every
 /// mutation rewrites the whole profile session file, so depth costs disk I/O on
-/// each enqueue rather than just memory.
-const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
+/// each enqueue rather than just memory. Well above any plausible run of
+/// follow-ups a person lines up behind one turn.
+pub(super) const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
 
-/// Cap on a single queued prompt's text. Unlike `/acp/prompt`, which streams
-/// straight to the agent, this text is persisted and rewritten on every
-/// subsequent queue mutation, so 256 KiB bounds that rewrite.
-const MAX_QUEUED_TEXT_BYTES: usize = 256 * 1024;
+/// Cap on a single queued prompt's text. Matches nothing upstream because
+/// `/acp/prompt` streams straight to the agent, while this text is persisted to
+/// the session file and rewritten on every subsequent queue mutation. 256 KiB
+/// is far past a pasted stack trace and still bounds that rewrite.
+pub(super) const MAX_QUEUED_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct EnqueueRequest {
