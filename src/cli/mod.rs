@@ -433,7 +433,9 @@ mod tests {
         let _guard = crate::session::test_support::isolate_app_dir();
         let a = seed_session("scope-one", "twin", None);
         let b = seed_session("scope-two", "twin", None);
-        let err = resolve_scope_in("twin", &two_profiles()).unwrap_err().to_string();
+        let err = resolve_scope_in("twin", &two_profiles())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Ambiguous session title"), "{err}");
         assert!(err.contains("No action taken"), "{err}");
         assert!(err.contains(&format!("scope-one: {a}")), "{err}");
@@ -459,12 +461,20 @@ mod tests {
         let _guard = crate::session::test_support::isolate_app_dir();
         let id = seed_session("scope-one", "alpha", None);
         let prefix = &id[..8];
-        let err = resolve_scope_in(prefix, &two_profiles()).unwrap_err().to_string();
-        assert!(err.starts_with(&format!("Session not found: {prefix}")), "{err}");
+        let err = resolve_scope_in(prefix, &two_profiles())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(&format!("Session not found: {prefix}")),
+            "{err}"
+        );
         let err = resolve_scope_in("no-such-session", &two_profiles())
             .unwrap_err()
             .to_string();
-        assert!(err.starts_with("Session not found: no-such-session"), "{err}");
+        assert!(
+            err.starts_with("Session not found: no-such-session"),
+            "{err}"
+        );
     }
 
     #[test]
