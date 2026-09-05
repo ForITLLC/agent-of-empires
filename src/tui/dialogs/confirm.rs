@@ -129,6 +129,16 @@ impl ConfirmDialog {
         &self.action
     }
 
+    #[cfg(test)]
+    pub(crate) fn title_for_test(&self) -> &str {
+        &self.title
+    }
+
+    #[cfg(test)]
+    pub(crate) fn message_for_test(&self) -> &str {
+        &self.message
+    }
+
     /// The `[Yes]` button hit-rect, populated on `render`. Test-only so a
     /// click path can be exercised at the exact coordinates the dialog draws.
     #[cfg(test)]

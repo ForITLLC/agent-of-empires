@@ -25,6 +25,12 @@ pub struct UpdateArchiveBody {
     /// unconditional. Ignored when `archived = false`. See #1868.
     #[serde(default = "default_kill_pane")]
     pub kill_pane: bool,
+    /// WO#1980-1: the explicit HUMAN override for a kept row. A non-empty
+    /// value (who is overriding) clears the keep flag — logged who/when —
+    /// and lets the archive proceed in one call. Sweeps never send it, so
+    /// they keep getting 409 `session_kept`.
+    #[serde(default)]
+    pub confirm_kept: Option<String>,
 }
 
 fn default_kill_pane() -> bool {
@@ -38,6 +44,10 @@ pub struct TrashSessionBody {
     /// preserves the transcript) is unconditional. Defaults to `true`.
     #[serde(default = "default_kill_pane")]
     pub kill_pane: bool,
+    /// WO#1980-1: explicit human override for a kept row (see
+    /// `UpdateArchiveBody::confirm_kept`).
+    #[serde(default)]
+    pub confirm_kept: Option<String>,
 }
 
 // A no-body trash request resolves through `unwrap_or_default()`, so `Default`
@@ -47,6 +57,7 @@ impl Default for TrashSessionBody {
     fn default() -> Self {
         Self {
             kill_pane: default_kill_pane(),
+            confirm_kept: None,
         }
     }
 }
@@ -59,6 +70,10 @@ pub struct UpdateSnoozeBody {
     /// TUI dialog and CLI use also apply here.
     #[serde(default)]
     pub minutes: Option<u32>,
+    /// WO#1980-1: explicit human override for a kept row (see
+    /// `UpdateArchiveBody::confirm_kept`).
+    #[serde(default)]
+    pub confirm_kept: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +119,72 @@ pub(crate) async fn keep_refusal_response(
         "refused {op}: session is kept"
     );
     Some((StatusCode::CONFLICT, Json(refusal.to_json())).into_response())
+}
+
+/// WO#1980-1: the keep gate with the HUMAN override. Not kept → `None`
+/// (proceed). Kept + a non-empty `confirm_kept` (who) → clear the flag
+/// (persist first, then memory; logged who/when under `session.keep`) and
+/// return `None` so the op proceeds in the same call. Kept + no/empty
+/// override → the 409 from `keep_refusal_response`. Sweeps never carry the
+/// field, so their behaviour is unchanged; a workspace delete never calls
+/// this (it is always a sweep).
+pub(crate) async fn keep_gate_response(
+    state: &Arc<AppState>,
+    id: &str,
+    op: &str,
+    confirm_kept: Option<&str>,
+) -> Option<axum::response::Response> {
+    let who = match confirm_kept.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(who) => who.to_string(),
+        None => return keep_refusal_response(state, id, op).await,
+    };
+    let (profile, title, previously_by) = {
+        let instances = state.instances.read().await;
+        let inst = instances.iter().find(|i| i.id == id)?;
+        if !inst.is_kept() {
+            return None;
+        }
+        (
+            inst.source_profile.clone(),
+            inst.title.clone(),
+            inst.kept_by.clone(),
+        )
+    };
+    let lock = state.instance_lock(id).await;
+    let _guard = lock.lock().await;
+    let persist_id = id.to_string();
+    if persist_session_update(
+        profile,
+        "keep override",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.unkeep();
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return Some(persist_failed_response());
+    }
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            inst.unkeep();
+        }
+    }
+    tracing::info!(
+        target: "session.keep",
+        session = %id,
+        title = %title,
+        op = %op,
+        by = %who,
+        previously_by = previously_by.as_deref().unwrap_or("-"),
+        at = %chrono::Utc::now().to_rfc3339(),
+        "keep flag CLEARED (override: {op} anyway)"
+    );
+    None
 }
 
 /// `PATCH /api/sessions/{id}/keep` — set or clear the per-session keep flag
@@ -372,10 +453,13 @@ pub async fn update_session_archive(
         Err(rej) => return rej.into_response(),
     };
 
-    // WO#1953: a kept session refuses archive outright (409), before any
-    // guard or teardown. Unarchive is a recovery, not a sweep — allowed.
+    // WO#1953: a kept session refuses archive (409), before any guard or
+    // teardown, unless the body carries the explicit human override
+    // (WO#1980-1). Unarchive is a recovery, not a sweep — allowed.
     if body.archived {
-        if let Some(resp) = keep_refusal_response(&state, &id, "archive").await {
+        if let Some(resp) =
+            keep_gate_response(&state, &id, "archive", body.confirm_kept.as_deref()).await
+        {
             return resp;
         }
     }
@@ -528,8 +612,10 @@ pub async fn trash_session(
     }
     let body = body.map(|Json(body)| body).unwrap_or_default();
 
-    // WO#1953: a kept session cannot be trashed (409) — no force.
-    if let Some(resp) = keep_refusal_response(&state, &id, "trash").await {
+    // WO#1953: a kept session cannot be trashed (409) — no force. The only
+    // way through in one call is the explicit human override (WO#1980-1).
+    if let Some(resp) = keep_gate_response(&state, &id, "trash", body.confirm_kept.as_deref()).await
+    {
         return resp;
     }
 
@@ -1517,7 +1603,9 @@ pub async fn update_session_snooze(
     // WO#1953: snoozing a kept session is a sweep — refused (409). An
     // unsnooze (`minutes: None`) is a wake and stays allowed.
     if body.minutes.is_some() {
-        if let Some(resp) = keep_refusal_response(&state, &id, "snooze").await {
+        if let Some(resp) =
+            keep_gate_response(&state, &id, "snooze", body.confirm_kept.as_deref()).await
+        {
             return resp;
         }
     }
