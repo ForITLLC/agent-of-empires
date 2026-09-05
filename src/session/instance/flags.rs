@@ -43,10 +43,26 @@ pub struct KeepRefused {
 }
 
 impl KeepRefused {
+    /// The one-line HUMAN override for this op (WO#1980-1). The flag exists
+    /// to stop sweeps, scripts and API callers; a person who reads the
+    /// refusal must be able to act in one command. `--confirm-kept` clears
+    /// the flag (logged who/when) and proceeds. There is still no `--force`.
+    pub fn override_command(&self) -> String {
+        match self.op.as_str() {
+            "snooze" => format!(
+                "aoe session snooze {} --minutes <n> --confirm-kept",
+                self.session_id
+            ),
+            "trash" | "remove" | "delete" => format!("aoe rm {} --confirm-kept", self.session_id),
+            other => format!("aoe session {other} {} --confirm-kept", self.session_id),
+        }
+    }
+
     pub fn message(&self) -> String {
         format!(
             "refused: session {} ({}) is kept (keep flag set {}{}); `{}` is blocked. \
-             Clear it first: aoe session keep --off {}",
+             Clear it first: aoe session keep --off {} \
+             — or, as a person, do it in one step: {}",
             self.session_id,
             self.title,
             self.kept_at
@@ -57,6 +73,7 @@ impl KeepRefused {
                 .unwrap_or_default(),
             self.op,
             self.session_id,
+            self.override_command(),
         )
     }
 
@@ -70,6 +87,8 @@ impl KeepRefused {
             "kept_at": self.kept_at,
             "kept_by": self.kept_by,
             "clear_with": format!("aoe session keep --off {}", self.session_id),
+            "override_with": self.override_command(),
+            "override_field": "confirm_kept",
         })
     }
 }
@@ -1012,6 +1031,45 @@ mod keep_tests {
         inst.keep(Some("second"));
         assert_eq!(inst.kept_at, first, "re-keeping must not restamp");
         assert_eq!(inst.kept_by.as_deref(), Some("first"));
+    }
+
+    /// WO#1980-1: the refusal must ALSO name the human's one-line override,
+    /// per op, so a person who hits it never has to guess the flag.
+    #[test]
+    fn keep_refusal_names_the_human_override_per_op() {
+        let mut inst = Instance::new("t", "/tmp/t");
+        inst.keep(Some("api:test"));
+        let id = inst.id.clone();
+        let r = inst.keep_refusal("archive").unwrap();
+        assert_eq!(
+            r.override_command(),
+            format!("aoe session archive {id} --confirm-kept")
+        );
+        assert!(
+            r.message().contains(&r.override_command()),
+            "{}",
+            r.message()
+        );
+        assert!(
+            r.message().contains("aoe session keep --off"),
+            "{}",
+            r.message()
+        );
+        let j = r.to_json();
+        assert_eq!(j["override_with"], r.override_command());
+        assert_eq!(j["override_field"], "confirm_kept");
+        assert_eq!(
+            inst.keep_refusal("snooze").unwrap().override_command(),
+            format!("aoe session snooze {id} --minutes <n> --confirm-kept")
+        );
+        assert_eq!(
+            inst.keep_refusal("trash").unwrap().override_command(),
+            format!("aoe rm {id} --confirm-kept")
+        );
+        assert_eq!(
+            inst.keep_refusal("remove").unwrap().override_command(),
+            format!("aoe rm {id} --confirm-kept")
+        );
     }
 
     #[test]

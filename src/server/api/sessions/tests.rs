@@ -2927,6 +2927,7 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
                 Ok(Json(UpdateArchiveBody {
                     archived: true,
                     kill_pane: true,
+                    confirm_kept: None,
                 })),
             )
             .await
@@ -2934,7 +2935,10 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
             "snooze" => update_session_snooze(
                 State(state),
                 Path(id),
-                Ok(Json(UpdateSnoozeBody { minutes: Some(30) })),
+                Ok(Json(UpdateSnoozeBody {
+                    minutes: Some(30),
+                    confirm_kept: None,
+                })),
             )
             .await
             .into_response(),
@@ -4035,6 +4039,7 @@ async fn sweep_handlers_refuse_a_kept_session_with_409_session_kept() {
         Ok(Json(UpdateArchiveBody {
             archived: true,
             kill_pane: true,
+            confirm_kept: None,
         })),
     )
     .await
@@ -4042,7 +4047,10 @@ async fn sweep_handlers_refuse_a_kept_session_with_409_session_kept() {
     let snooze = update_session_snooze(
         State(state.clone()),
         Path(id.clone()),
-        Ok(Json(UpdateSnoozeBody { minutes: Some(30) })),
+        Ok(Json(UpdateSnoozeBody {
+            minutes: Some(30),
+            confirm_kept: None,
+        })),
     )
     .await
     .into_response();
@@ -4093,6 +4101,136 @@ async fn sweep_handlers_refuse_a_kept_session_with_409_session_kept() {
     assert!(row.is_kept() && !row.is_archived() && !row.is_snoozed() && !row.is_trashed());
 }
 
+/// WO#1980-1: the explicit `confirm_kept` body field is the HUMAN override.
+/// It clears the flag (logged who/when) and lets the op proceed in one call;
+/// sweeps never send it, so they keep getting 409.
+#[tokio::test]
+#[serial_test::serial]
+async fn confirm_kept_clears_the_flag_and_lets_archive_proceed() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let (storage, state, id) = keep_test_state(true);
+    let response = update_session_archive(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateArchiveBody {
+            archived: true,
+            kill_pane: false,
+            confirm_kept: Some("web:ben".to_string()),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mem = state.instances.read().await;
+    let row = mem.iter().find(|i| i.id == id).unwrap();
+    assert!(
+        !row.is_kept() && row.is_archived(),
+        "flag cleared, op applied"
+    );
+    drop(mem);
+    let disk = storage.load().unwrap();
+    let row = disk.iter().find(|i| i.id == id).unwrap();
+    assert!(!row.is_kept() && row.is_archived(), "both persisted");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn confirm_kept_clears_the_flag_for_snooze_trash_and_delete() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let who = Some("web:ben".to_string());
+
+    let (_s, state, id) = keep_test_state(true);
+    let r = update_session_snooze(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateSnoozeBody {
+            minutes: Some(30),
+            confirm_kept: who.clone(),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(r.status(), StatusCode::OK, "snooze");
+    let row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .cloned()
+        .unwrap();
+    assert!(!row.is_kept() && row.is_snoozed());
+
+    let (_s, state, id) = keep_test_state(true);
+    let r = trash_session(
+        State(state.clone()),
+        Path(id.clone()),
+        Some(Json(TrashSessionBody {
+            kill_pane: false,
+            confirm_kept: who.clone(),
+        })),
+    )
+    .await
+    .into_response();
+    assert_ne!(r.status(), StatusCode::CONFLICT, "trash must not 409");
+    let row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .cloned()
+        .unwrap();
+    assert!(!row.is_kept());
+
+    let (_s, state, id) = keep_test_state(true);
+    let r = delete_session(
+        State(state.clone()),
+        Path(id.clone()),
+        Some(Json(DeleteSessionBody {
+            confirm_kept: who.clone(),
+            ..DeleteSessionBody::default()
+        })),
+    )
+    .await
+    .into_response();
+    assert_ne!(r.status(), StatusCode::CONFLICT, "delete must not 409");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn an_empty_confirm_kept_is_not_an_override() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let (_s, state, id) = keep_test_state(true);
+    let response = update_session_archive(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateArchiveBody {
+            archived: true,
+            kill_pane: false,
+            confirm_kept: Some(String::new()),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body_json(response).await;
+    assert_eq!(body["override_field"], "confirm_kept");
+    assert_eq!(
+        body["override_with"],
+        format!("aoe session archive {id} --confirm-kept")
+    );
+    let row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .cloned()
+        .unwrap();
+    assert!(row.is_kept() && !row.is_archived());
+}
+
 /// Unarchive / unsnooze are NOT sweeps: a kept row that somehow carries an
 /// old archive stamp (legacy disk) must still be recoverable.
 #[tokio::test]
@@ -4106,6 +4244,7 @@ async fn unarchive_and_unsnooze_still_work_on_a_kept_session() {
         Ok(Json(UpdateArchiveBody {
             archived: false,
             kill_pane: true,
+            confirm_kept: None,
         })),
     )
     .await
@@ -4114,7 +4253,10 @@ async fn unarchive_and_unsnooze_still_work_on_a_kept_session() {
     let response = update_session_snooze(
         State(state.clone()),
         Path(id.clone()),
-        Ok(Json(UpdateSnoozeBody { minutes: None })),
+        Ok(Json(UpdateSnoozeBody {
+            minutes: None,
+            confirm_kept: None,
+        })),
     )
     .await
     .into_response();

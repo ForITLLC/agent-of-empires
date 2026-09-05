@@ -19,6 +19,12 @@ pub struct DeleteSessionBody {
     /// non-scratch sessions.
     #[serde(default)]
     pub keep_scratch: bool,
+    /// WO#1980-1: the explicit HUMAN override for a kept row — a non-empty
+    /// "who" clears the keep flag (logged) and lets this single delete
+    /// proceed. `force_delete` never overrides the flag; a workspace delete
+    /// never honours this field (it is a sweep).
+    #[serde(default)]
+    pub confirm_kept: Option<String>,
 }
 
 /// Flip a session out of `Status::Deleting` into `Status::Error` so a
@@ -429,6 +435,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             delete_sandbox: cfg.sandbox.auto_cleanup,
             force_delete: true,
             keep_scratch: false,
+            confirm_kept: None,
         };
         match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
             Ok((_removed, _messages)) => tracing::info!(
@@ -463,8 +470,12 @@ pub async fn delete_session(
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
     // WO#1953: a kept session cannot be removed (409) — `force_delete`
-    // overrides worktree dirtiness, never the keep flag.
-    if let Some(resp) = super::lifecycle::keep_refusal_response(&state, &id, "remove").await {
+    // overrides worktree dirtiness, never the keep flag. WO#1980-1: the
+    // explicit `confirm_kept` override is the one human way through.
+    if let Some(resp) =
+        super::lifecycle::keep_gate_response(&state, &id, "remove", body.confirm_kept.as_deref())
+            .await
+    {
         return resp;
     }
 
@@ -625,12 +636,15 @@ pub(super) fn order_workspace_deletion(
     let Some((owner, siblings)) = session_ids.split_first() else {
         return Vec::new();
     };
+    // The workspace plan is a sweep over siblings: the human override never
+    // travels into it (WO#1980-1).
     let sibling_body = DeleteSessionBody {
         delete_worktree: false,
         delete_branch: false,
         delete_sandbox: body.delete_sandbox,
         force_delete: body.force_delete,
         keep_scratch: body.keep_scratch,
+        confirm_kept: None,
     };
     let owner_body = DeleteSessionBody {
         delete_worktree: body.delete_worktree,
@@ -638,6 +652,7 @@ pub(super) fn order_workspace_deletion(
         delete_sandbox: body.delete_sandbox,
         force_delete: body.force_delete,
         keep_scratch: body.keep_scratch,
+        confirm_kept: None,
     };
     let mut plan: Vec<(String, DeleteSessionBody)> = siblings
         .iter()

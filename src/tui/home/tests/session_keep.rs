@@ -1,7 +1,9 @@
-//! WO#1953 — the per-session `keep` flag on the TUI surface: archive,
-//! snooze and trash at the cursor refuse a kept row with an info dialog
-//! that names the flag and the clear command; a group archive skips kept
-//! members; the row renders a `⚓ ` marker so the flag is visible.
+//! WO#1953 / WO#1980-1 — the per-session `keep` flag on the TUI surface:
+//! archive, snooze and trash at the cursor do NOT refuse the human — they
+//! open a confirm ("kept since <when> by <who> — <op> anyway?"); Yes clears
+//! the flag and proceeds in one step, No leaves the row exactly as it was.
+//! A group archive (a sweep) still skips kept members; the row renders a
+//! `⚓ ` marker so the flag is visible.
 
 use super::*;
 
@@ -44,61 +46,114 @@ fn on_disk(env: &TestEnv, id: &str) -> Instance {
         .unwrap()
 }
 
-fn assert_kept_dialog(env: &TestEnv, id: &str, op: &str) {
+fn assert_kept_confirm(env: &TestEnv, op: &str) {
+    assert!(
+        env.view.info_dialog.is_none(),
+        "{op}: a human at the TUI gets a confirm, not a refusal"
+    );
     let dialog = env
         .view
-        .info_dialog
+        .confirm_dialog
         .as_ref()
-        .unwrap_or_else(|| panic!("{op} on a kept row must open the info dialog"));
-    assert_eq!(dialog.title(), "Kept session");
-    let msg = dialog.message();
-    assert!(msg.contains("kept"), "{op}: {msg}");
-    assert!(msg.contains(op), "{op}: {msg}");
-    assert!(
-        msg.contains(&format!("aoe session keep --off {id}")),
-        "{op}: {msg}"
-    );
+        .unwrap_or_else(|| panic!("{op} on a kept row must open the confirm dialog"));
+    assert_eq!(dialog.action(), "kept_override");
+    assert_eq!(dialog.title_for_test(), "Kept session");
+    let msg = dialog.message_for_test();
+    assert!(msg.contains("kept since"), "{op}: {msg}");
+    assert!(msg.contains("test:seed"), "{op}: names who kept it: {msg}");
+    assert!(msg.to_lowercase().contains("anyway"), "{op}: {msg}");
+    assert!(msg.to_lowercase().contains(op), "{op}: {msg}");
+}
+
+fn press(env: &mut TestEnv, c: char) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), None);
 }
 
 #[test]
 #[serial]
-fn archive_at_cursor_refuses_a_kept_session() {
+fn archive_at_cursor_asks_before_touching_a_kept_session() {
     let mut env = create_test_env_with_sessions(2);
     let id = keep_selected(&mut env);
 
     env.view.toggle_archive_at_cursor().unwrap();
 
     let inst = env.view.get_instance(&id).unwrap();
-    assert!(!inst.is_archived(), "kept row must not archive");
+    assert!(
+        !inst.is_archived(),
+        "nothing happens until the human answers"
+    );
     assert!(inst.is_kept());
-    assert_kept_dialog(&env, &id, "archive");
+    assert_kept_confirm(&env, "archive");
     assert_eq!(
         env.view.selected_session.as_deref(),
         Some(id.as_str()),
-        "cursor stays on the refused row"
+        "cursor stays on the row"
     );
 }
 
 #[test]
 #[serial]
-fn snooze_refuses_a_kept_session() {
+fn confirming_the_kept_archive_clears_the_flag_and_archives_in_one_step() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = keep_selected(&mut env);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert_kept_confirm(&env, "archive");
+
+    press(&mut env, 'y');
+
+    assert!(env.view.confirm_dialog.is_none(), "dialog closes on yes");
+    let inst = env.view.get_instance(&id).unwrap();
+    assert!(!inst.is_kept(), "yes clears the keep flag");
+    assert!(inst.is_archived(), "and the archive proceeds");
+    let disk = on_disk(&env, &id);
+    assert!(!disk.is_kept() && disk.is_archived(), "both persisted");
+}
+
+#[test]
+#[serial]
+fn cancelling_the_kept_archive_leaves_the_row_untouched() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = keep_selected(&mut env);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert_kept_confirm(&env, "archive");
+
+    press(&mut env, 'n');
+
+    assert!(env.view.confirm_dialog.is_none());
+    let inst = env.view.get_instance(&id).unwrap();
+    assert!(inst.is_kept() && !inst.is_archived());
+    let disk = on_disk(&env, &id);
+    assert!(disk.is_kept() && !disk.is_archived());
+    // a later, unrelated confirm must not replay the kept override
+    assert!(env.view.pending_kept_override.is_none());
+}
+
+#[test]
+#[serial]
+fn snooze_asks_then_confirms_on_a_kept_session() {
     let mut env = create_test_env_with_sessions(2);
     let id = keep_selected(&mut env);
 
     let status = env.view.snooze_session_for(&id, 30).unwrap();
 
-    assert!(
-        status.is_none(),
-        "no 'Snoozed' status line for a refused op"
-    );
+    assert!(status.is_none(), "no 'Snoozed' status line until confirmed");
     let inst = env.view.get_instance(&id).unwrap();
     assert!(!inst.is_snoozed() && inst.is_kept());
-    assert_kept_dialog(&env, &id, "snooze");
+    assert_kept_confirm(&env, "snooze");
+
+    press(&mut env, 'y');
+
+    let inst = env.view.get_instance(&id).unwrap();
+    assert!(!inst.is_kept() && inst.is_snoozed(), "yes clears + snoozes");
+    let disk = on_disk(&env, &id);
+    assert!(!disk.is_kept() && disk.is_snoozed());
 }
 
 #[test]
 #[serial]
-fn trash_refuses_a_kept_session() {
+fn trash_asks_then_confirms_on_a_kept_session() {
     let mut env = create_test_env_with_sessions(2);
     let id = keep_selected(&mut env);
 
@@ -108,10 +163,23 @@ fn trash_refuses_a_kept_session() {
     assert!(!inst.is_trashed() && inst.is_kept());
     assert!(
         inst.lifecycle_reservation.is_none(),
-        "no Trash reservation may be taken on a kept row"
+        "no Trash reservation may be taken before the human answers"
     );
-    assert_kept_dialog(&env, &id, "trash");
-    assert!(!on_disk(&env, &id).is_trashed(), "trash must not persist");
+    assert_kept_confirm(&env, "trash");
+    assert!(
+        !on_disk(&env, &id).is_trashed(),
+        "trash must not persist yet"
+    );
+
+    press(&mut env, 'y');
+
+    let inst = env.view.get_instance(&id).unwrap();
+    assert!(!inst.is_kept(), "yes clears the flag");
+    assert!(
+        inst.is_trashed() || inst.lifecycle_reservation.is_some(),
+        "and the trash proceeds (applied, or reserved for the async worker)"
+    );
+    assert!(!on_disk(&env, &id).is_kept(), "clear persisted");
 }
 
 #[test]

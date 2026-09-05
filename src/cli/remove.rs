@@ -34,6 +34,11 @@ pub struct RemoveArgs {
     #[arg(long = "keep-scratch")]
     keep_scratch: bool,
 
+    /// The session is kept and you, a person, want to remove it anyway:
+    /// clears the keep flag (logged who/when) and removes in one command.
+    #[arg(long = "confirm-kept")]
+    confirm_kept: bool,
+
     /// Permanently delete instead of moving to trash. By default `rm` moves
     /// the session to the trash (when `session.delete_to_trash` is enabled,
     /// the default) so it can be restored; `--purge` forces the irreversible
@@ -85,9 +90,15 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     let removed_title = inst.title.clone();
 
     // WO#1953: a kept session refuses remove — trash-first AND --purge —
-    // before any lock, teardown or hook fires. No --force.
+    // before any lock, teardown or hook fires. No --force; the one human
+    // way through is `--confirm-kept` (WO#1980-1), which clears the flag
+    // (logged) and proceeds in this same command.
     if let Some(refusal) = inst.keep_refusal("remove") {
-        anyhow::bail!("{}", refusal.message());
+        if !args.confirm_kept {
+            anyhow::bail!("{}", refusal.message());
+        }
+        super::session::clear_keep_for_override(profile, &removed_id, "remove").await?;
+        inst.unkeep();
     }
 
     let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
@@ -361,6 +372,7 @@ mod tests {
             keep_container: false,
             keep_scratch: false,
             purge: false,
+            confirm_kept: false,
         }
     }
 
@@ -485,6 +497,7 @@ mod keep_refusal_tests {
                     keep_container: false,
                     keep_scratch: false,
                     purge,
+                    confirm_kept: false,
                 },
             )
             .await
@@ -496,9 +509,45 @@ mod keep_refusal_tests {
                 err.contains(&format!("aoe session keep --off {id}")),
                 "purge={purge}: {err}"
             );
+            // WO#1980-1: the refusal names the one-command override too
+            assert!(
+                err.contains(&format!("aoe rm {id} --confirm-kept")),
+                "purge={purge}: {err}"
+            );
         }
         let rows = storage.load().unwrap();
         let row = rows.iter().find(|i| i.id == id).expect("row still on disk");
         assert!(row.is_kept() && !row.is_trashed());
+    }
+
+    /// WO#1980-1: `aoe rm <id> --confirm-kept` clears the flag and trashes
+    /// in one command.
+    #[tokio::test]
+    #[serial]
+    async fn remove_with_confirm_kept_clears_the_flag_and_trashes() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let (storage, id) = seed("keep-remove-ok");
+        run(
+            "keep-remove-ok",
+            RemoveArgs {
+                identifier: id.clone(),
+                delete_worktree: false,
+                delete_branch: false,
+                force: false,
+                keep_container: false,
+                keep_scratch: false,
+                purge: false,
+                confirm_kept: true,
+            },
+        )
+        .await
+        .unwrap();
+        let rows = storage.load().unwrap();
+        let row = rows
+            .iter()
+            .find(|i| i.id == id)
+            .expect("trash-first keeps the row");
+        assert!(row.is_trashed(), "trashed in one step");
+        assert!(!row.is_kept(), "keep flag cleared by the override");
     }
 }
