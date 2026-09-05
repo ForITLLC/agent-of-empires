@@ -279,6 +279,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "log_level",
     "remove",
     "send",
+    "relay",
     "status",
     "killall",
     "session",
