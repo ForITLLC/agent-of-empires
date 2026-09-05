@@ -102,6 +102,16 @@ pub struct SessionResponse {
     /// and permanent-delete actions. See #2489.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<String>,
+    /// Keep flag (WO#1953): `true` when the operator has said this session
+    /// must never be swept. Archive/snooze/trash/remove and the fleet
+    /// placement scripts refuse a kept row (409 `session_kept`).
+    pub kept: bool,
+    /// RFC3339 timestamp the keep flag was set, omitted when not kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_at: Option<String>,
+    /// Who set the keep flag, omitted when not kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_by: Option<String>,
     /// Unread marker, mirroring `Instance::unread`: `true` when the session
     /// needs attention (a finished turn the user hasn't engaged with, or a
     /// manual flag), omitted when read. The web sidebar paints an unread
@@ -401,6 +411,9 @@ impl SessionResponse {
                 None
             },
             trashed_at: inst.trashed_at.map(|t| t.to_rfc3339()),
+            kept: inst.is_kept(),
+            kept_at: inst.kept_at.map(|t| t.to_rfc3339()),
+            kept_by: inst.kept_by.clone(),
             // Surface the marker (omitted when read); the web gates the
             // visual on the `session.unread_indicator` setting.
             unread: inst.unread,

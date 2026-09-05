@@ -337,6 +337,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("PATCH", "/api/sessions/{id}/group"),
     ("PATCH", "/api/sessions/{id}/notifications"),
     ("PATCH", "/api/sessions/{id}/pin"),
+    ("PATCH", "/api/sessions/{id}/keep"),
     ("PATCH", "/api/sessions/{id}/snooze"),
     ("PATCH", "/api/sessions/{id}/unread"),
     ("PATCH", "/api/sessions/{id}/worktree-name"),

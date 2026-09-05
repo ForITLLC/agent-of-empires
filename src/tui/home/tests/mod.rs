@@ -39,6 +39,7 @@ mod right_click_context_menu;
 mod save_field_merge;
 mod scroll_pane_isolation;
 mod search;
+mod session_keep;
 mod settings_scroll_wiring;
 mod stacked_single_seam;
 mod status_rows_menu;

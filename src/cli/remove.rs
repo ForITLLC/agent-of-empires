@@ -84,6 +84,12 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     let removed_id = inst.id.clone();
     let removed_title = inst.title.clone();
 
+    // WO#1953: a kept session refuses remove — trash-first AND --purge —
+    // before any lock, teardown or hook fires. No --force.
+    if let Some(refusal) = inst.keep_refusal("remove") {
+        anyhow::bail!("{}", refusal.message());
+    }
+
     let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         profile,
         std::path::Path::new(&inst.project_path),
@@ -439,5 +445,60 @@ mod tests {
             all[0].lifecycle_reservation.as_ref().map(|c| c.op),
             Some(LifecycleOperation::Purge)
         );
+    }
+}
+
+/// WO#1953 — `aoe remove` refuses a kept session, trash-first or `--purge`.
+#[cfg(test)]
+mod keep_refusal_tests {
+    use super::{run, RemoveArgs};
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+
+    fn seed(profile: &str) -> (Storage, String) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new("kept-remove", "/tmp/kept-remove");
+        inst.keep(Some("test:seed"));
+        let id = inst.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![inst];
+                Ok(())
+            })
+            .unwrap();
+        (storage, id)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn remove_refuses_a_kept_session_trash_first_and_purge() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let (storage, id) = seed("keep-remove");
+        for purge in [false, true] {
+            let err = run(
+                "keep-remove",
+                RemoveArgs {
+                    identifier: id.clone(),
+                    delete_worktree: false,
+                    delete_branch: false,
+                    force: false,
+                    keep_container: false,
+                    keep_scratch: false,
+                    purge,
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("kept"), "purge={purge}: {err}");
+            assert!(err.contains("remove"), "purge={purge}: {err}");
+            assert!(
+                err.contains(&format!("aoe session keep --off {id}")),
+                "purge={purge}: {err}"
+            );
+        }
+        let rows = storage.load().unwrap();
+        let row = rows.iter().find(|i| i.id == id).expect("row still on disk");
+        assert!(row.is_kept() && !row.is_trashed());
     }
 }

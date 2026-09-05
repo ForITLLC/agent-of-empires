@@ -109,6 +109,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::attach_session_project),
         )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
+        .route("/api/sessions/{id}/keep", patch(api::update_session_keep))
         .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",

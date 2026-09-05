@@ -91,7 +91,7 @@ pub(super) fn active_snoozed_until(inst: &Instance) -> Option<chrono::DateTime<c
 }
 
 #[derive(Serialize)]
-struct SessionJson {
+pub(crate) struct SessionJson {
     id: String,
     title: String,
     path: String,
@@ -126,6 +126,13 @@ struct SessionJson {
     /// `pinned_at != null`, matching the API field from #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pinned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Keep flag (WO#1953): `true` when the operator has said this session
+    /// must never be swept; `kept_at`/`kept_by` present iff kept.
+    kept: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept_by: Option<String>,
     /// Empty for single-repo sessions; populated with one entry per repo
     /// (including the primary) for sessions created with `--repo`/`--project`.
     workspace_repos: Vec<WorkspaceRepoJson>,
@@ -164,7 +171,7 @@ fn worktree_for(inst: &Instance) -> Option<WorktreeJson> {
     })
 }
 
-fn session_json(inst: &Instance, profile: &str) -> SessionJson {
+pub(crate) fn session_json(inst: &Instance, profile: &str) -> SessionJson {
     SessionJson {
         id: inst.id.clone(),
         title: inst.title.clone(),
@@ -179,6 +186,9 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
         archived_at: inst.archived_at,
         snoozed_until: active_snoozed_until(inst),
         pinned_at: inst.pinned_at,
+        kept: inst.is_kept(),
+        kept_at: inst.kept_at,
+        kept_by: inst.kept_by.clone(),
         workspace_repos: workspace_repos_for(inst),
         worktree: worktree_for(inst),
         account: Default::default(),

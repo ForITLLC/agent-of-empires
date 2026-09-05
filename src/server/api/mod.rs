@@ -58,9 +58,9 @@ pub use sessions::{
     send_message, serve_session_artifact, session_diff_file, session_diff_files, session_file,
     set_session_goal, set_worktree_name, start_session, stop_session, summarize_session,
     trash_session, update_session_archive, update_session_color, update_session_diff_base,
-    update_session_group, update_session_notifications, update_session_pin, update_session_snooze,
-    update_session_unread, update_workspace_ordering, CleanupDefaults, OutputQuery,
-    SendMessageRequest, SessionResponse,
+    update_session_group, update_session_keep, update_session_notifications, update_session_pin,
+    update_session_snooze, update_session_unread, update_workspace_ordering, CleanupDefaults,
+    OutputQuery, SendMessageRequest, SessionResponse,
 };
 // Daemon-side restart (POST /api/sessions/{id}/restart + GET restart-status): a
 // separate `use` so this branch stacks beside other route additions without
@@ -356,6 +356,7 @@ mod tests {
                 include_str!("sessions/lifecycle.rs"),
                 &[
                     "update_session_pin",
+                    "update_session_keep",
                     "update_session_color",
                     "update_session_archive",
                     "update_session_snooze",
@@ -591,6 +592,7 @@ mod tests {
                 include_str!("sessions/lifecycle.rs"),
                 &[
                     "update_session_pin",
+                    "update_session_keep",
                     "update_session_color",
                     "update_session_archive",
                     "update_session_snooze",

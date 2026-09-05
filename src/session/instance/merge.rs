@@ -355,6 +355,12 @@ impl Instance {
         if pre.trashed_at != post.trashed_at {
             self.trashed_at = post.trashed_at;
         }
+        if pre.kept_at != post.kept_at {
+            self.kept_at = post.kept_at;
+        }
+        if pre.kept_by != post.kept_by {
+            self.kept_by = post.kept_by.clone();
+        }
         if pre.pre_trash_project_path != post.pre_trash_project_path {
             self.pre_trash_project_path = post.pre_trash_project_path.clone();
         }
@@ -464,6 +470,28 @@ mod tests {
         let mut disk2 = pre2.clone();
         disk2.merge_user_action_diff(&pre2, &post2);
         assert!(!disk2.unread);
+    }
+
+    /// WO#1953: a `keep`/`unkeep` from one writer (CLI, API, TUI) must land on
+    /// the disk row like every other triage flag, and a peer's concurrent
+    /// archive must NOT ride over a kept row.
+    #[test]
+    fn test_merge_user_action_diff_propagates_keep_and_unkeep() {
+        let pre = Instance::new("t", "/tmp");
+        let mut post = pre.clone();
+        post.keep(Some("cli:t"));
+        let mut disk = pre.clone();
+        disk.merge_user_action_diff(&pre, &post);
+        assert!(disk.is_kept(), "keep must propagate to disk");
+        assert_eq!(disk.kept_by.as_deref(), Some("cli:t"));
+
+        let pre2 = post.clone();
+        let mut post2 = pre2.clone();
+        post2.unkeep();
+        let mut disk2 = pre2.clone();
+        disk2.merge_user_action_diff(&pre2, &post2);
+        assert!(!disk2.is_kept(), "unkeep must propagate to disk");
+        assert!(disk2.kept_by.is_none());
     }
 
     #[test]

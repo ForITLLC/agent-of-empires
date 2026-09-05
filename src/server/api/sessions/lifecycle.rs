@@ -72,6 +72,132 @@ pub struct UpdateUnreadBody {
     pub unread: bool,
 }
 
+/// `PATCH /api/sessions/{id}/keep` body (WO#1953).
+#[derive(Deserialize)]
+pub struct UpdateKeepBody {
+    /// `true` sets the keep flag, `false` clears it. There is no `--force`
+    /// on the sweep side; clearing is the one and only way through.
+    pub keep: bool,
+    /// Who is asking (`cli:<user>@<host>`, `tui`, a relay peer, …). Recorded
+    /// on set so the refusal can name them; logged on clear with the time.
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// The 409 `session_kept` response every sweep handler returns for a kept
+/// row (WO#1953). Checked BEFORE the submission guard, the lifecycle
+/// reservation, and any persist — a refusal must leave disk, memory and the
+/// live process exactly as they were.
+pub(crate) async fn keep_refusal_response(
+    state: &Arc<AppState>,
+    id: &str,
+    op: &str,
+) -> Option<axum::response::Response> {
+    let instances = state.instances.read().await;
+    let inst = instances.iter().find(|i| i.id == id)?;
+    let refusal = inst.keep_refusal(op)?;
+    tracing::info!(
+        target: "session.keep",
+        session = %id,
+        op = %op,
+        kept_by = refusal.kept_by.as_deref().unwrap_or("-"),
+        "refused {op}: session is kept"
+    );
+    Some((StatusCode::CONFLICT, Json(refusal.to_json())).into_response())
+}
+
+/// `PATCH /api/sessions/{id}/keep` — set or clear the per-session keep flag
+/// (WO#1953). Both transitions are logged with who/when under the
+/// `session.keep` target so a cleared flag is traceable in the daemon log.
+pub async fn update_session_keep(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateKeepBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let (profile, previously_by) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        (inst.source_profile.clone(), inst.kept_by.clone())
+    };
+
+    let keep = body.keep;
+    let by = body.by.clone();
+    let persist_id = id.clone();
+    let persist_by = by.clone();
+    if persist_session_update(
+        profile,
+        "keep update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                if keep {
+                    inst.keep(persist_by.as_deref());
+                } else {
+                    inst.unkeep();
+                }
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "keep update: instance vanished after persist"
+        );
+        return crate::server::api::session_gone_after_persist();
+    };
+    let who = by.as_deref().unwrap_or("unknown");
+    if keep {
+        inst.keep(by.as_deref());
+        tracing::info!(
+            target: "session.keep",
+            session = %id,
+            title = %inst.title,
+            by = %who,
+            at = %chrono::Utc::now().to_rfc3339(),
+            "keep flag SET"
+        );
+    } else {
+        inst.unkeep();
+        tracing::info!(
+            target: "session.keep",
+            session = %id,
+            title = %inst.title,
+            by = %who,
+            previously_by = previously_by.as_deref().unwrap_or("-"),
+            at = %chrono::Utc::now().to_rfc3339(),
+            "keep flag CLEARED"
+        );
+    }
+
+    let response =
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
 pub async fn update_session_pin(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -246,6 +372,14 @@ pub async fn update_session_archive(
         Err(rej) => return rej.into_response(),
     };
 
+    // WO#1953: a kept session refuses archive outright (409), before any
+    // guard or teardown. Unarchive is a recovery, not a sweep — allowed.
+    if body.archived {
+        if let Some(resp) = keep_refusal_response(&state, &id, "archive").await {
+            return resp;
+        }
+    }
+
     // Worker-stopping barrier: submission guard before `instance_lock`, per
     // `prompt_submission` (#3650).
     let Some(_submission) = state
@@ -393,6 +527,11 @@ pub async fn trash_session(
         return crate::server::api::read_only_response();
     }
     let body = body.map(|Json(body)| body).unwrap_or_default();
+
+    // WO#1953: a kept session cannot be trashed (409) — no force.
+    if let Some(resp) = keep_refusal_response(&state, &id, "trash").await {
+        return resp;
+    }
 
     // Worker-stopping barrier: submission guard before `instance_lock`, per
     // `prompt_submission` (#3650).
@@ -1372,6 +1511,14 @@ pub async fn update_session_snooze(
                 })),
             )
                 .into_response();
+        }
+    }
+
+    // WO#1953: snoozing a kept session is a sweep — refused (409). An
+    // unsnooze (`minutes: None`) is a wake and stays allowed.
+    if body.minutes.is_some() {
+        if let Some(resp) = keep_refusal_response(&state, &id, "snooze").await {
+            return resp;
         }
     }
 

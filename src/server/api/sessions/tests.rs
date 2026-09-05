@@ -3801,3 +3801,237 @@ fn the_cap_counts_characters_not_bytes() {
     ))
     .is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// WO#1953 — per-session `keep` flag on the daemon API.
+// ---------------------------------------------------------------------------
+
+/// Storage-backed state with one kept-or-not row in profile `default`, so
+/// the handlers' `persist_session_update` path has a disk row to write.
+fn keep_test_state(kept: bool) -> (Storage, std::sync::Arc<crate::server::AppState>, String) {
+    let mut inst = Instance::new("keep-me", "/tmp/aoe-keep");
+    inst.source_profile = "default".to_string();
+    inst.status = Status::Idle;
+    if kept {
+        inst.keep(Some("test:seed"));
+    }
+    let id = inst.id.clone();
+    let (storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
+    (storage, state, id)
+}
+
+async fn body_json(response: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn keep_patch_sets_and_clears_the_flag_on_disk_and_in_memory() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let (storage, state, id) = keep_test_state(false);
+
+    let response = update_session_keep(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateKeepBody {
+            keep: true,
+            by: Some("api:test".to_string()),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["kept"], true, "response row carries kept: {body}");
+    assert_eq!(body["kept_by"], "api:test");
+    assert!(body["kept_at"].is_string());
+
+    let mem = state.instances.read().await;
+    let row = mem.iter().find(|i| i.id == id).unwrap();
+    assert!(row.is_kept(), "memory updated");
+    assert_eq!(row.kept_by.as_deref(), Some("api:test"));
+    drop(mem);
+    let disk = storage.load().unwrap();
+    assert!(
+        disk.iter().find(|i| i.id == id).unwrap().is_kept(),
+        "disk updated"
+    );
+
+    let response = update_session_keep(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateKeepBody {
+            keep: false,
+            by: Some("api:test".to_string()),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["kept"], false);
+    assert!(body.get("kept_at").is_none(), "cleared rows omit kept_at");
+    let disk = storage.load().unwrap();
+    assert!(!disk.iter().find(|i| i.id == id).unwrap().is_kept());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn keep_patch_404s_an_unknown_session_and_refuses_read_only() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let (_storage, state, _id) = keep_test_state(false);
+    let response = update_session_keep(
+        State(state.clone()),
+        Path("nope".to_string()),
+        Ok(Json(UpdateKeepBody {
+            keep: true,
+            by: None,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// The contract: `archive`, `snooze`, `trash` and permanent `delete` all
+/// answer 409 `session_kept` for a kept row, BEFORE touching disk, memory
+/// or any live process — and the body names the flag, the id, the op and
+/// the exact clear command.
+#[tokio::test]
+#[serial_test::serial]
+async fn sweep_handlers_refuse_a_kept_session_with_409_session_kept() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let (storage, state, id) = keep_test_state(true);
+
+    let archive = update_session_archive(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateArchiveBody {
+            archived: true,
+            kill_pane: true,
+        })),
+    )
+    .await
+    .into_response();
+    let snooze = update_session_snooze(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateSnoozeBody { minutes: Some(30) })),
+    )
+    .await
+    .into_response();
+    let trash = trash_session(State(state.clone()), Path(id.clone()), None)
+        .await
+        .into_response();
+    let delete = delete_session(
+        State(state.clone()),
+        Path(id.clone()),
+        Some(Json(DeleteSessionBody::default())),
+    )
+    .await
+    .into_response();
+
+    for (op, response) in [
+        ("archive", archive),
+        ("snooze", snooze),
+        ("trash", trash),
+        ("remove", delete),
+    ] {
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "{op} must answer 409 for a kept session"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["error"], "session_kept", "{op}: {body}");
+        assert_eq!(body["session_id"], id, "{op}: {body}");
+        assert_eq!(body["op"], op, "{op}: {body}");
+        assert_eq!(body["kept_by"], "test:seed", "{op}: {body}");
+        let msg = body["message"].as_str().unwrap_or("");
+        assert!(msg.contains("kept"), "{op} message names the flag: {msg}");
+        assert!(
+            msg.contains(&format!("aoe session keep --off {id}")),
+            "{op} message names the clear command: {msg}"
+        );
+    }
+
+    let mem = state.instances.read().await;
+    let row = mem.iter().find(|i| i.id == id).expect("row still present");
+    assert!(row.is_kept() && !row.is_archived() && !row.is_snoozed() && !row.is_trashed());
+    drop(mem);
+    let disk = storage.load().unwrap();
+    let row = disk
+        .iter()
+        .find(|i| i.id == id)
+        .expect("disk row still present");
+    assert!(row.is_kept() && !row.is_archived() && !row.is_snoozed() && !row.is_trashed());
+}
+
+/// Unarchive / unsnooze are NOT sweeps: a kept row that somehow carries an
+/// old archive stamp (legacy disk) must still be recoverable.
+#[tokio::test]
+#[serial_test::serial]
+async fn unarchive_and_unsnooze_still_work_on_a_kept_session() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let (_storage, state, id) = keep_test_state(true);
+    let response = update_session_archive(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateArchiveBody {
+            archived: false,
+            kill_pane: true,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = update_session_snooze(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateSnoozeBody { minutes: None })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[test]
+fn session_response_carries_the_keep_fields() {
+    let mut inst = Instance::new("k", "/tmp/k");
+    let bare = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+    assert_eq!(bare["kept"], false);
+    assert!(bare.get("kept_at").is_none());
+    assert!(bare.get("kept_by").is_none());
+
+    inst.keep(Some("tui"));
+    let v = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+    assert_eq!(v["kept"], true);
+    assert_eq!(v["kept_by"], "tui");
+    assert_eq!(
+        v["kept_at"].as_str().unwrap(),
+        inst.kept_at.unwrap().to_rfc3339()
+    );
+}
+
+/// The retention purge must never consume a kept row, even a legacy one
+/// that carries both stamps. Asserted at the source like the lock-order
+/// test above: the candidate filter has to exclude `is_kept()` rows.
+#[test]
+fn the_retention_purge_skips_kept_rows() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/api/sessions/delete.rs"),
+    )
+    .unwrap();
+    let start = source
+        .find("pub(crate) async fn purge_expired_trash")
+        .unwrap();
+    let body = &source[start..];
+    let filter = body.find(".filter(|i| i.is_trashed() && !i.is_kept())");
+    assert!(
+        filter.is_some(),
+        "purge_expired_trash must filter out kept rows before purging"
+    );
+}
