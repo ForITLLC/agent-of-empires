@@ -288,7 +288,7 @@ async fn pinned_model_for_agent(profile: &str, agent: &str) -> Option<String> {
     let profile = profile.to_string();
     let agent = agent.to_string();
     tokio::task::spawn_blocking(move || {
-        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         if let Some(model) = config.acp.acp_defaults_for(&agent).and_then(|d| d.model()) {
             return Some(model);
         }
