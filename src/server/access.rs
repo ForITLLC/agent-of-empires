@@ -453,6 +453,9 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("PATCH", "/api/settings"),
     ("PATCH", "/api/log-level"),
     ("PUT", "/api/workspace-ordering"),
+    // Fleet goal rail (fork, WO#1584-B): the Commander sets a session's goal
+    // through the daemon API / CLI; a CityHall client never writes it.
+    ("PATCH", "/api/sessions/{id}/goal"),
 ];
 
 /// Default-deny CityHall reachability boundary. A no-op outside CityHall mode
