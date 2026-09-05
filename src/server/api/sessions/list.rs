@@ -120,6 +120,7 @@ pub async fn list_sessions(
                 &crate::session::config::effective_profile(&inst.source_profile),
                 &inst.tool,
             );
+            resp.model_state = crate::server::account_usage::session_model(&cache, &inst.id);
         }
     }
 
@@ -639,6 +640,7 @@ mod workspace_ordering_tests {
             monitor_active: false,
             monitor_description: None,
             account: Default::default(),
+            model_state: Default::default(),
             favorited: false,
             color: None,
             urgent: false,

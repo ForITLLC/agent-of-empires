@@ -184,6 +184,7 @@ impl SessionResponse {
             monitor_active,
             monitor_description,
             account: Default::default(),
+            model_state: Default::default(),
         }
     }
 }
