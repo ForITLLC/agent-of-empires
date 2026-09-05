@@ -33,6 +33,8 @@ impl Instance {
             idle_dormant_since: None,
             pinned_at: None,
             trashed_at: None,
+            kept_at: None,
+            kept_by: None,
             pre_trash_project_path: None,
             lifecycle_reservation: None,
             plugin_meta: std::collections::BTreeMap::new(),
