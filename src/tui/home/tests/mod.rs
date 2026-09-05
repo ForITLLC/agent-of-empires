@@ -81,7 +81,11 @@ fn create_test_env_empty() -> TestEnv {
 async fn config_watch_keys_distinguish_global_from_profile_named_global() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
-    let profile_name = "<global>";
+    // Upstream uses the literal "<global>" (the old string sentinel). With the
+    // stray-profile guard (#148) that name can no longer be minted on disk —
+    // `Storage::new_unwatched` rejects it before the collision could exist —
+    // so the closest mintable name proves the same key distinction.
+    let profile_name = "global";
     let _storage = Storage::new_unwatched(profile_name).unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
     let view = HomeView::new(
