@@ -485,6 +485,8 @@ pub struct SessionResponse {
     /// Live account identity and cached usage from the fleet daemon.
     #[serde(default, flatten)]
     pub account: crate::session::account::SessionAccount,
+    #[serde(default, flatten)]
+    pub model_state: crate::session::model_state::SessionModel,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

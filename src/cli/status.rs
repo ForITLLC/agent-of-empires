@@ -76,6 +76,9 @@ struct SessionStatusJson {
     status: &'static str,
     #[serde(flatten)]
     account: SessionAccount,
+    /// Live model vs pin (WO#1933); same keys as `/api/sessions`.
+    #[serde(flatten)]
+    model_state: crate::session::model_state::SessionModel,
 }
 
 /// Account rows for `dirs`, counting the sessions on each by canonical
@@ -105,6 +108,7 @@ fn account_rows(
 fn session_rows(
     instances: &[crate::session::Instance],
     accounts: &mut HashMap<String, SessionAccount>,
+    models: &mut HashMap<String, crate::session::model_state::SessionModel>,
 ) -> Vec<SessionStatusJson> {
     instances
         .iter()
@@ -114,6 +118,7 @@ fn session_rows(
             tool: inst.tool.clone(),
             status: inst.status.as_str(),
             account: accounts.remove(&inst.id).unwrap_or_default(),
+            model_state: models.remove(&inst.id).unwrap_or_default(),
         })
         .collect()
 }
@@ -173,6 +178,8 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     if args.json {
         let usage = daemon_usage_map().await;
         let mut per_session = local_session_accounts(&instances, profile, &usage);
+        let mut per_session_model =
+            crate::session::model_state::local_session_models(&instances, profile);
         let now = now_ms();
         let accounts = account_rows(
             discover_account_dirs(bound_dirs(profile, &instances)),
@@ -188,7 +195,7 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
             error: counts.error,
             total: counts.total,
             accounts,
-            sessions: session_rows(&instances, &mut per_session),
+            sessions: session_rows(&instances, &mut per_session, &mut per_session_model),
         };
         println!("{}", serde_json::to_string(&status_json)?);
     } else if args.quiet {
@@ -297,6 +304,40 @@ mod tests {
             account_source: Some(AccountSource::Live),
             ..Default::default()
         }
+    }
+
+    /// WO#1933: `aoe status --json` session rows carry the model view.
+    #[test]
+    fn session_rows_carry_the_model_view() {
+        use crate::session::model_state::{session_model, LiveModel, LiveModelSource, PinSource};
+        let inst = crate::session::Instance::new("t", "/repo");
+        let mut accounts: HashMap<String, SessionAccount> = HashMap::new();
+        let mut models = HashMap::new();
+        models.insert(
+            inst.id.clone(),
+            session_model(
+                Some(("claude-fable-5-1".into(), PinSource::Profile)),
+                Some(LiveModel {
+                    model: "claude-opus-4-8".into(),
+                    source: LiveModelSource::Transcript,
+                    at: Some(1_788_423_947),
+                }),
+            ),
+        );
+        let rows = session_rows(std::slice::from_ref(&inst), &mut accounts, &mut models);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(v["live_model"], "claude-opus-4-8");
+        assert_eq!(v["live_model_source"], "transcript");
+        assert_eq!(v["model_pin"], "claude-fable-5-1");
+        assert_eq!(v["model_drift"], true);
+        let bare = session_rows(
+            std::slice::from_ref(&inst),
+            &mut accounts,
+            &mut HashMap::new(),
+        );
+        let v = serde_json::to_value(&bare[0]).unwrap();
+        assert_eq!(v["model_drift"], false);
+        assert!(v.get("live_model").is_none());
     }
 
     #[test]
