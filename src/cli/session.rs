@@ -218,6 +218,11 @@ pub struct SnoozeArgs {
     /// from the active config (default 30)
     #[arg(long)]
     pub minutes: Option<u32>,
+
+    /// The session is kept and you, a person, want to snooze it anyway:
+    /// clears the keep flag (logged who/when) and snoozes in one command.
+    #[arg(long = "confirm-kept")]
+    pub confirm_kept: bool,
 }
 
 #[derive(Args)]
@@ -228,6 +233,11 @@ pub struct ArchiveArgs {
     /// Skip tmux teardown on archive.
     #[arg(long = "no-kill")]
     pub no_kill: bool,
+
+    /// The session is kept and you, a person, want to archive it anyway:
+    /// clears the keep flag (logged who/when) and archives in one command.
+    #[arg(long = "confirm-kept")]
+    pub confirm_kept: bool,
 }
 
 #[derive(Args)]
@@ -919,6 +929,38 @@ async fn keep_session(args: KeepArgs) -> Result<()> {
     Ok(())
 }
 
+/// WO#1980-1: the CLI half of the human override. Called by archive /
+/// snooze / rm when the row is kept and `--confirm-kept` was given: clears
+/// the flag daemon-first (the daemon logs who/when), falling back to disk,
+/// and prints the clear so the operator sees both steps. The caller then
+/// re-checks `keep_refusal`, which is now `None`, and proceeds.
+pub(crate) async fn clear_keep_for_override(profile: &str, id: &str, op: &str) -> Result<()> {
+    let by = keep_actor();
+    let landed = match daemon_session_keep(id, false, &by).await? {
+        Some(true) => "daemon-side",
+        _ => {
+            let storage = Storage::open_unwatched(profile)?;
+            storage.update(|instances, _groups| {
+                super::patch_instance(instances, id, |row| {
+                    row.unkeep();
+                    Ok(())
+                })
+            })?;
+            "on disk"
+        }
+    };
+    tracing::info!(
+        target: "session.keep",
+        session = %id,
+        op = %op,
+        by = %by,
+        at = %chrono::Utc::now().to_rfc3339(),
+        "keep flag CLEARED (override: {op} anyway, --confirm-kept)"
+    );
+    println!("Keep cleared ({landed}, by {by}) — {op} anyway: {id}");
+    Ok(())
+}
+
 /// `Some(true)` when the daemon applied the change, `Some(false)` when it
 /// answered 404 for the row (fall back to disk), `None` when no daemon is
 /// reachable at all.
@@ -1373,9 +1415,16 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let title = inst.title.clone();
     let inst = inst.clone();
 
-    // WO#1953: a kept session refuses archive before any teardown.
+    // WO#1953: a kept session refuses archive before any teardown — unless
+    // a person said `--confirm-kept` (WO#1980-1), which clears the flag
+    // (logged) and proceeds in this one command.
+    let mut inst = inst;
     if let Some(refusal) = inst.keep_refusal("archive") {
-        bail!("{}", refusal.message());
+        if !args.confirm_kept {
+            bail!("{}", refusal.message());
+        }
+        clear_keep_for_override(profile, &id, "archive").await?;
+        inst.unkeep();
     }
 
     // Serialize teardown and the archive commit as one lifecycle transition.
@@ -1682,6 +1731,15 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
     let minutes = raw_minutes as u32;
 
     let storage = Storage::open_unwatched(profile)?;
+    // WO#1980-1: resolve first so `--confirm-kept` can clear the flag
+    // (daemon-first, logged) before the locked snooze below re-checks it.
+    if args.confirm_kept {
+        let (instances, _groups) = storage.load_with_groups()?;
+        let inst = super::resolve_session(&args.identifier, &instances)?;
+        if inst.is_kept() {
+            clear_keep_for_override(profile, &inst.id, "snooze").await?;
+        }
+    }
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             // WO#1953: a kept session refuses snooze.
@@ -4835,6 +4893,7 @@ mod keep_command_tests {
             ArchiveArgs {
                 identifier: id.clone(),
                 no_kill: true,
+                confirm_kept: false,
             },
         )
         .await
@@ -4865,6 +4924,7 @@ mod keep_command_tests {
             SnoozeArgs {
                 identifier: id.clone(),
                 minutes: Some(30),
+                confirm_kept: false,
             },
         )
         .await
@@ -4878,6 +4938,97 @@ mod keep_command_tests {
             .find(|i| i.id == id)
             .unwrap();
         assert!(!row.is_snoozed() && row.is_kept());
+    }
+
+    /// WO#1980-1: the refusal prints the exact one-line override.
+    #[tokio::test]
+    #[serial]
+    async fn archive_refusal_prints_the_confirm_kept_override() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let (_storage, id) = seed("keep-archive-hint", true);
+        let err = archive_session(
+            "keep-archive-hint",
+            ArchiveArgs {
+                identifier: id.clone(),
+                no_kill: true,
+                confirm_kept: false,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(&format!("aoe session archive {id} --confirm-kept")),
+            "{err}"
+        );
+    }
+
+    /// WO#1980-1: `--confirm-kept` clears the flag (logged who) and archives
+    /// in ONE command.
+    #[tokio::test]
+    #[serial]
+    async fn archive_with_confirm_kept_clears_the_flag_and_archives() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let (storage, id) = seed("keep-archive-ok", true);
+        archive_session(
+            "keep-archive-ok",
+            ArchiveArgs {
+                identifier: id.clone(),
+                no_kill: true,
+                confirm_kept: true,
+            },
+        )
+        .await
+        .unwrap();
+        let row = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap();
+        assert!(row.is_archived(), "archived in one step");
+        assert!(!row.is_kept(), "keep flag cleared by the override");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snooze_with_confirm_kept_clears_the_flag_and_snoozes() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let (storage, id) = seed("keep-snooze-ok", true);
+        snooze_session(
+            "keep-snooze-ok",
+            SnoozeArgs {
+                identifier: id.clone(),
+                minutes: Some(30),
+                confirm_kept: true,
+            },
+        )
+        .await
+        .unwrap();
+        let row = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap();
+        assert!(row.is_snoozed() && !row.is_kept());
+    }
+
+    #[test]
+    fn confirm_kept_parses_on_archive_snooze_and_rm() {
+        let cli = Cli::try_parse_from(["aoe", "archive", "x", "--confirm-kept"]).unwrap();
+        match cli.cmd {
+            SessionCommands::Archive(a) => assert!(a.confirm_kept),
+            _ => panic!("wrong subcommand"),
+        }
+        let cli = Cli::try_parse_from(["aoe", "snooze", "x", "--minutes", "5", "--confirm-kept"])
+            .unwrap();
+        match cli.cmd {
+            SessionCommands::Snooze(a) => assert!(a.confirm_kept),
+            _ => panic!("wrong subcommand"),
+        }
+        // and it is NOT a --force: that name stays rejected
+        assert!(Cli::try_parse_from(["aoe", "archive", "x", "--force"]).is_err());
     }
 
     #[test]

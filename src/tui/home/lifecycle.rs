@@ -301,6 +301,7 @@ impl HomeView {
             structured_preview_pending: false,
             pending_force_remove_session: None,
             pending_trash_session: None,
+            pending_kept_override: None,
             pending_dialog_click_action: None,
             search_active: false,
             search_query: Input::default(),

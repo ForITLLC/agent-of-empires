@@ -9,7 +9,8 @@ use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
 use crate::tui::restart_poller::RestartRequest;
 
-use super::HomeView;
+use super::{HomeView, KeptOp};
+use crate::tui::dialogs::ConfirmDialog;
 
 /// Membership predicate for a manual group: matches instances whose
 /// `group_path` equals `group_path` or nests beneath it, optionally scoped to
@@ -1768,23 +1769,105 @@ impl HomeView {
     /// `snoozed_until` from the TUI. After sinking the row in the Attention
     /// sort, jump to the next needs attention item so the user can keep
     /// triaging.
-    /// WO#1953: a kept session refuses archive / snooze / trash from every
-    /// surface. On the TUI the refusal is an info dialog naming the flag and
-    /// the clear command, read from the in-memory row BEFORE any lifecycle
-    /// lock or reservation is taken. Returns `true` when the op was refused
-    /// (the caller returns without touching the row).
-    pub(super) fn refuse_if_kept(&mut self, id: &str, op: &str) -> bool {
-        let Some(refusal) = self.instances.get(id).and_then(|i| i.keep_refusal(op)) else {
+    /// WO#1953 / WO#1980-1: a kept session refuses archive / snooze / trash
+    /// from every SWEEP surface — but the TUI is a person, and the flag must
+    /// never refuse the human. So here a kept row opens a confirm ("kept
+    /// since <when> by <who> — <op> anyway?"); Yes clears the flag (logged
+    /// who/when) and re-runs the op in one step, No leaves the row exactly
+    /// as it was. Read from the in-memory row BEFORE any lifecycle lock or
+    /// reservation is taken. Returns `true` when the op is parked behind
+    /// the confirm (the caller returns without touching the row).
+    pub(super) fn confirm_if_kept(&mut self, id: &str, op: KeptOp) -> bool {
+        let Some(inst) = self.instances.get(id) else {
             return false;
         };
+        if !inst.is_kept() {
+            return false;
+        }
+        let verb = op.verb();
+        let title = inst.title.clone();
+        let since = inst
+            .kept_at
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_else(|| "?".to_string());
+        let by = inst
+            .kept_by
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         tracing::info!(
             target: "session.keep",
             session_id = %id,
-            op,
-            "tui {op} refused: session is kept"
+            op = verb,
+            "tui {verb} on a kept row: asking the operator"
         );
-        self.info_dialog = Some(InfoDialog::new("Kept session", &refusal.message()));
+        let verb_cap = {
+            let mut c = verb.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        };
+        let message = format!(
+            "\"{title}\" is kept since {since} by {by}.\n\
+             {verb_cap} anyway? Yes clears the keep flag (logged) and {verb}s it now."
+        );
+        self.pending_kept_override = Some((id.to_string(), op));
+        self.confirm_dialog = Some(
+            ConfirmDialog::new("Kept session", &message, "kept_override")
+                .buttons(&format!("{verb_cap} anyway"), "Cancel"),
+        );
         true
+    }
+
+    /// The Yes arm of the kept confirm (WO#1980-1): clear the flag on memory
+    /// + disk (logged who/when), then replay the op the person asked for.
+    pub(super) fn apply_kept_override(&mut self) {
+        let Some((id, op)) = self.pending_kept_override.take() else {
+            return;
+        };
+        let previously_by = self
+            .instances
+            .get(&id)
+            .and_then(|i| i.kept_by.clone())
+            .unwrap_or_else(|| "-".to_string());
+        if let Err(e) = self.apply_user_action(&id, |inst| inst.unkeep()) {
+            tracing::error!(
+                target: "session.keep",
+                session_id = %id,
+                "kept override: failed to clear the flag: {e}"
+            );
+            self.info_dialog = Some(InfoDialog::new(
+                "Kept session",
+                &format!("Could not clear the keep flag: {e}"),
+            ));
+            return;
+        }
+        tracing::info!(
+            target: "session.keep",
+            session_id = %id,
+            op = op.verb(),
+            by = %tui_actor(),
+            previously_by = %previously_by,
+            at = %chrono::Utc::now().to_rfc3339(),
+            "keep flag CLEARED (override: {} anyway, TUI confirm)",
+            op.verb()
+        );
+        match op {
+            KeptOp::Archive => {
+                if self.selected_session.as_deref() != Some(id.as_str()) {
+                    self.selected_session = Some(id.clone());
+                }
+                if let Err(e) = self.toggle_archive_at_cursor() {
+                    tracing::error!(target: "session.keep", "archive after override failed: {e}");
+                }
+            }
+            KeptOp::Snooze(minutes) => {
+                if let Err(e) = self.snooze_session_for(&id, minutes) {
+                    tracing::error!(target: "session.keep", "snooze after override failed: {e}");
+                }
+            }
+            KeptOp::Trash => self.trash_session_by_id(&id),
+        }
     }
 
     pub(super) fn snooze_session_for(
@@ -1792,7 +1875,7 @@ impl HomeView {
         id: &str,
         minutes: u32,
     ) -> anyhow::Result<Option<String>> {
-        if self.refuse_if_kept(id, "snooze") {
+        if self.confirm_if_kept(id, KeptOp::Snooze(minutes)) {
             return Ok(None);
         }
         let title = self
@@ -1935,7 +2018,7 @@ impl HomeView {
             return Ok(());
         }
 
-        if self.refuse_if_kept(&id, "archive") {
+        if self.confirm_if_kept(&id, KeptOp::Archive) {
             return Ok(());
         }
 
@@ -2014,7 +2097,7 @@ impl HomeView {
     /// `Instance::stop` runs on the `StopPoller`, #1496). A structured-view
     /// worker is reaped by the daemon reconciler once the row reads trashed.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
-        if self.refuse_if_kept(id, "trash") {
+        if self.confirm_if_kept(id, KeptOp::Trash) {
             return;
         }
         let Some((profile, mut request_instance)) = self
@@ -2495,6 +2578,24 @@ fn restore_from_trash_with_storage(
             RestoreFromTrash::PersistFailed
         }
     }
+}
+
+/// `tui:<user>@<host>` — who cleared a keep flag from the TUI (WO#1980-1).
+pub(super) fn tui_actor() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "localhost".to_string());
+    format!("tui:{user}@{host}")
 }
 
 #[cfg(test)]
