@@ -405,6 +405,9 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/terminal"),
     ("DELETE", "/api/sessions/{id}/terminal"),
     ("POST", "/api/sessions/{id}/container-terminal"),
+    // Cross-board relay ingress (fork, WO#1584): a bearer-authenticated
+    // board-to-board send; a CityHall client never originates one.
+    ("POST", "/api/relay"),
     // Git / project / profile management.
     ("POST", "/api/git/clone"),
     ("POST", "/api/projects"),
