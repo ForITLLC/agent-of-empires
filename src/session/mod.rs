@@ -71,11 +71,11 @@ pub use groups::{
 };
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
+pub(crate) use instance::seed_mcp_servers_from_template;
 #[cfg(test)]
 pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
-pub(crate) use instance::seed_mcp_servers_from_template;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
     persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite,
@@ -89,10 +89,10 @@ pub(crate) use instance::{
 pub use instance::{
     is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,
     EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation, Instance,
-    LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
-    PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
-    SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
-    WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    KeepRefused, LaunchSidOutcome, LifecycleOperation, LifecycleReservation,
+    LifecycleReservationError, PendingInitialTurn, PluginCreateIdempotency, PollerStart,
+    SandboxInfo, SessionBucket, SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo,
+    View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{

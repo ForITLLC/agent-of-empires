@@ -479,17 +479,7 @@ fn decorate_row(
             .add_modifier(Modifier::RAPID_BLINK);
     }
 
-    // Prefix priority: archive (none) > snooze (`z `) > urgent (`! `). Both are
-    // Attention-only so other sorts show no decoration for state the user did not opt into.
-    let title_text = if inst.is_archived() || inst.is_trashed() {
-        Cow::Owned(inst.title.clone())
-    } else if in_attention && inst.is_snoozed() {
-        Cow::Owned(format!("z {}", inst.title))
-    } else if in_attention && inst.is_urgent() {
-        Cow::Owned(format!("! {}", inst.title))
-    } else {
-        Cow::Owned(inst.title.clone())
-    };
+    let title_text = Cow::Owned(row_title(inst, in_attention));
 
     (icon, title_text, style)
 }

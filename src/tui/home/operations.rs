@@ -1213,7 +1213,7 @@ impl HomeView {
                 Some(&id),
             )
         {
-            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+            self.info_dialog = Some(InfoDialog::new(
                 "Rename Failed",
                 &duplicate_session_error(&authoritative.title).to_string(),
             ));
@@ -1415,10 +1415,7 @@ impl HomeView {
                     if target_profile != current_profile {
                         return Err(error);
                     }
-                    self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                        "Rename Failed",
-                        &error.to_string(),
-                    ));
+                    self.info_dialog = Some(InfoDialog::new("Rename Failed", &error.to_string()));
                     return Ok(());
                 }
             }
@@ -1504,10 +1501,8 @@ impl HomeView {
                         worktree_rename_block(status, is_sandboxed, container_holds_worktree)
                     {
                         let body = worktree_rename_block_message(&reason);
-                        self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                            "Stop the Session to Rename",
-                            body,
-                        ));
+                        self.info_dialog =
+                            Some(InfoDialog::new("Stop the Session to Rename", body));
                         return Ok(());
                     }
                     match crate::session::worktree_edit::edit_worktree_workdir(
@@ -1531,7 +1526,7 @@ impl HomeView {
                         }
                         Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
                         Err(e) => {
-                            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                            self.info_dialog = Some(InfoDialog::new(
                                 "Rename Failed",
                                 &format!("Could not move the worktree directory: {e}"),
                             ));
@@ -1699,6 +1694,25 @@ impl HomeView {
         Ok(None)
     }
 
+    /// WO#1953: a kept session refuses archive / snooze / trash from every
+    /// surface. On the TUI the refusal is an info dialog naming the flag and
+    /// the clear command, read from the in-memory row BEFORE any lifecycle
+    /// lock or reservation is taken. Returns `true` when the op was refused
+    /// (the caller returns without touching the row).
+    pub(super) fn refuse_if_kept(&mut self, id: &str, op: &str) -> bool {
+        let Some(refusal) = self.instances.get(id).and_then(|i| i.keep_refusal(op)) else {
+            return false;
+        };
+        tracing::info!(
+            target: "session.keep",
+            session_id = %id,
+            op,
+            "tui {op} refused: session is kept"
+        );
+        self.info_dialog = Some(InfoDialog::new("Kept session", &refusal.message()));
+        true
+    }
+
     /// Apply a snooze with an explicit duration, on the picker's submit. The only place
     /// the TUI mutates `snoozed_until`. Jumps to the next needs-attention row once this
     /// one sinks, so triage can continue.
@@ -1707,6 +1721,9 @@ impl HomeView {
         id: &str,
         minutes: u32,
     ) -> anyhow::Result<Option<String>> {
+        if self.refuse_if_kept(id, "snooze") {
+            return Ok(None);
+        }
         let title = self
             .instances
             .get(id)
@@ -1824,6 +1841,10 @@ impl HomeView {
             return Ok(());
         }
 
+        if self.refuse_if_kept(&id, "archive") {
+            return Ok(());
+        }
+
         // Tear down all tmux before flipping archived (#1868), holding the lifecycle lock
         // through the archive so `aoe send` cannot relaunch or type into the session between.
         let lifecycle_lock = match self.instances.get(&id) {
@@ -1889,6 +1910,9 @@ impl HomeView {
     /// structured-view worker is reaped by the daemon reconciler once the row reads
     /// trashed.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
+        if self.refuse_if_kept(id, "trash") {
+            return;
+        }
         let Some((profile, mut request_instance)) = self
             .instances
             .get(id)
@@ -2002,19 +2026,19 @@ impl HomeView {
                 self.rebuild_flat_items();
             }
             RestoreFromTrash::Busy(reason) => {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                self.info_dialog = Some(InfoDialog::new(
                     "Restore Failed",
                     &format!("Session is {reason}, so it was not restored."),
                 ));
             }
             RestoreFromTrash::WorktreeFailed { reason } => {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                self.info_dialog = Some(InfoDialog::new(
                     "Restore Failed",
                     &format!("Could not restore the worktree: {reason}"),
                 ));
             }
             RestoreFromTrash::PersistFailed => {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                self.info_dialog = Some(InfoDialog::new(
                     "Restore Failed",
                     "Could not persist the restore. Try again.",
                 ));
@@ -2178,8 +2202,29 @@ impl HomeView {
     /// Archive every active session under the selected group: persist runs inline, then tmux
     /// teardown runs off-thread. Confirmation upstream. See #1868.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
-        let ids = self.active_sessions_in_selected_group();
+        // WO#1953: kept members stay; the sweep archives the rest and says so.
+        let (kept, ids): (Vec<String>, Vec<String>) = self
+            .active_sessions_in_selected_group()
+            .into_iter()
+            .partition(|id| self.instances.get(id).is_some_and(|i| i.is_kept()));
+        for id in &kept {
+            tracing::info!(
+                target: "session.keep",
+                session_id = %id,
+                "group archive skipped a kept session"
+            );
+        }
         if ids.is_empty() {
+            if !kept.is_empty() {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Kept session",
+                    &format!(
+                        "refused: every active session in this group is kept ({}); \
+                         `archive` is blocked. Clear with: aoe session keep --off <id>",
+                        kept.join(", ")
+                    ),
+                ));
+            }
             return Ok(());
         }
         let kill_targets: Vec<_> = ids
