@@ -602,7 +602,7 @@ async fn move_session(args: MoveArgs) -> Result<()> {
         // resolves; when they diverge, perform the same restart+rebind a
         // cross-profile move would, so a single call rescues it.
         let expected = extract_config_dir(
-            &crate::session::profile_config::resolve_config_or_warn(&target).environment,
+            &crate::session::config::profile_config::resolve_config_or_warn(&target).environment,
         );
         let live = live_config_dir(&record);
         if !args.no_restart && config_dir_diverged(live.as_deref(), expected.as_deref()) {
@@ -636,7 +636,7 @@ async fn move_session(args: MoveArgs) -> Result<()> {
     // and refuse the move outright when the record cannot be written: a loud
     // refusal here beats a silent dead pane at the next launch.
     let target_environment =
-        crate::session::profile_config::resolve_config_or_warn(&target).environment;
+        crate::session::config::profile_config::resolve_config_or_warn(&target).environment;
     let home = dirs::home_dir().context("cannot seed destination folder trust: no home dir")?;
     let (trusted_json, trusted_key) =
         seed_destination_folder_trust(&target_environment, &home, &record.project_path)
@@ -690,7 +690,7 @@ async fn move_session(args: MoveArgs) -> Result<()> {
     // restart path re-resolves CLAUDE_CONFIG_DIR from source_profile=target.
     println!("  Re-binding live account under '{}'...", target);
     let expected = extract_config_dir(
-        &crate::session::profile_config::resolve_config_or_warn(&target).environment,
+        &crate::session::config::profile_config::resolve_config_or_warn(&target).environment,
     );
     if let Err(e) = restart_session(
         &target,
