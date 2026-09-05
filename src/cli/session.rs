@@ -75,6 +75,14 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
+    /// Mark a session KEPT (WO#1953): `archive`, `snooze`, `remove`/trash and
+    /// every auto-archive placement script refuse it until the flag is
+    /// cleared with `--off`. There is no `--force` on the sweep side. Looked
+    /// up across ALL profiles (no `-p` needed); daemon-first so a live board
+    /// sees the flag at once, direct-to-disk when no daemon is running. The
+    /// daemon logs every set/clear with who/when.
+    Keep(KeepArgs),
+
     /// Acknowledge (clear) a session's urgent flag, sticky kinds included —
     /// the explicit counterpart of the ack a delivered `send` performs. For a
     /// row that is healthy again but still flagged (WO#1832).
@@ -220,6 +228,16 @@ pub struct ArchiveArgs {
     /// Skip tmux teardown on archive.
     #[arg(long = "no-kill")]
     pub no_kill: bool,
+}
+
+#[derive(Args)]
+pub struct KeepArgs {
+    /// Session ID or title. Looked up across ALL profiles.
+    pub identifier: String,
+
+    /// Clear the keep flag instead of setting it.
+    #[arg(long)]
+    pub off: bool,
 }
 
 #[derive(Args)]
@@ -451,6 +469,12 @@ struct SessionDetails {
     /// Independent of `state`, matching the API field from #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pinned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Keep flag (WO#1953), same keys as `/api/sessions` and `list --json`.
+    kept: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -475,6 +499,9 @@ fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
         archived_at: inst.archived_at,
         snoozed_until: super::list::active_snoozed_until(inst),
         pinned_at: inst.pinned_at,
+        kept: inst.is_kept(),
+        kept_at: inst.kept_at,
+        kept_by: inst.kept_by.clone(),
         agent_session_id: inst.agent_session_id.clone(),
         parent_session_id: inst.parent_session_id.clone(),
         profile: profile.to_string(),
@@ -541,6 +568,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
         SessionCommands::Favorite(args) => favorite_session(profile, args).await,
         SessionCommands::Unfavorite(args) => unfavorite_session(profile, args).await,
+        SessionCommands::Keep(args) => keep_session(args).await,
         SessionCommands::UrgentAck(args) => urgent_ack_session(profile, args).await,
         SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
@@ -817,6 +845,99 @@ async fn set_model_session(args: SetModelArgs) -> Result<()> {
 /// `(owning_profile, instance)`. An exact-id hit wins outright even if a
 /// title collides elsewhere; otherwise more than one matching profile is an
 /// ambiguity error (refuse rather than guess which account to touch).
+/// `cli:<user>@<host>` — who is asking, recorded on the row and in the
+/// daemon's `session.keep` log line.
+fn keep_actor() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    // `HOSTNAME` is not exported by every shell; `/etc/hostname` (Linux) and
+    // `uname -n` cover the rest without pulling in a crate for one string.
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .or_else(|| {
+            std::process::Command::new("uname")
+                .arg("-n")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "localhost".to_string());
+    format!("cli:{user}@{host}")
+}
+
+/// `aoe session keep <id> [--off]` (WO#1953). Daemon-first: the running
+/// board owns the live row and logs the transition; disk is the fallback
+/// when no daemon is up (the row is then picked up on the daemon's next
+/// file-watch reload).
+async fn keep_session(args: KeepArgs) -> Result<()> {
+    let (owner, inst) = find_session_across_profiles(&args.identifier)?;
+    let keep = !args.off;
+    let by = keep_actor();
+    match daemon_session_keep(&inst.id, keep, &by).await? {
+        Some(true) => {
+            println!(
+                "{}: {} ({}) [daemon-side, by {by}]",
+                if keep { "Kept" } else { "Keep cleared" },
+                inst.title,
+                inst.id
+            );
+            return Ok(());
+        }
+        Some(false) => {
+            // Daemon is up but does not know the row (e.g. an older daemon
+            // without the endpoint, or a profile it does not serve): fall
+            // through to disk so the flag still lands.
+        }
+        None => {}
+    }
+    let storage = Storage::open_unwatched(&owner)?;
+    let title = storage.update(|instances, _groups| {
+        super::patch_instance(instances, &inst.id, |row| {
+            if keep {
+                row.keep(Some(&by));
+            } else {
+                row.unkeep();
+            }
+            Ok(row.title.clone())
+        })
+    })?;
+    println!(
+        "{}: {} ({}) [profile '{owner}', by {by}]",
+        if keep { "Kept" } else { "Keep cleared" },
+        title,
+        inst.id
+    );
+    Ok(())
+}
+
+/// `Some(true)` when the daemon applied the change, `Some(false)` when it
+/// answered 404 for the row (fall back to disk), `None` when no daemon is
+/// reachable at all.
+async fn daemon_session_keep(session_id: &str, keep: bool, by: &str) -> Result<Option<bool>> {
+    use crate::acp::client::{discovery, HttpClient, HttpError};
+    let Ok(endpoint) = discovery::discover_local() else {
+        return Ok(None);
+    };
+    let Ok(client) = HttpClient::new(endpoint) else {
+        return Ok(None);
+    };
+    match client.session_keep(session_id, keep, by).await {
+        Ok(()) => Ok(Some(true)),
+        Err(HttpError::Transport(_)) => Ok(None),
+        Err(HttpError::SessionNotFound(_)) => Ok(Some(false)),
+        Err(e) => bail!("daemon refused keep update for {session_id}: {e}"),
+    }
+}
+
 fn find_session_across_profiles(identifier: &str) -> Result<(String, crate::session::Instance)> {
     let profiles = crate::session::list_profiles()?;
     let mut hits: Vec<(String, crate::session::Instance)> = Vec::new();
@@ -1253,6 +1374,11 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let title = inst.title.clone();
     let inst = inst.clone();
 
+    // WO#1953: a kept session refuses archive before any teardown.
+    if let Some(refusal) = inst.keep_refusal("archive") {
+        bail!("{}", refusal.message());
+    }
+
     // Serialize teardown and the archive commit as one lifecycle transition.
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&id)
@@ -1559,6 +1685,10 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
+            // WO#1953: a kept session refuses snooze.
+            if let Some(refusal) = inst.keep_refusal("snooze") {
+                bail!("{}", refusal.message());
+            }
             inst.snooze(minutes);
             Ok(inst.title.clone())
         })
@@ -4626,5 +4756,176 @@ mod show_json_tests {
             active["snoozed_until"],
             serde_json::to_value(future).unwrap()
         );
+    }
+}
+
+/// WO#1953 — `aoe session keep <id> [--off]` and the CLI-side refusals.
+#[cfg(test)]
+mod keep_command_tests {
+    use super::{
+        archive_session, keep_session, snooze_session, ArchiveArgs, KeepArgs, SessionCommands,
+        SnoozeArgs,
+    };
+    use crate::session::{Instance, Storage};
+    use clap::Parser;
+    use serial_test::serial;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        cmd: SessionCommands,
+    }
+
+    #[test]
+    fn keep_parses_identifier_and_off_flag() {
+        let cli = Cli::try_parse_from(["aoe", "keep", "abc123"]).expect("keep must parse");
+        match cli.cmd {
+            SessionCommands::Keep(args) => {
+                assert_eq!(args.identifier, "abc123");
+                assert!(!args.off);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        let cli = Cli::try_parse_from(["aoe", "keep", "abc123", "--off"]).expect("--off parses");
+        match cli.cmd {
+            SessionCommands::Keep(args) => assert!(args.off),
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn keep_has_no_force_flag_anywhere() {
+        // The contract: there is no --force on keep, archive, snooze or remove.
+        assert!(Cli::try_parse_from(["aoe", "keep", "x", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["aoe", "archive", "x", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["aoe", "snooze", "x", "--force"]).is_err());
+    }
+
+    fn seed(profile: &str, kept: bool) -> (Storage, String) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new("kept-cli", "/tmp/kept-cli");
+        if kept {
+            inst.keep(Some("test:seed"));
+        }
+        let id = inst.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![inst];
+                Ok(())
+            })
+            .unwrap();
+        (storage, id)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn keep_sets_and_clears_the_flag_without_a_daemon() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let (storage, id) = seed("keep-cli", false);
+
+        keep_session(KeepArgs {
+            identifier: id.clone(),
+            off: false,
+        })
+        .await
+        .unwrap();
+        let row = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap();
+        assert!(row.is_kept());
+        let by = row.kept_by.clone().expect("kept_by recorded");
+        assert!(by.starts_with("cli:"), "by = {by}");
+
+        keep_session(KeepArgs {
+            identifier: id.clone(),
+            off: true,
+        })
+        .await
+        .unwrap();
+        let row = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap();
+        assert!(!row.is_kept());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn archive_refuses_a_kept_session_and_names_the_flag() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let (storage, id) = seed("keep-archive", true);
+        let err = archive_session(
+            "keep-archive",
+            ArchiveArgs {
+                identifier: id.clone(),
+                no_kill: true,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("kept"), "{err}");
+        assert!(err.contains("archive"), "{err}");
+        assert!(
+            err.contains(&format!("aoe session keep --off {id}")),
+            "{err}"
+        );
+        let row = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap();
+        assert!(!row.is_archived() && row.is_kept());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snooze_refuses_a_kept_session() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let (storage, id) = seed("keep-snooze", true);
+        let err = snooze_session(
+            "keep-snooze",
+            SnoozeArgs {
+                identifier: id.clone(),
+                minutes: Some(30),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("kept") && err.contains("snooze"), "{err}");
+        let row = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .unwrap();
+        assert!(!row.is_snoozed() && row.is_kept());
+    }
+
+    #[test]
+    fn show_json_and_list_json_carry_the_keep_fields() {
+        let mut inst = Instance::new("k", "/tmp/k");
+        let bare = serde_json::to_value(super::session_details(&inst, "p")).unwrap();
+        assert_eq!(bare["kept"], false);
+        assert!(bare.get("kept_at").is_none());
+        let bare = serde_json::to_value(crate::cli::list::session_json(&inst, "p")).unwrap();
+        assert_eq!(bare["kept"], false);
+        assert!(bare.get("kept_by").is_none());
+
+        inst.keep(Some("tui"));
+        let v = serde_json::to_value(super::session_details(&inst, "p")).unwrap();
+        assert_eq!(v["kept"], true);
+        assert_eq!(v["kept_by"], "tui");
+        assert!(v["kept_at"].is_string());
+        let v = serde_json::to_value(crate::cli::list::session_json(&inst, "p")).unwrap();
+        assert_eq!(v["kept"], true);
+        assert_eq!(v["kept_by"], "tui");
     }
 }

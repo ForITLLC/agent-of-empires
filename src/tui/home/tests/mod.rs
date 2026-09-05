@@ -40,6 +40,7 @@ mod save_field_merge;
 mod scroll_pane_isolation;
 mod search;
 mod session_feed_tests;
+mod session_keep;
 mod settings_scroll_wiring;
 mod stacked_single_seam;
 mod status_rows_menu;

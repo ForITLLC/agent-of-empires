@@ -88,6 +88,9 @@ impl SessionResponse {
                 None
             },
             trashed_at: inst.trashed_at.map(|t| t.to_rfc3339()),
+            kept: inst.is_kept(),
+            kept_at: inst.kept_at.map(|t| t.to_rfc3339()),
+            kept_by: inst.kept_by.clone(),
             // Surface the marker (omitted when read); the web gates the
             // visual on the `session.unread_indicator` setting.
             unread: inst.unread,

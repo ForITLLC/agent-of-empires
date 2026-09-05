@@ -85,6 +85,7 @@ pub use instance::{
     LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
     PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket, StartOutcome, Status,
     TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
+    KeepRefused,
     TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]

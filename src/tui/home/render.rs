@@ -530,24 +530,45 @@ fn decorate_row(
             .add_modifier(Modifier::UNDERLINED);
     }
 
-    // Prefix priority: archive (no prefix) wins over snooze (`z `) wins over
-    // urgent (`! `) wins over favorite (`* `). Snooze and urgent are
-    // Attention-mode-only so users in Newest / AZ / etc. don't see decoration
-    // for state they didn't opt into managing; the favorite star also shows
-    // elsewhere, because favorites-first pins the row there too.
-    let title_text = if inst.is_archived() || inst.is_trashed() {
-        Cow::Owned(inst.title.clone())
-    } else if in_attention && inst.is_snoozed() {
-        Cow::Owned(format!("z {}", inst.title))
-    } else if in_attention && inst.is_urgent() {
-        Cow::Owned(format!("! {}", inst.title))
-    } else if show_favorite && crate::session::is_live_favorite(inst) {
-        Cow::Owned(format!("* {}", inst.title))
-    } else {
-        Cow::Owned(inst.title.clone())
-    };
+    let title_text = Cow::Owned(row_title(inst, in_attention, show_favorite));
 
     (icon, title_text, style)
+}
+
+/// The row's title with its state prefix.
+///
+/// Prefix priority: archive (no prefix) wins over snooze (`z `) wins over
+/// urgent (`! `) wins over keep (`⚓ `) wins over favorite (`* `). Snooze and
+/// urgent are Attention-mode-only so users in Newest / AZ / etc. don't see
+/// decoration for state they didn't opt into managing; the favorite star also
+/// shows elsewhere, because favorites-first pins the row there too. The keep
+/// anchor shows in every sort: it is the flag that makes archive / snooze /
+/// trash refuse the row, so it must be visible wherever those keys are live,
+/// and it outranks the star because a kept row is the more consequential
+/// state (WO#1953).
+fn row_title(inst: &crate::session::Instance, in_attention: bool, show_favorite: bool) -> String {
+    if inst.is_archived() || inst.is_trashed() {
+        inst.title.clone()
+    } else if in_attention && inst.is_snoozed() {
+        format!("z {}", inst.title)
+    } else if in_attention && inst.is_urgent() {
+        format!("! {}", inst.title)
+    } else if inst.is_kept() {
+        format!("⚓ {}", inst.title)
+    } else if show_favorite && crate::session::is_live_favorite(inst) {
+        format!("* {}", inst.title)
+    } else {
+        inst.title.clone()
+    }
+}
+
+#[cfg(test)]
+pub(super) fn row_title_for_test(
+    inst: &crate::session::Instance,
+    in_attention: bool,
+    show_favorite: bool,
+) -> String {
+    row_title(inst, in_attention, show_favorite)
 }
 
 /// Append the selected row's `last_error` (in red) to a shelf placeholder's

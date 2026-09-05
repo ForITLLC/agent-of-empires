@@ -67,7 +67,7 @@ pub(crate) mod test_helpers;
 mod tmux_session;
 mod types;
 
-pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
+pub use flags::{is_valid_session_color, KeepRefused, SessionBucket, SESSION_COLORS};
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 pub(crate) use omp::persist_omp_session_to_storage;
@@ -300,6 +300,23 @@ pub struct Instance {
     /// absent in older `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<DateTime<Utc>>,
+
+    /// Keep marker (WO#1953): the operator has said this session must never
+    /// be swept. While set, `archive`, `snooze`, `trash`/`remove` and every
+    /// auto-archive placement script REFUSE the session (HTTP 409
+    /// `session_kept`, CLI error naming the flag). There is no `--force`;
+    /// the only way through is an explicit clear (`aoe session keep --off`),
+    /// which the daemon logs with who/when. Orthogonal to the triage
+    /// decorations (favorite/pin) and NOT cleared by `touch_last_accessed`.
+    /// Additive: absent in older `sessions.json` rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_at: Option<DateTime<Utc>>,
+
+    /// Who set `kept_at` (`cli:<user>@<host>`, `api:<peer>`, `tui`, …).
+    /// Informational — it names the setter in the refusal so an operator
+    /// knows whom to ask before clearing the flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_by: Option<String>,
 
     /// The `project_path` a managed-worktree session had before it was
     /// trashed, captured when the trash flow relocates the worktree into the

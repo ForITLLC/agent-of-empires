@@ -280,6 +280,12 @@ pub struct SessionResponse {
     /// and permanent-delete actions. See #2489.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<String>,
+    #[serde(default)]
+    pub kept: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_by: Option<String>,
     /// Unread marker, mirroring `Instance::unread`: `true` when the session
     /// needs attention (a finished turn the user hasn't engaged with, or a
     /// manual flag), omitted when read. The web sidebar paints an unread

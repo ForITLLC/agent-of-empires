@@ -61,6 +61,7 @@ pub use sessions::{
     update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
     update_workspace_ordering, OutputQuery, SendMessageRequest,
     get_session_goal, set_session_goal,
+    update_session_keep,
 };
 // Daemon-side restart (POST /api/sessions/{id}/restart + GET restart-status): a
 // separate `use` so this branch stacks beside other route additions without
@@ -356,6 +357,7 @@ mod tests {
                 include_str!("sessions/lifecycle.rs"),
                 &[
                     "update_session_pin",
+                    "update_session_keep",
                     "update_session_color",
                     "update_session_archive",
                     "update_session_snooze",
@@ -591,6 +593,7 @@ mod tests {
                 include_str!("sessions/lifecycle.rs"),
                 &[
                     "update_session_pin",
+                    "update_session_keep",
                     "update_session_color",
                     "update_session_archive",
                     "update_session_snooze",

@@ -27,6 +27,53 @@ pub enum SessionBucket {
     Trashed,
 }
 
+/// The refusal a kept session hands back for a sweep-class operation
+/// (WO#1953). One value, rendered by every surface: the API serialises it as
+/// the 409 body (`to_json`), the CLI/TUI print `message()`. Naming the flag,
+/// the session, the op and the exact clear command is the contract — there
+/// is no `--force`, so the message must tell the operator the only way
+/// through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepRefused {
+    pub session_id: String,
+    pub title: String,
+    pub op: String,
+    pub kept_at: DateTime<Utc>,
+    pub kept_by: Option<String>,
+}
+
+impl KeepRefused {
+    pub fn message(&self) -> String {
+        format!(
+            "refused: session {} ({}) is kept (keep flag set {}{}); `{}` is blocked. \
+             Clear it first: aoe session keep --off {}",
+            self.session_id,
+            self.title,
+            self.kept_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            self.kept_by
+                .as_deref()
+                .map(|b| format!(" by {b}"))
+                .unwrap_or_default(),
+            self.op,
+            self.session_id,
+        )
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "error": "session_kept",
+            "message": self.message(),
+            "session_id": self.session_id,
+            "title": self.title,
+            "op": self.op,
+            "kept_at": self.kept_at,
+            "kept_by": self.kept_by,
+            "clear_with": format!("aoe session keep --off {}", self.session_id),
+        })
+    }
+}
+
 impl Instance {
     /// Stamp `last_accessed_at` to the current time AND wake the session
     /// from any sink state. Call this on user-initiated interactions
@@ -99,6 +146,10 @@ impl Instance {
     /// touches archived rows (#2206), so nothing else can clear it. Degrade
     /// those statuses to Idle here, matching where v016 settles archived rows.
     pub fn archive(&mut self) {
+        if let Some(r) = self.keep_refusal("archive") {
+            tracing::warn!(target: "session.keep", "{}", r.message());
+            return;
+        }
         self.archived_at = Some(Utc::now());
         self.favorited_at = None;
         self.snoozed_until = None;
@@ -167,6 +218,10 @@ impl Instance {
     /// `pinned_at`) are left untouched so restore is faithful.
     /// `effective_bucket()` makes trash win regardless. Idempotent.
     pub fn trash(&mut self) {
+        if let Some(r) = self.keep_refusal("trash") {
+            tracing::warn!(target: "session.keep", "{}", r.message());
+            return;
+        }
         if self.trashed_at.is_none() {
             self.trashed_at = Some(Utc::now());
         }
@@ -274,6 +329,10 @@ impl Instance {
     /// (favorite is the TUI within-tier signal, snoozed favorites keep
     /// their star when they wake; see field doc for `favorited_at`).
     pub fn snooze(&mut self, minutes: u32) {
+        if let Some(r) = self.keep_refusal("snooze") {
+            tracing::warn!(target: "session.keep", "{}", r.message());
+            return;
+        }
         self.snoozed_until = Some(Utc::now() + chrono::Duration::minutes(minutes as i64));
         self.pinned_at = None;
     }
@@ -358,6 +417,42 @@ impl Instance {
 
     pub fn is_pinned(&self) -> bool {
         self.pinned_at.is_some()
+    }
+
+    /// WO#1953: mark this session as kept. Idempotent — a second `keep`
+    /// preserves the first stamp and setter so the refusal keeps naming the
+    /// person who actually asked for it.
+    pub fn keep(&mut self, by: Option<&str>) {
+        if self.kept_at.is_none() {
+            self.kept_at = Some(Utc::now());
+            self.kept_by = by.map(str::to_string);
+        }
+    }
+
+    /// Clear the keep flag. The daemon logs who/when at its call site
+    /// (`session.keep` target); this is the pure state change.
+    pub fn unkeep(&mut self) {
+        self.kept_at = None;
+        self.kept_by = None;
+    }
+
+    pub fn is_kept(&self) -> bool {
+        self.kept_at.is_some()
+    }
+
+    /// The refusal a kept session hands back for a sweep-class `op`
+    /// (`archive`, `snooze`, `trash`, `remove`, …), or `None` when the row is
+    /// not kept. Every refusing surface (API 409, CLI error, TUI dialog,
+    /// placement scripts) derives its wording from this one value so the
+    /// operator always sees the same flag, id, op and clear command.
+    pub fn keep_refusal(&self, op: &str) -> Option<KeepRefused> {
+        self.kept_at.map(|kept_at| KeepRefused {
+            session_id: self.id.clone(),
+            title: self.title.clone(),
+            op: op.to_string(),
+            kept_at,
+            kept_by: self.kept_by.clone(),
+        })
     }
 
     /// Time elapsed since this session most recently transitioned into
@@ -882,5 +977,128 @@ mod tests {
             inst.archive();
             assert_eq!(inst.status, status, "{status:?} should survive archive");
         }
+    }
+}
+
+/// WO#1953 — the per-session `keep` flag. A kept session is one the operator
+/// has said must never be swept: `archive`, `snooze`, `trash`/`remove` and
+/// every auto-archive placement script REFUSE it until the flag is cleared
+/// explicitly (`aoe session keep --off <id>`). There is no `--force`.
+#[cfg(test)]
+mod keep_tests {
+    use super::*;
+
+    #[test]
+    fn keep_sets_kept_at_and_by_and_unkeep_clears_both() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        assert!(!inst.is_kept());
+        assert!(inst.kept_at.is_none() && inst.kept_by.is_none());
+
+        inst.keep(Some("cli:ben@mini"));
+        assert!(inst.is_kept());
+        assert!(inst.kept_at.is_some());
+        assert_eq!(inst.kept_by.as_deref(), Some("cli:ben@mini"));
+
+        inst.unkeep();
+        assert!(!inst.is_kept());
+        assert!(inst.kept_at.is_none() && inst.kept_by.is_none());
+    }
+
+    #[test]
+    fn keep_is_idempotent_and_preserves_the_first_stamp() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.keep(Some("first"));
+        let first = inst.kept_at;
+        inst.keep(Some("second"));
+        assert_eq!(inst.kept_at, first, "re-keeping must not restamp");
+        assert_eq!(inst.kept_by.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn keep_refusal_names_the_flag_the_op_and_the_clear_command() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        assert!(
+            inst.keep_refusal("archive").is_none(),
+            "unkept → no refusal"
+        );
+
+        inst.keep(Some("api:test"));
+        let r = inst.keep_refusal("archive").expect("kept → refusal");
+        assert_eq!(r.session_id, inst.id);
+        assert_eq!(r.op, "archive");
+        let msg = r.message();
+        assert!(msg.contains("kept"), "message names the flag: {msg}");
+        assert!(msg.contains(&inst.id), "message names the session: {msg}");
+        assert!(msg.contains("archive"), "message names the op: {msg}");
+        assert!(
+            msg.contains(&format!("aoe session keep --off {}", inst.id)),
+            "message names the clear command: {msg}"
+        );
+        let json = r.to_json();
+        assert_eq!(json["error"], "session_kept");
+        assert_eq!(json["session_id"], inst.id);
+        assert_eq!(json["op"], "archive");
+        assert_eq!(json["kept_by"], "api:test");
+    }
+
+    #[test]
+    fn archive_snooze_and_trash_are_no_ops_on_a_kept_row() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.keep(Some("t"));
+
+        inst.archive();
+        assert!(!inst.is_archived(), "archive() must not touch a kept row");
+        inst.snooze(30);
+        assert!(!inst.is_snoozed(), "snooze() must not touch a kept row");
+        inst.trash();
+        assert!(!inst.is_trashed(), "trash() must not touch a kept row");
+        assert_eq!(inst.effective_bucket(), SessionBucket::Active);
+        assert!(inst.is_kept(), "the flag survives every refused op");
+    }
+
+    #[test]
+    fn touch_last_accessed_and_pin_leave_keep_alone() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.keep(Some("t"));
+        inst.touch_last_accessed();
+        assert!(inst.is_kept(), "engagement must not clear keep");
+        inst.pin();
+        assert!(inst.is_kept());
+        inst.unpin();
+        assert!(inst.is_kept());
+        inst.favorite();
+        inst.unfavorite();
+        assert!(inst.is_kept());
+    }
+
+    #[test]
+    fn unkeep_then_archive_works_again() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.keep(Some("t"));
+        inst.unkeep();
+        inst.archive();
+        assert!(inst.is_archived());
+    }
+
+    #[test]
+    fn kept_fields_round_trip_through_serde_and_default_absent() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        let bare = serde_json::to_value(&inst).unwrap();
+        assert!(bare.get("kept_at").is_none(), "absent when unset");
+        assert!(bare.get("kept_by").is_none(), "absent when unset");
+
+        inst.keep(Some("who"));
+        let v = serde_json::to_value(&inst).unwrap();
+        assert!(v.get("kept_at").is_some());
+        assert_eq!(v["kept_by"], "who");
+        let back: Instance = serde_json::from_value(v).unwrap();
+        assert!(back.is_kept());
+        assert_eq!(back.kept_by.as_deref(), Some("who"));
+
+        // Older rows without the field deserialize as not-kept.
+        let mut legacy = serde_json::to_value(&Instance::new("l", "/tmp/l")).unwrap();
+        legacy.as_object_mut().unwrap().remove("kept_at");
+        let legacy: Instance = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.is_kept());
     }
 }

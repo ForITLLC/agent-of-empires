@@ -370,7 +370,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| i.is_trashed())
+            .filter(|i| i.is_trashed() && !i.is_kept())
             .map(|i| (i.id.clone(), i.source_profile.clone()))
             .collect()
     };
@@ -461,6 +461,12 @@ pub async fn delete_session(
     }
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    // WO#1953: a kept session cannot be removed (409) — `force_delete`
+    // overrides worktree dirtiness, never the keep flag.
+    if let Some(resp) = super::lifecycle::keep_refusal_response(&state, &id, "remove").await {
+        return resp;
+    }
 
     // Serialize concurrent mutations. Prompt submission first, per
     // `prompt_submission`: a queue drain snapshots an idle turn under that
@@ -820,6 +826,14 @@ pub async fn delete_workspace(
     // foreign plain session in as a sibling and have it destroyed. See #7.
     if let Some(resp) = cityhall_block_any_non_structured(&state, &session_ids).await {
         return resp;
+    }
+
+    // WO#1953: a workspace delete tears down every listed id, so one kept
+    // member refuses the whole call (all-or-nothing, like the dirty check).
+    for sid in &session_ids {
+        if let Some(resp) = super::lifecycle::keep_refusal_response(&state, sid, "remove").await {
+            return resp;
+        }
     }
 
     let owner_needs_dirty_check = body.delete_worktree && !body.force_delete;
