@@ -134,6 +134,9 @@ struct SessionJson {
     /// Live account + usage view (WO#1852); same keys as `/api/sessions`.
     #[serde(flatten)]
     account: crate::session::account::SessionAccount,
+    /// Live model vs pin (WO#1933); same keys as `/api/sessions`.
+    #[serde(flatten)]
+    model_state: crate::session::model_state::SessionModel,
 }
 
 #[derive(Serialize)]
@@ -179,6 +182,7 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
         workspace_repos: workspace_repos_for(inst),
         worktree: worktree_for(inst),
         account: Default::default(),
+        model_state: Default::default(),
     }
 }
 
@@ -187,9 +191,13 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
 async fn overlay_accounts(rows: &mut [SessionJson], instances: &[Instance], profile: &str) {
     let usage = crate::session::account::daemon_usage_map().await;
     let mut map = crate::session::account::local_session_accounts(instances, profile, &usage);
+    let mut models = crate::session::model_state::local_session_models(instances, profile);
     for row in rows.iter_mut() {
         if let Some(a) = map.remove(&row.id) {
             row.account = a;
+        }
+        if let Some(m) = models.remove(&row.id) {
+            row.model_state = m;
         }
     }
 }
@@ -421,6 +429,33 @@ mod tests {
     /// state needs the `state` string AND the timestamp to distinguish
     /// a trashed session from a genuinely failed one without a second
     /// `aoe session list-trash` shellout.
+    /// WO#1933: the model view rides on every row exactly like the account
+    /// view — `model_drift` is always present (false without evidence), the
+    /// other keys only with evidence; same keys as `/api/sessions`.
+    #[test]
+    fn session_json_carries_the_model_view_keys() {
+        let inst = Instance::new("z", "/repo");
+        let mut json = session_json(&inst, "p");
+        let v = serde_json::to_value(&json).unwrap();
+        assert_eq!(v["model_drift"], false);
+        assert!(v.get("live_model").is_none() && v.get("model_pin").is_none());
+        json.model_state = crate::session::model_state::session_model(
+            Some((
+                "claude-fable-5-1".into(),
+                crate::session::model_state::PinSource::Profile,
+            )),
+            Some(crate::session::model_state::LiveModel {
+                model: "claude-opus-4-8".into(),
+                source: crate::session::model_state::LiveModelSource::Transcript,
+                at: Some(1_788_423_947),
+            }),
+        );
+        let v = serde_json::to_value(&json).unwrap();
+        assert_eq!(v["live_model"], "claude-opus-4-8");
+        assert_eq!(v["model_pin"], "claude-fable-5-1");
+        assert_eq!(v["model_drift"], true);
+    }
+
     #[test]
     fn session_json_exposes_state_and_trashed_at_for_a_trashed_row() {
         let mut inst = Instance::new("z", "/repo");

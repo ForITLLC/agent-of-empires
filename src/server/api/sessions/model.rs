@@ -281,6 +281,9 @@ pub struct SessionResponse {
     /// config-dir env var.
     #[serde(flatten)]
     pub account: crate::session::account::SessionAccount,
+    /// Live model vs pin (WO#1933); same keys on `aoe list/status --json`.
+    #[serde(flatten)]
+    pub model_state: crate::session::model_state::SessionModel,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -506,6 +509,7 @@ impl SessionResponse {
             monitor_active,
             monitor_description,
             account: Default::default(),
+            model_state: Default::default(),
         }
     }
 }
