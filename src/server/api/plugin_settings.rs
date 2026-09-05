@@ -257,31 +257,11 @@ async fn group_options(state: &Arc<AppState>) -> Vec<SelectOption> {
     paths.iter().map(|p| SelectOption::new(p, p)).collect()
 }
 
-/// Extract the value of a `--model` / `-m` flag from a whitespace-split
-/// extra-args string (`session.agent_extra_args.<agent>`). Handles the spaced
-/// form (`--model X`, `-m X`) and the joined form (`--model=X`, `-m=X`). A
-/// dangling flag — no following value, or the next token is another option
-/// (`--model --verbose`) — yields `None` rather than a bogus model.
+/// Extract the value of a `--model` / `-m` flag from an extra-args string.
+/// Shared with the per-session model view (WO#1933); see
+/// [`crate::session::model_state::parse_model_flag`].
 fn parse_model_flag(args: &str) -> Option<String> {
-    let toks: Vec<&str> = args.split_whitespace().collect();
-    for (i, tok) in toks.iter().enumerate() {
-        if let Some(v) = tok
-            .strip_prefix("--model=")
-            .or_else(|| tok.strip_prefix("-m="))
-        {
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        } else if *tok == "--model" || *tok == "-m" {
-            if let Some(v) = toks
-                .get(i + 1)
-                .filter(|v| !v.is_empty() && !v.starts_with('-'))
-            {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
+    crate::session::model_state::parse_model_flag(args)
 }
 
 /// The model pinned under the profile for the agent `agent` spawns as, if
