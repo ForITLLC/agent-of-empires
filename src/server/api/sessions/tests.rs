@@ -1,5 +1,35 @@
 use super::*;
 
+/// WO#1933: the row carries the model view (`live_model`, `model_pin`,
+/// `model_drift`) beside the WO#1852 account view; `model_drift` is
+/// always present so a status-only consumer never mistakes "unknown"
+/// for "healthy".
+#[test]
+fn session_response_carries_the_model_view() {
+    let inst = crate::session::Instance::new("m", "/repo");
+    let mut resp = super::SessionResponse::from_instance(&inst, false);
+    let v = serde_json::to_value(&resp).unwrap();
+    assert_eq!(v["model_drift"], false);
+    assert!(v.get("live_model").is_none());
+    resp.model_state = crate::session::model_state::session_model(
+        Some((
+            "claude-fable-5-1".into(),
+            crate::session::model_state::PinSource::Profile,
+        )),
+        Some(crate::session::model_state::LiveModel {
+            model: "claude-opus-4-8".into(),
+            source: crate::session::model_state::LiveModelSource::Transcript,
+            at: Some(1_788_423_947),
+        }),
+    );
+    let v = serde_json::to_value(&resp).unwrap();
+    assert_eq!(v["live_model"], "claude-opus-4-8");
+    assert_eq!(v["live_model_at"], 1_788_423_947);
+    assert_eq!(v["model_pin"], "claude-fable-5-1");
+    assert_eq!(v["model_pin_source"], "profile");
+    assert_eq!(v["model_drift"], true);
+}
+
 mod restart_endpoint {
     use super::super::{admit_restart_inflight, restart_status_body, InflightAdmit};
     use std::collections::HashMap;

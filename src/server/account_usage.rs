@@ -53,6 +53,8 @@ pub struct AccountCache {
     pub live: HashMap<String, LiveBinding>,
     /// Per profile name: the config dir its `environment` binds (canonical).
     pub record: HashMap<String, Option<PathBuf>>,
+    /// Per session id: live model vs pin (WO#1933), read on the same pass.
+    pub models: HashMap<String, crate::session::model_state::SessionModel>,
     pub updated_at: Option<u64>,
 }
 
@@ -95,33 +97,52 @@ pub async fn fetch_usage(client: &reqwest::Client, token: &str, read_at: u64) ->
     }
 }
 
+/// What one session contributes to the blocking pass: identity for the
+/// account walk, plus the record-side model inputs (WO#1933).
+pub struct PassRow {
+    pub id: String,
+    pub title: String,
+    pub profile: String,
+    pub tool: String,
+    pub project_path: String,
+    pub agent_session_id: Option<String>,
+    pub agent_model: Option<String>,
+    pub extra_args: String,
+}
+
 /// A blocking snapshot of the fleet: every claude session's record binding
-/// and live config dir, plus the identity of every account dir found.
+/// and live config dir, plus the identity of every account dir found, plus
+/// each session's live model vs pin (WO#1933).
 struct Pass {
     live: HashMap<String, LiveBinding>,
     record: HashMap<String, Option<PathBuf>>,
     identities: Vec<AccountIdentity>,
+    models: HashMap<String, crate::session::model_state::SessionModel>,
 }
 
-fn blocking_pass(rows: Vec<(String, String, String, String)>) -> Pass {
-    // rows: (session id, title, effective profile, tool)
+fn blocking_pass(rows: Vec<PassRow>) -> Pass {
+    use crate::session::model_state;
     let now_ms = account::now_ms();
     let mut record: HashMap<String, Option<PathBuf>> = HashMap::new();
     let mut live: HashMap<String, LiveBinding> = HashMap::new();
+    let mut models: HashMap<String, model_state::SessionModel> = HashMap::new();
     let mut dirs: HashSet<PathBuf> = HashSet::new();
+    // Per (profile, tool): the `session.agent_extra_args.<tool>` string,
+    // whose `--model` flag is the profile pin. Resolved once per pass.
+    let mut profile_args: HashMap<(String, String), Option<String>> = HashMap::new();
     let pane_metadata = crate::tmux::batch_pane_metadata().unwrap_or_default();
-    for (id, title, profile, tool) in rows {
-        if !account::tool_has_config_dir(&tool) {
+    for row in rows {
+        if !account::tool_has_config_dir(&row.tool) {
             continue;
         }
         let bound = record
-            .entry(profile.clone())
-            .or_insert_with(|| account::record_config_dir(&profile, &tool))
+            .entry(row.profile.clone())
+            .or_insert_with(|| account::record_config_dir(&row.profile, &row.tool))
             .clone();
         if let Some(b) = &bound {
             dirs.insert(b.clone());
         }
-        let pane_pid = crate::tmux::Session::new(&id, &title)
+        let pane_pid = crate::tmux::Session::new(&row.id, &row.title)
             .ok()
             .and_then(|s| pane_metadata.get(s.name()).and_then(|m| m.pane_pid));
         let live_dir = pane_pid
@@ -130,7 +151,35 @@ fn blocking_pass(rows: Vec<(String, String, String, String)>) -> Pass {
         if let Some(l) = &live_dir {
             dirs.insert(l.clone());
         }
-        live.insert(id, LiveBinding { pane_pid, live_dir });
+        // WO#1933: pin from the record, else the profile; live from the
+        // transcript under the dir the process really runs on (else the
+        // record's, else the default).
+        let pargs = profile_args
+            .entry((row.profile.clone(), row.tool.clone()))
+            .or_insert_with(|| {
+                crate::session::config::profile_config::resolve_config_or_warn(&row.profile)
+                    .session
+                    .agent_extra_args
+                    .get(&row.tool)
+                    .cloned()
+            })
+            .clone();
+        let pin = model_state::model_pin(
+            row.agent_model.as_deref(),
+            &row.extra_args,
+            pargs.as_deref(),
+        );
+        let transcript_dir = live_dir
+            .clone()
+            .or_else(|| bound.clone())
+            .unwrap_or_else(account::default_config_dir);
+        let live_model = row
+            .agent_session_id
+            .as_deref()
+            .map(|sid| model_state::transcript_path(&transcript_dir, &row.project_path, sid))
+            .and_then(|p| model_state::read_live_model(&p));
+        models.insert(row.id.clone(), model_state::session_model(pin, live_model));
+        live.insert(row.id, LiveBinding { pane_pid, live_dir });
     }
     let identities = account::discover_account_dirs(dirs)
         .into_iter()
@@ -140,24 +189,27 @@ fn blocking_pass(rows: Vec<(String, String, String, String)>) -> Pass {
         live,
         record,
         identities,
+        models,
     }
 }
 
 /// One refresh: blocking identity/process pass, then the usage reads that
 /// are due, then a single cache swap.
 pub async fn refresh_once(state: &Arc<AppState>, client: &reqwest::Client) {
-    let rows: Vec<(String, String, String, String)> = {
+    let rows: Vec<PassRow> = {
         let instances = state.instances.read().await;
         instances
             .iter()
             .filter(|i| !i.is_trashed())
-            .map(|i| {
-                (
-                    i.id.clone(),
-                    i.title.clone(),
-                    i.effective_profile(),
-                    i.tool.clone(),
-                )
+            .map(|i| PassRow {
+                id: i.id.clone(),
+                title: i.title.clone(),
+                profile: i.effective_profile(),
+                tool: i.tool.clone(),
+                project_path: i.project_path.clone(),
+                agent_session_id: i.agent_session_id.clone(),
+                agent_model: i.agent_model.clone(),
+                extra_args: i.extra_args.clone(),
             })
             .collect()
     };
@@ -234,6 +286,7 @@ pub async fn refresh_once(state: &Arc<AppState>, client: &reqwest::Client) {
     cache.accounts = accounts;
     cache.live = pass.live;
     cache.record = pass.record;
+    cache.models = pass.models;
     cache.updated_at = Some(account::now_secs());
 }
 
@@ -297,6 +350,13 @@ pub fn session_account(
             cache.accounts.get(&key).and_then(|r| r.usage.clone())
         },
     )
+}
+
+/// The per-session model view from the cache (WO#1933): what the last
+/// pass read from the record, the profile pin and the transcript tail.
+/// Empty (drift `false`) for a session the pass has not seen yet.
+pub fn session_model(cache: &AccountCache, id: &str) -> crate::session::model_state::SessionModel {
+    cache.models.get(id).cloned().unwrap_or_default()
 }
 
 /// `GET /api/accounts`

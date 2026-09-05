@@ -9,6 +9,7 @@ pub(crate) mod capture;
 pub mod cityhall_bundle;
 pub mod civilizations;
 pub(crate) mod claim;
+pub mod model_state;
 // Discovery of on-disk Claude Code sessions. Lives here rather than under
 // `acp` because terminal/tmux import via the CLI does not involve ACP.
 pub mod claude_import;
