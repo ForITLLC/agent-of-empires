@@ -89,7 +89,7 @@ pub use instance::{
     LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
     PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
     StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    KeepRefused, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{

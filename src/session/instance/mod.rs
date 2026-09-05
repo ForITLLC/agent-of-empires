@@ -69,7 +69,7 @@ pub(crate) const SESSION_IDENTITY_EXTENSION: &str =
     include_str!("../../../assets/session/aoe-session-id.js");
 
 pub(crate) use accessors::resolved_agent_for;
-pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
+pub use flags::{is_valid_session_color, KeepRefused, SessionBucket, SESSION_COLORS};
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
@@ -209,6 +209,33 @@ pub struct Instance {
     pub pinned_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<DateTime<Utc>>,
+
+    /// Keep marker (WO#1953): the operator has said this session must never
+    /// be swept. While set, `archive`, `snooze`, `trash`/`remove` and every
+    /// auto-archive placement script REFUSE the session (HTTP 409
+    /// `session_kept`, CLI error naming the flag). There is no `--force`;
+    /// the only way through is an explicit clear (`aoe session keep --off`),
+    /// which the daemon logs with who/when. Orthogonal to the triage
+    /// decorations (favorite/pin) and NOT cleared by `touch_last_accessed`.
+    /// Additive: absent in older `sessions.json` rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_at: Option<DateTime<Utc>>,
+
+    /// Who set `kept_at` (`cli:<user>@<host>`, `api:<peer>`, `tui`, …).
+    /// Informational — it names the setter in the refusal so an operator
+    /// knows whom to ask before clearing the flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_by: Option<String>,
+
+    /// The `project_path` a managed-worktree session had before it was
+    /// trashed, captured when the trash flow relocates the worktree into the
+    /// `.aoe-trash` holding area (see `src/session/trash.rs`). `project_path`
+    /// is repointed to the trash location while trashed so the structured-view
+    /// preview, diff, and purge keep reading the worktree at its real spot;
+    /// restore moves the worktree back here and clears this field. `None` for
+    /// sessions that were never relocated (plain / non-managed worktrees, or
+    /// rows trashed before relocation existed). Additive: absent in older
+    /// `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_trash_project_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

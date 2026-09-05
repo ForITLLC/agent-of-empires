@@ -472,21 +472,7 @@ fn decorate_row(
             .add_modifier(Modifier::UNDERLINED);
     }
 
-    // Prefix priority: archive (none) > snooze (`z `) > urgent (`! `) > favorite (`* `).
-    // Snooze and urgent are Attention-only so other sorts show no decoration for state the
-    // user did not opt into; the star also shows elsewhere because favorites-first pins
-    // the row there too.
-    let title_text = if inst.is_archived() || inst.is_trashed() {
-        Cow::Owned(inst.title.clone())
-    } else if in_attention && inst.is_snoozed() {
-        Cow::Owned(format!("z {}", inst.title))
-    } else if in_attention && inst.is_urgent() {
-        Cow::Owned(format!("! {}", inst.title))
-    } else if show_favorite && crate::session::is_live_favorite(inst) {
-        Cow::Owned(format!("* {}", inst.title))
-    } else {
-        Cow::Owned(inst.title.clone())
-    };
+    let title_text = Cow::Owned(row_title(inst, in_attention, show_favorite));
 
     (icon, title_text, style)
 }

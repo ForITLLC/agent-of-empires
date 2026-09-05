@@ -396,6 +396,28 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `PATCH /api/sessions/{id}/keep` (WO#1953): set (`keep = true`) or
+    /// clear the per-session keep flag; `by` names the actor for the
+    /// daemon's `session.keep` log line and the row's `kept_by`.
+    pub async fn session_keep(
+        &self,
+        session_id: &str,
+        keep: bool,
+        by: &str,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/keep",
+            self.endpoint.base_url, session_id
+        );
+        let res = self
+            .auth(self.http.patch(&url))
+            .json(&serde_json::json!({ "keep": keep, "by": by }))
+            .send()
+            .await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
     /// Replace a queued prompt's text in place. The client-minted id is
     /// encoded as one path segment.
     pub async fn queue_edit(

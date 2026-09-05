@@ -166,6 +166,12 @@ pub struct SessionResponse {
     pub snoozed_until: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<String>,
+    #[serde(default)]
+    pub kept: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_by: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unread: bool,
     /// Single-repo worktrees only; use `has_cleanable_worktree` for delete cleanup.
