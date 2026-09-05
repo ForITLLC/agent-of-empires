@@ -265,26 +265,30 @@ pub(crate) fn claude_composer_draft_region(raw_content: &str, max_region: usize)
 /// requiring the message's own text keeps an unrelated draft (someone else's
 /// half-typed input) from triggering a recovery Enter that would submit text
 /// this send does not own.
+///
+/// Only the COMPOSER row decides. Claude Code echoes a submitted message as
+/// a history row that also begins with `❯`, and after a turn that ends at
+/// once (a usage-cap `Worked for 0s`, an instant reply) that echo sits in
+/// the same tail window as the now-empty composer. Reading it as the
+/// composer reported a delivered message as parked, resent bare Enters and
+/// answered 502 submit_unconfirmed for text the target had already received
+/// (WO#1960-B, the Mini commander relay). So the draft is read the way the
+/// pre-paste check reads it — the bottom-most `❯` row and its box — never
+/// any `❯` row in the tail.
 pub(crate) fn claude_message_stuck_in_composer(raw_content: &str, message: &str) -> bool {
     let first_line = message.lines().next().unwrap_or("").trim();
     if first_line.is_empty() {
         return false;
     }
     let prefix: String = first_line.chars().take(32).collect();
-    let clean = strip_ansi(raw_content);
-    clean
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect::<Vec<&str>>()
-        .iter()
-        .rev()
-        .take(CLAUDE_COMPOSER_TAIL)
-        .any(|line| {
-            line.trim()
-                .strip_prefix('❯')
-                .map(str::trim_start)
-                .is_some_and(|draft| draft.starts_with(&prefix))
-        })
+    claude_composer_draft(raw_content).is_some_and(|draft| {
+        draft
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with(&prefix)
+    })
 }
 
 /// Explains a refused injection WITHOUT reproducing the operator's draft.
@@ -733,6 +737,46 @@ mod tests {
             "RACE-PROBE-MESSAGE this text was pasted during boot"
         ));
         assert!(!claude_message_stuck_in_composer(pane, ""));
+    }
+
+    #[test]
+    fn stuck_in_composer_ignores_the_echoed_history_row() {
+        // WO#1960-B, captured live from the Mini's AoE-Commander pane
+        // (2026-09-05 12:26 PT): the relayed message WAS submitted — Claude
+        // Code echoes it as a history row `❯ [relay:forit-fleet] sessions`,
+        // the turn died on the usage cap (`Worked for 0s`) and the composer
+        // below it is EMPTY. The echoed row sits inside the tail window, so a
+        // scan that accepts ANY `❯` row read it as the composer and reported
+        // the delivered message as parked — three bare Enters, then a 502
+        // submit_unconfirmed for text the target had already received.
+        let pane = "❯ [relay:forit-fleet] sessions
+  ⎿  You've hit your session limit · resets 1:20pm (America/Los_Angeles)
+     Continuing automatically at 1:20pm · esc to cancel
+
+✻ Worked for 0s · done 12:26 PM
+
+──────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────
+  ⚠ Usage limit reached · continuing automatically at 1:20pm · esc to cancel
+  5h 103% · wk 30%
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        assert!(!claude_message_stuck_in_composer(
+            pane,
+            "[relay:forit-fleet] sessions"
+        ));
+        // The same shape with the message genuinely parked in the composer
+        // (Enter swallowed) is still stuck — only the composer row decides.
+        let parked = pane.replace(
+            "❯ 
+",
+            "❯ [relay:forit-fleet] sessions
+",
+        );
+        assert!(claude_message_stuck_in_composer(
+            &parked,
+            "[relay:forit-fleet] sessions"
+        ));
     }
 
     #[test]
