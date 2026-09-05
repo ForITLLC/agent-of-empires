@@ -452,6 +452,9 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/mode"),
     ("POST", "/api/sessions/{id}/acp/spawn"),
     ("POST", "/api/sessions/{id}/acp/switch-agent"),
+    // Daemon-owned tmux restart (fork, WO#1641 3c): tears down and respawns
+    // the host pane — a terminal-surface lifecycle op, not a structured one.
+    ("POST", "/api/sessions/{id}/restart"),
     // Global settings / ops / shared workspace ordering.
     ("PATCH", "/api/settings"),
     ("PATCH", "/api/log-level"),
