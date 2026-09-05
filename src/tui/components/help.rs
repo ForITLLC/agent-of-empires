@@ -87,6 +87,11 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     ];
     actions_rows.append(&mut actions);
 
+    // WO#1980-1: the ⚓ row marker (WO#1953 keep flag) explains itself here.
+    attention.push((
+        "\u{2693}".to_string(),
+        "Kept: blocks sweeps; confirm clears it".to_string(),
+    ));
     // Rows with no single registry binding. Tips has no global hotkey at all
     // (it is palette / badge driven), so `?` would not document it otherwise.
     views.push(("< >".to_string(), "Resize list panel".to_string()));
@@ -444,6 +449,29 @@ mod tests {
                     "help overlay (strict={strict}) should list '{expected_key}' for '{desc_sub}'"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn help_explains_the_kept_anchor_marker() {
+        // WO#1980-1: the ⚓ row marker (WO#1953 keep flag) must explain
+        // itself from `?`: what the flag blocks, and that the human at the
+        // TUI can still act (the confirm clears it).
+        for strict in [false, true] {
+            let all = shortcuts(strict, false);
+            let (_, keys) = all
+                .iter()
+                .find(|(name, _)| name.starts_with("Attention"))
+                .expect("Attention section should exist");
+            let legend = keys
+                .iter()
+                .find(|(k, _)| k == "\u{2693}")
+                .unwrap_or_else(|| {
+                    panic!("Attention section should carry the ⚓ legend (strict={strict})")
+                });
+            assert!(legend.1.contains("Kept"), "{}", legend.1);
+            assert!(legend.1.contains("sweep"), "{}", legend.1);
+            assert!(legend.1.contains("confirm"), "{}", legend.1);
         }
     }
 
