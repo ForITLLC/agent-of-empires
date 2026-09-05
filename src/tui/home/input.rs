@@ -1050,6 +1050,10 @@ impl HomeView {
                 }
                 None
             }
+            "kept_override" => {
+                self.apply_kept_override();
+                None
+            }
             "empty_trash" => {
                 self.empty_trash_all();
                 None
@@ -1253,6 +1257,7 @@ impl HomeView {
                         self.pending_stop_tool = None;
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
+                        self.pending_kept_override = None;
                         self.pending_image_pull = None;
                         // Mirrors the keyboard route: Cancel means "don't discard", so
                         // settings stays open and `settings_close_confirm` resets.
@@ -2067,6 +2072,7 @@ impl HomeView {
                     self.pending_stop_tool = None;
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
+                    self.pending_kept_override = None;
                     self.pending_image_pull = None;
                 }
                 DialogResult::Submit(_) => {

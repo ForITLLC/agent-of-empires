@@ -128,6 +128,25 @@ struct RecoveryUpdate {
     result: Result<crate::session::StartOutcome, String>,
 }
 
+/// WO#1980-1: which op a person asked for on a kept row, so the confirm's
+/// Yes arm can clear the flag and replay exactly that op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeptOp {
+    Archive,
+    Snooze(u32),
+    Trash,
+}
+
+impl KeptOp {
+    pub(super) fn verb(&self) -> &'static str {
+        match self {
+            KeptOp::Archive => "archive",
+            KeptOp::Snooze(_) => "snooze",
+            KeptOp::Trash => "trash",
+        }
+    }
+}
+
 pub struct HomeView {
     pub(super) storages: HashMap<String, Storage>,
     pub(super) active_profile: Option<String>,
@@ -244,6 +263,10 @@ pub struct HomeView {
     pub(in crate::tui) structured_preview_pending: bool,
     pub(super) pending_force_remove_session: Option<String>,
     pub(super) pending_trash_session: Option<String>,
+    /// WO#1980-1: the (session, op) a person asked for on a KEPT row, held
+    /// while the "kept since … — <op> anyway?" confirm is open. Yes clears
+    /// the flag and re-runs the op; No drops it.
+    pub(super) pending_kept_override: Option<(String, KeptOp)>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     pub(super) search_active: bool,
     pub(super) search_query: Input,
