@@ -2340,7 +2340,7 @@ fn favorite_decoration_gated_to_attention_sort() {
     // process-wide flag to the shipped default (on).
     crate::session::set_favorites_first(false);
 
-    // In Newest: row should NOT have the `* ` prefix or the bold/
+    // In Newest: row should NOT have the ` ★` suffix or the bold/
     // underlined favorite styling.
     env.view.sort_order = SortOrder::Newest;
     env.view.flat_items = env.view.build_flat_items();
@@ -2353,7 +2353,7 @@ fn favorite_decoration_gated_to_attention_sort() {
         .expect("session item present in Newest sort");
     let text_newest = rendered_row_text(&env.view, &item);
     assert!(
-        !text_newest.contains("* "),
+        !text_newest.contains(" ★"),
         "favorite prefix must be hidden outside Attention sort; got: {:?}",
         text_newest
     );
@@ -2375,7 +2375,7 @@ fn favorite_decoration_gated_to_attention_sort() {
         .expect("session item present in Attention sort");
     let text_attention = rendered_row_text(&env.view, &item_attention);
     assert!(
-        text_attention.contains("* "),
+        text_attention.contains(" ★"),
         "favorite prefix must surface in Attention sort; got: {:?}",
         text_attention
     );
@@ -2416,7 +2416,7 @@ fn favorite_decoration_shows_outside_attention_when_favorites_first() {
 
     let text = row(&env.view, &id);
     assert!(
-        text.contains("* "),
+        text.contains(" ★"),
         "favorite prefix must show in Newest when favorites-first is on; got: {:?}",
         text
     );
@@ -2432,7 +2432,7 @@ fn favorite_decoration_shows_outside_attention_when_favorites_first() {
     env.view.flat_items = env.view.build_flat_items();
     let text_snoozed = row(&env.view, &id);
     assert!(
-        !text_snoozed.contains("* "),
+        !text_snoozed.contains(" ★"),
         "a snoozed favorite is not pinned, so it must not show the star; got: {:?}",
         text_snoozed
     );

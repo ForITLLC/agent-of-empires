@@ -1897,8 +1897,8 @@ impl HomeView {
 
     /// Toggle the favorite flag on the cursor's session. Favorited rows
     /// pin above non-favorited peers within the same status tier in the
-    /// Attention sort, and render with bold + underline plus a leading
-    /// `* ` glyph (see `render.rs`).
+    /// Attention sort, and render with bold + underline plus a trailing
+    /// ` ★` glyph after the title (see `render.rs`).
     ///
     /// Favorite is orthogonal to archive and snooze: it survives an
     /// unsnooze (the star is the user's persistent "care more" signal),
