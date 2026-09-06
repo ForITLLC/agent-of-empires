@@ -1825,7 +1825,8 @@ impl HomeView {
     }
 
     /// Toggle the favorite flag on the cursor's session. Favorite survives an unsnooze
-    /// but not an archive; that mutual exclusion lives in `Instance::archive()`.
+    /// but not an archive; that mutual exclusion lives in `Instance::archive()`. The
+    /// row shows a trailing ` ★` after the title (see `render::row_title`).
     pub(super) fn toggle_favorite_at_cursor(&mut self) -> anyhow::Result<()> {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
