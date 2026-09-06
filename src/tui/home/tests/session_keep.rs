@@ -3,7 +3,7 @@
 //! open a confirm ("kept since <when> by <who> — <op> anyway?"); Yes clears
 //! the flag and proceeds in one step, No leaves the row exactly as it was.
 //! A group archive (a sweep) still skips kept members; the row renders a
-//! `⚓ ` marker so the flag is visible.
+//! trailing ` ⚓` marker so the flag is visible.
 
 use super::*;
 
@@ -211,7 +211,9 @@ fn group_archive_skips_kept_members_and_archives_the_rest() {
 }
 
 #[test]
-fn kept_rows_carry_the_anchor_marker_in_the_title() {
+fn kept_rows_carry_the_anchor_marker_after_the_title() {
+    // Ben, 2026-09-06: "put the emojis after what the thing is" — the anchor
+    // is a SUFFIX, the title reads first.
     let mut inst = Instance::new("kept-me", "/tmp/k");
     assert_eq!(
         super::super::render::row_title_for_test(&inst, false, false),
@@ -220,13 +222,35 @@ fn kept_rows_carry_the_anchor_marker_in_the_title() {
     inst.keep(Some("tui"));
     assert_eq!(
         super::super::render::row_title_for_test(&inst, false, false),
-        "⚓ kept-me"
+        "kept-me ⚓"
     );
-    // Keep wins over the favorite star: the flag is the more consequential
-    // state (it blocks sweeps), so it must not be hidden behind `*`.
+    // Suffix markers no longer compete for one slot: a kept favorite shows
+    // both, anchor first (the more consequential state), then the star.
     inst.favorite();
     assert_eq!(
         super::super::render::row_title_for_test(&inst, true, true),
-        "⚓ kept-me"
+        "kept-me ⚓ ★"
+    );
+}
+
+#[test]
+fn favorite_rows_carry_a_star_after_the_title() {
+    // Ben, 2026-09-06: "favorite should use a star and it should also be after".
+    let mut inst = Instance::new("fav-me", "/tmp/f");
+    inst.favorite();
+    assert_eq!(
+        super::super::render::row_title_for_test(&inst, true, true),
+        "fav-me ★"
+    );
+    assert_eq!(
+        super::super::render::row_title_for_test(&inst, false, false),
+        "fav-me",
+        "star is gated exactly like the old `* ` prefix"
+    );
+    // Snooze keeps its upstream `z ` prefix and, as before, hides the star.
+    inst.snooze(5);
+    assert_eq!(
+        super::super::render::row_title_for_test(&inst, true, true),
+        "z fav-me"
     );
 }

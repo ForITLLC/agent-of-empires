@@ -469,7 +469,7 @@ enum SunkRow {
 }
 
 /// The archive/trash, snooze, urgent, and favorite overlays every view mode
-/// paints on top of its [`RowSeed`], plus the title prefix that goes with them.
+/// paints on top of its [`RowSeed`], plus the title markers that go with them.
 ///
 /// This was three copies: the Structured and Terminal arms of
 /// `render_item_line` carried byte-identical title blocks and near-identical
@@ -535,31 +535,37 @@ fn decorate_row(
     (icon, title_text, style)
 }
 
-/// The row's title with its state prefix.
+/// The row's title with its state markers.
 ///
-/// Prefix priority: archive (no prefix) wins over snooze (`z `) wins over
-/// urgent (`! `) wins over keep (`⚓ `) wins over favorite (`* `). Snooze and
-/// urgent are Attention-mode-only so users in Newest / AZ / etc. don't see
-/// decoration for state they didn't opt into managing; the favorite star also
-/// shows elsewhere, because favorites-first pins the row there too. The keep
-/// anchor shows in every sort: it is the flag that makes archive / snooze /
-/// trash refuse the row, so it must be visible wherever those keys are live,
-/// and it outranks the star because a kept row is the more consequential
-/// state (WO#1953).
+/// Two kinds of marker. The upstream state PREFIXES stay where they are:
+/// archive (no prefix) wins over snooze (`z `) wins over urgent (`! `), both
+/// Attention-mode-only so users in Newest / AZ / etc. don't see decoration
+/// for state they didn't opt into managing. The glyph markers are SUFFIXES,
+/// after the title, so the name reads first (Ben, 2026-09-06: "put the emojis
+/// after what the thing is; favorite should use a star and also be after"):
+/// keep (` ⚓`) shows in every sort because it is the flag that makes
+/// archive / snooze / trash refuse the row (WO#1953); favorite (` ★`) follows
+/// the same gate the old `* ` prefix had (Attention, or favorites-first on).
+/// Suffixes don't compete for one slot, so a kept favorite shows both, the
+/// more consequential anchor first.
 fn row_title(inst: &crate::session::Instance, in_attention: bool, show_favorite: bool) -> String {
     if inst.is_archived() || inst.is_trashed() {
-        inst.title.clone()
-    } else if in_attention && inst.is_snoozed() {
+        return inst.title.clone();
+    }
+    let mut title = if in_attention && inst.is_snoozed() {
         format!("z {}", inst.title)
     } else if in_attention && inst.is_urgent() {
         format!("! {}", inst.title)
-    } else if inst.is_kept() {
-        format!("⚓ {}", inst.title)
-    } else if show_favorite && crate::session::is_live_favorite(inst) {
-        format!("* {}", inst.title)
     } else {
         inst.title.clone()
+    };
+    if inst.is_kept() {
+        title.push_str(" ⚓");
     }
+    if show_favorite && crate::session::is_live_favorite(inst) {
+        title.push_str(" ★");
+    }
+    title
 }
 
 #[cfg(test)]
