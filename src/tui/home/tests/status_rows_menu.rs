@@ -982,8 +982,9 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
     crate::session::set_favorites_first(original);
 }
 
-/// `toggle_favorite_at_cursor` flips the instance's favorited state and persists it. No
-/// toast: the row's bold and leading `* ` glyph are the feedback.
+/// `toggle_favorite_at_cursor` flips the cursor's instance favorited state
+/// and persists the change. No toast: the row's visual treatment (bold +
+/// trailing ` ★` glyph) is the feedback.
 #[test]
 #[serial]
 fn toggle_favorite_at_cursor_round_trip() {
