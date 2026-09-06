@@ -1123,7 +1123,7 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
 
 /// `toggle_favorite_at_cursor` flips the cursor's instance favorited state
 /// and persists the change. No toast: the row's visual treatment (bold +
-/// leading `* ` glyph) is the feedback.
+/// trailing ` ★` glyph) is the feedback.
 #[test]
 #[serial]
 fn toggle_favorite_at_cursor_round_trip() {
