@@ -28,6 +28,9 @@ pub enum EnsureReadyError {
     Transient(Status),
     /// Instance is structured view-mode (no backing tmux pane); send is not supported.
     StructuredView,
+    /// Instance is in the trash (soft-deleted). It must not be started or
+    /// respawned on anyone's behalf; restore (untrash) is the only way back.
+    Trashed,
     /// Underlying tmux operation failed.
     Tmux(anyhow::Error),
 }
@@ -45,6 +48,9 @@ impl std::fmt::Display for EnsureReadyError {
                 f,
                 "Acp-mode sessions have no tmux pane; send is not supported"
             ),
+            EnsureReadyError::Trashed => {
+                write!(f, "Session is in the trash; restore it before sending")
+            }
             EnsureReadyError::Tmux(e) => write!(f, "{e}"),
         }
     }
@@ -108,6 +114,14 @@ impl Instance {
         &mut self,
         size: Option<(u16, u16)>,
     ) -> Result<EnsureReadyOutcome, EnsureReadyError> {
+        // Trash is the strongest "leave this session alone" signal: a
+        // soft-deleted record must not be started or respawned because
+        // someone addressed it (a send to a trashed id used to launch a
+        // fresh agent for a session the user had thrown away). Checked
+        // before any tmux probe so the refusal has no side effects.
+        if self.is_trashed() {
+            return Err(EnsureReadyError::Trashed);
+        }
         if matches!(self.status, Status::Creating | Status::Deleting) {
             return Err(EnsureReadyError::Transient(self.status));
         }
@@ -276,5 +290,25 @@ mod tests {
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
             .output();
+    }
+}
+
+#[cfg(test)]
+mod trashed_tests {
+    use super::*;
+
+    /// Trash is the strongest "leave this session alone" signal, so the
+    /// revive cascade refuses it before any tmux probe: no start, no respawn.
+    /// Without this, every send/live-send path that ensures a pane would
+    /// resurrect a soft-deleted record the moment someone addressed it.
+    #[test]
+    fn test_ensure_pane_ready_refuses_trashed_before_any_tmux_probe() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.trash();
+        match inst.ensure_pane_ready() {
+            Err(EnsureReadyError::Trashed) => {}
+            other => panic!("expected Trashed, got {other:?}"),
+        }
+        assert!(inst.is_trashed(), "the refusal must not untrash");
     }
 }
