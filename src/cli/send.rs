@@ -48,6 +48,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     }
 
     let inst = super::resolve_session(&scope.identifier, &instances)?;
+    refuse_if_trashed(inst)?;
     let session_id = inst.id.clone();
     let session_title = inst.title.clone();
     let tool = inst.tool.clone();
@@ -74,6 +75,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
                 Err(EnsureReadyError::StructuredView) => {
                     bail!("Acp-mode sessions have no tmux pane; send is not supported")
                 }
+                Err(e @ EnsureReadyError::Trashed) => bail!("{e}"),
                 Err(EnsureReadyError::Tmux(e)) => bail!("{}", e),
             }
         }
@@ -322,5 +324,44 @@ mod tests {
         let id = new_queue_id();
         assert!(id.starts_with("send-") && id.len() == 17, "{id}");
         assert_ne!(id, new_queue_id());
+    }
+}
+
+/// A trashed (soft-deleted) session is never a send target: it must not be
+/// revived, and typing into a still-live pane of one would resurrect a
+/// record the user threw away. Restore is the only way back.
+pub(crate) fn refuse_if_trashed(inst: &crate::session::Instance) -> Result<()> {
+    if inst.is_trashed() {
+        bail!(
+            "Session '{}' is in the trash; restore it first with: aoe session restore {}",
+            inst.title,
+            inst.id
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod trashed_tests {
+    use super::*;
+
+    #[test]
+    fn refuse_if_trashed_names_the_restore_verb() {
+        let mut inst = crate::session::Instance::new("per-mcp", "/tmp/per-mcp");
+        inst.id = "a343c82262764ef3".to_string();
+        inst.trash();
+        let err = refuse_if_trashed(&inst).expect_err("a trashed target must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("trash"), "{msg}");
+        assert!(
+            msg.contains("aoe session restore a343c82262764ef3"),
+            "the refusal must tell the user how to bring it back: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuse_if_trashed_passes_a_live_session() {
+        let inst = crate::session::Instance::new("per-mcp", "/tmp/per-mcp");
+        assert!(refuse_if_trashed(&inst).is_ok());
     }
 }

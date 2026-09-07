@@ -93,17 +93,29 @@ pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Resul
         }
     }
 
-    // Try exact title match
-    if let Some(inst) = instances.iter().find(|i| i.title == identifier) {
+    // Try exact title match. A live session wins over a trashed twin with
+    // the same title: storage order is not a tie-break anyone intends, and
+    // a trashed row is only the answer when nothing live carries the name.
+    if let Some(inst) = prefer_live(instances.iter().filter(|i| i.title == identifier)) {
         return Ok(inst);
     }
 
-    // Try path match
-    if let Some(inst) = instances.iter().find(|i| i.project_path == identifier) {
+    // Try path match, same live-first rule.
+    if let Some(inst) = prefer_live(instances.iter().filter(|i| i.project_path == identifier)) {
         return Ok(inst);
     }
 
     bail!("Session not found: {}", identifier)
+}
+
+/// First live (untrashed) match, else the first match of any kind.
+fn prefer_live<'a>(
+    mut matches: impl Iterator<Item = &'a Instance> + Clone,
+) -> Option<&'a Instance> {
+    matches
+        .clone()
+        .find(|i| !i.is_trashed())
+        .or_else(|| matches.next())
 }
 
 /// Whether the invocation named a profile (`-p`/`--profile`, or the
@@ -602,5 +614,39 @@ mod tests {
         // Open creates an empty db with neither acp_events nor acp_attachments.
         rusqlite::Connection::open(&db_path).unwrap();
         purge_acp_transcript_rows(&db_path, "whatever").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod resolve_session_trash_tests {
+    use super::*;
+
+    /// A title lookup must land on the live session, not a trashed twin that
+    /// happens to sort first in storage. Otherwise `aoe send <title>` aims at
+    /// the soft-deleted record and either refuses or, worse, revives it.
+    #[test]
+    fn resolve_session_title_prefers_live_over_trashed_twin() {
+        let mut dead = Instance::new("per-mcp", "/tmp/per-mcp-old");
+        dead.id = "dead00000000dead".to_string();
+        dead.trash();
+        let mut live = Instance::new("per-mcp", "/tmp/per-mcp");
+        live.id = "live00000000live".to_string();
+        let instances = vec![dead, live];
+
+        let got = resolve_session("per-mcp", &instances).expect("title resolves");
+        assert_eq!(got.id, "live00000000live");
+    }
+
+    /// Only a trashed match exists: still resolve it (the caller decides what
+    /// a trashed target means), never "not found".
+    #[test]
+    fn resolve_session_title_falls_back_to_trashed_when_no_live_twin() {
+        let mut dead = Instance::new("per-mcp", "/tmp/per-mcp-old");
+        dead.id = "dead00000000dead".to_string();
+        dead.trash();
+        let instances = vec![dead];
+
+        let got = resolve_session("per-mcp", &instances).expect("title resolves");
+        assert_eq!(got.id, "dead00000000dead");
     }
 }
