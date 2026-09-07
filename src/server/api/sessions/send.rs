@@ -159,6 +159,8 @@ enum SendKeysError {
     /// The text was typed but its submitting Enter never registered after
     /// the resend budget: typed, not submitted.
     SubmitUnconfirmed(crate::tmux::SubmitUnconfirmed),
+    /// Target is in the trash (soft-deleted): never revived, never typed into.
+    Trashed,
     Tmux(anyhow::Error),
 }
 
@@ -190,6 +192,11 @@ fn send_error_parts(err: &SendKeysError) -> (StatusCode, serde_json::Value) {
         SendKeysError::StructuredView => (
             StatusCode::BAD_REQUEST,
             serde_json::json!({"error": "acp_mode_unsupported"}),
+        ),
+        // 409: the record exists but is soft-deleted; restore it first.
+        SendKeysError::Trashed => (
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": "trashed"}),
         ),
         // 423 Locked: the resource (the composer) is held by someone else.
         // Never the draft's text — only its size, so the operator can
@@ -281,6 +288,15 @@ pub async fn send_message(
     };
     drop(instances);
 
+    // A trashed (soft-deleted) session is never a send target, `revive` or
+    // not: reviving would resurrect a record the user threw away, and a
+    // still-live pane of one must not be typed into either. Refused before
+    // the revive cascade so the check has no side effects; restore first.
+    if instance.is_trashed() {
+        let (status, body) = send_error_parts(&SendKeysError::Trashed);
+        return (status, Json(body)).into_response();
+    }
+
     let sync_base = instance.clone();
     let tool = instance.tool.clone();
     let message = req.message;
@@ -312,6 +328,7 @@ pub async fn send_message(
                     let mapped = match e {
                         EnsureReadyError::Transient(s) => SendKeysError::Transient(s),
                         EnsureReadyError::StructuredView => SendKeysError::StructuredView,
+                        EnsureReadyError::Trashed => SendKeysError::Trashed,
                         EnsureReadyError::Tmux(e) => SendKeysError::Tmux(e),
                     };
                     // ensure_pane_ready did not mutate user-visible
@@ -455,7 +472,9 @@ pub async fn send_message(
                         apply_post_restart_sync(i, &sync_base, &started);
                     }
                 }
-                SendKeysError::Transient(_) | SendKeysError::StructuredView => {}
+                SendKeysError::Transient(_)
+                | SendKeysError::StructuredView
+                | SendKeysError::Trashed => {}
                 SendKeysError::ParkedDraft(refusal) => {
                     // Nothing was typed and the session is healthy: no status
                     // or last_error paint. A refusal is not a session error;
@@ -1120,5 +1139,63 @@ mod send_error_contract_tests {
             b.get("sent").is_none(),
             "transport failure must not claim a delivery state"
         );
+    }
+}
+
+#[cfg(test)]
+mod send_trashed_tests {
+    use super::*;
+
+    /// A soft-deleted session is off-limits to `send`: it must neither be
+    /// revived nor typed into. Before this guard, `POST /sessions/{id}/send`
+    /// on a trashed id fell straight into `ensure_pane_ready`, which launched
+    /// a fresh agent for a record the user had thrown away. Observed on a
+    /// fleet host: three "zombie" panes, each born from a peer's send to a
+    /// trashed id it had read back from `/api/sessions`.
+    #[tokio::test]
+    async fn send_to_trashed_session_is_refused_before_any_revive() {
+        let mut inst = Instance::new("trashed-send", "/tmp/trashed-send");
+        inst.id = "trashed-send-id".to_string();
+        inst.trash();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let resp = send_message(
+            State(state.clone()),
+            Path("trashed-send-id".to_string()),
+            // `revive: true` is the defect path: before the guard this
+            // launched a fresh agent for the trashed record.
+            Ok(Json(SendMessageRequest {
+                message: "hello".to_string(),
+                revive: true,
+                queue: false,
+                sender: None,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(v["error"], "trashed", "body: {v}");
+
+        let live = state.instances.read().await;
+        let after = live
+            .iter()
+            .find(|i| i.id == "trashed-send-id")
+            .expect("record still present");
+        assert!(
+            after.is_trashed(),
+            "a refused send must not untrash the record"
+        );
+    }
+
+    #[test]
+    fn trashed_send_error_contract() {
+        let (status, body) = send_error_parts(&SendKeysError::Trashed);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "trashed");
     }
 }
