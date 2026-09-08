@@ -137,6 +137,24 @@ impl Instance {
         self.title == "AoE-Commander"
     }
 
+    /// Pin rank for the commander lane: `Some(0)` for the Claude
+    /// `AoE-Commander` (exact title), `Some(1)` for a manager-lane twin titled
+    /// `AoE-Commander-<runtime>` (2026-09-08: `AoE-Commander-Codex`, the same
+    /// brief on OpenAI Codex), `None` for every other session. Ranked rows are
+    /// hoisted to the top of every view in rank order (see
+    /// `pin_commander_first`). `is_commander` stays the exact match on purpose:
+    /// it is the relay/routing identity of the one Claude Commander, and
+    /// widening it would re-target the twins.
+    pub fn commander_pin_rank(&self) -> Option<u8> {
+        if self.is_commander() {
+            return Some(0);
+        }
+        match self.title.strip_prefix("AoE-Commander-") {
+            Some(runtime) if !runtime.is_empty() => Some(1),
+            _ => None,
+        }
+    }
+
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
     }
