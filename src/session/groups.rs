@@ -900,43 +900,50 @@ fn count_sessions_in_group(path: &str, instances: &[Instance]) -> usize {
     group_members(path, instances).count()
 }
 
-/// Hoist the AoE-Commander session to the absolute top of `items` (index 0,
-/// depth 0), above ungrouped sessions, every group, and the Archived section,
-/// in every sort order and grouping mode. `favorite`/`pinned_at` only pin
-/// within a status tier and sink/clear when the row goes idle or is archived;
-/// the commander must stay top-visible in every state, so we lift its row to
-/// the front as a post-pass after the natural flow is built.
+/// Hoist the commander-lane rows to the absolute top of `items` (from index
+/// 0, depth 0), above ungrouped sessions, every group, and the Archived
+/// section, in every sort order and grouping mode. `favorite`/`pinned_at` only
+/// pin within a status tier and sink/clear when the row goes idle or is
+/// archived; the commander must stay top-visible in every state, so we lift
+/// its row to the front as a post-pass after the natural flow is built.
 ///
-/// Group-/sort-/view-agnostic by construction: it finds the commander row
-/// wherever it landed and moves it. If the commander isn't already in `items`
+/// Rows are ordered by `Instance::commander_pin_rank`: the Claude
+/// `AoE-Commander` (rank 0) first, then any `AoE-Commander-<runtime>` twin
+/// (rank 1, e.g. `AoE-Commander-Codex`) directly below it; ties break on
+/// title, then id, so the order is deterministic.
+///
+/// Group-/sort-/view-agnostic by construction: it finds each ranked row
+/// wherever it landed and moves it. If a ranked row isn't already in `items`
 /// (e.g. filtered out by an active profile) it's still inserted at the top, so
 /// the fleet manager is visible from every view. No-op when no non-archived
-/// commander session exists (an archived commander stays in the Archived
-/// section rather than clawing back to the top).
+/// ranked session exists (an archived commander stays in the Archived section
+/// rather than clawing back to the top).
 pub fn pin_commander_first<'a>(
     items: &mut Vec<Item>,
     instances: impl IntoIterator<Item = &'a Instance>,
 ) {
-    let commander_id = match instances
+    let mut ranked: Vec<(u8, String, String)> = instances
         .into_iter()
-        .find(|i| i.is_commander() && !i.is_archived())
-    {
-        Some(inst) => inst.id.clone(),
-        None => return,
-    };
-    if let Some(pos) = items
-        .iter()
-        .position(|it| matches!(it, Item::Session { id, .. } if *id == commander_id))
-    {
-        items.remove(pos);
+        .filter(|i| !i.is_archived())
+        .filter_map(|i| {
+            i.commander_pin_rank()
+                .map(|rank| (rank, i.title.clone(), i.id.clone()))
+        })
+        .collect();
+    if ranked.is_empty() {
+        return;
     }
-    items.insert(
-        0,
-        Item::Session {
-            id: commander_id,
-            depth: 0,
-        },
-    );
+    ranked.sort();
+    // Insert in reverse rank order so the lowest rank ends at index 0.
+    for (_, _, id) in ranked.into_iter().rev() {
+        if let Some(pos) = items
+            .iter()
+            .position(|it| matches!(it, Item::Session { id: x, .. } if *x == id))
+        {
+            items.remove(pos);
+        }
+        items.insert(0, Item::Session { id, depth: 0 });
+    }
 }
 
 /// Append the synthetic "Archived" section to `items`, pinned to the bottom of the sidebar across
@@ -1827,4 +1834,1727 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_commander_pin_rank_exact_title_is_zero_twin_is_one() {
+        // Rank 0 = the Claude AoE-Commander (exact title, the routing identity).
+        // Rank 1 = a manager-lane twin titled `AoE-Commander-<runtime>`
+        // (2026-09-08: `AoE-Commander-Codex`). Anything else is unranked.
+        assert_eq!(
+            Instance::new("AoE-Commander", "/tmp/c").commander_pin_rank(),
+            Some(0)
+        );
+        assert_eq!(
+            Instance::new("AoE-Commander-Codex", "/tmp/c").commander_pin_rank(),
+            Some(1)
+        );
+        assert_eq!(
+            Instance::new("AoE-Commanderish", "/tmp/c").commander_pin_rank(),
+            None
+        );
+        assert_eq!(
+            Instance::new("aoe-commander", "/tmp/c").commander_pin_rank(),
+            None
+        );
+        assert_eq!(
+            Instance::new("AoE-Commander-", "/tmp/c").commander_pin_rank(),
+            None,
+            "a bare dash with no runtime suffix is not a twin"
+        );
+        // `is_commander` stays the EXACT match: relay/cmdtop identity of the
+        // Claude Commander must not widen to the twins.
+        assert!(!Instance::new("AoE-Commander-Codex", "/tmp/c").is_commander());
+    }
+
+    #[test]
+    fn test_pin_commander_first_hoists_twin_directly_below_commander() {
+        // The Codex twin lives in the same group as the Commander and lands
+        // after the ungrouped rows and the worker without the pin. After the
+        // pin: Commander at 0, twin at 1, each exactly once, both depth 0.
+        let ungrouped = Instance::new("ungrouped", "/tmp/u");
+        let mut worker = Instance::new("worker", "/tmp/w");
+        worker.group_path = "fleet".to_string();
+        let mut twin = Instance::new("AoE-Commander-Codex", "/tmp/c");
+        twin.group_path = "fleet".to_string();
+        let twin_id = twin.id.clone();
+        let mut commander = Instance::new("AoE-Commander", "/tmp/c");
+        commander.group_path = "fleet".to_string();
+        let commander_id = commander.id.clone();
+
+        // Twin listed BEFORE the commander so natural order would put it first
+        // among the two; the rank must still put the commander above it.
+        let instances = vec![ungrouped, worker, twin, commander];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        let mut items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        assert!(
+            !matches!(&items[0], Item::Session { id, .. } if *id == commander_id),
+            "precondition: commander buried before pinning"
+        );
+
+        pin_commander_first(&mut items, &instances);
+
+        match (&items[0], &items[1]) {
+            (Item::Session { id: a, depth: da }, Item::Session { id: b, depth: db }) => {
+                assert_eq!(*a, commander_id, "commander must be row 0");
+                assert_eq!(*b, twin_id, "the twin must be row 1, directly below");
+                assert_eq!((*da, *db), (0, 0), "both pinned rows render at depth 0");
+            }
+            other => panic!("expected two pinned Session rows at the top, got {other:?}"),
+        }
+        for id in [&commander_id, &twin_id] {
+            let n = items
+                .iter()
+                .filter(|it| matches!(it, Item::Session { id: x, .. } if x == id))
+                .count();
+            assert_eq!(n, 1, "pinned row {id} must appear exactly once");
+        }
+    }
+
+    #[test]
+    fn test_pin_commander_first_twin_alone_pins_top() {
+        // No Claude Commander registered (e.g. its profile filtered out or it
+        // is archived): the twin still pins to row 0 rather than staying buried.
+        let ungrouped = Instance::new("ungrouped", "/tmp/u");
+        let mut twin = Instance::new("AoE-Commander-Codex", "/tmp/c");
+        twin.group_path = "fleet".to_string();
+        let twin_id = twin.id.clone();
+        let mut archived_commander = Instance::new("AoE-Commander", "/tmp/c");
+        archived_commander.archived_at = Some(Utc::now());
+        let archived_id = archived_commander.id.clone();
+        let instances = vec![ungrouped, twin, archived_commander];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        let mut items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        pin_commander_first(&mut items, &instances);
+        assert!(
+            matches!(&items[0], Item::Session { id, .. } if *id == twin_id),
+            "twin must be row 0 when it is the only live commander-lane row"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|it| matches!(it, Item::Session { id, .. } if *id == archived_id)),
+            "archived commander must not be pinned into the flow"
+        );
+    }
+
+    #[test]
+    fn test_toggle_collapsed() {
+        let mut inst = Instance::new("test", "/tmp/t");
+        inst.group_path = "work".to_string();
+        let instances = vec![inst];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let group = tree.groups_by_path.get("work").unwrap();
+        assert!(!group.collapsed);
+
+        tree.toggle_collapsed("work");
+
+        let group = tree.groups_by_path.get("work").unwrap();
+        assert!(group.collapsed);
+
+        tree.toggle_collapsed("work");
+
+        let group = tree.groups_by_path.get("work").unwrap();
+        assert!(!group.collapsed);
+    }
+
+    #[test]
+    fn test_toggle_collapsed_nonexistent_group() {
+        let instances: Vec<Instance> = vec![];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+        tree.toggle_collapsed("nonexistent");
+    }
+
+    #[test]
+    fn test_collapsed_group_hides_sessions_in_flatten() {
+        let mut inst1 = Instance::new("work-session", "/tmp/w");
+        inst1.group_path = "work".to_string();
+        let instances = vec![inst1];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items_expanded = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let session_count_expanded = items_expanded
+            .iter()
+            .filter(|i| matches!(i, Item::Session { .. }))
+            .count();
+        assert_eq!(session_count_expanded, 1);
+
+        tree.toggle_collapsed("work");
+        let items_collapsed = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let session_count_collapsed = items_collapsed
+            .iter()
+            .filter(|i| matches!(i, Item::Session { .. }))
+            .count();
+        assert_eq!(session_count_collapsed, 0);
+    }
+
+    #[test]
+    fn test_collapsed_group_still_shows_in_flatten() {
+        let mut inst = Instance::new("test", "/tmp/t");
+        inst.group_path = "work".to_string();
+        let instances = vec![inst];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        tree.toggle_collapsed("work");
+        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+
+        let group_items: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, Item::Group { .. }))
+            .collect();
+        assert_eq!(group_items.len(), 1);
+    }
+
+    #[test]
+    fn test_collapsed_state_in_flattened_item() {
+        let mut inst = Instance::new("test", "/tmp/t");
+        inst.group_path = "work".to_string();
+        let instances = vec![inst];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        if let Some(Item::Group { collapsed, .. }) = items
+            .iter()
+            .find(|i| matches!(i, Item::Group { path, .. } if path == "work"))
+        {
+            assert!(!collapsed);
+        }
+
+        tree.toggle_collapsed("work");
+        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        if let Some(Item::Group { collapsed, .. }) = items
+            .iter()
+            .find(|i| matches!(i, Item::Group { path, .. } if path == "work"))
+        {
+            assert!(*collapsed);
+        }
+    }
+
+    #[test]
+    fn test_nested_group_collapse_hides_children() {
+        let mut inst1 = Instance::new("parent-session", "/tmp/p");
+        inst1.group_path = "parent".to_string();
+        let mut inst2 = Instance::new("child-session", "/tmp/c");
+        inst2.group_path = "parent/child".to_string();
+        let instances = vec![inst1, inst2];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let group_count = items
+            .iter()
+            .filter(|i| matches!(i, Item::Group { .. }))
+            .count();
+        assert_eq!(group_count, 2);
+
+        tree.toggle_collapsed("parent");
+        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let group_count_collapsed = items
+            .iter()
+            .filter(|i| matches!(i, Item::Group { .. }))
+            .count();
+        assert_eq!(group_count_collapsed, 1);
+    }
+
+    #[test]
+    fn test_session_count_includes_nested() {
+        let mut inst1 = Instance::new("parent-session", "/tmp/p");
+        inst1.group_path = "parent".to_string();
+        let mut inst2 = Instance::new("child-session", "/tmp/c");
+        inst2.group_path = "parent/child".to_string();
+        let instances = vec![inst1, inst2];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        if let Some(Item::Group { session_count, .. }) = items
+            .iter()
+            .find(|i| matches!(i, Item::Group { path, .. } if path == "parent"))
+        {
+            assert_eq!(*session_count, 2);
+        }
+    }
+
+    #[test]
+    fn test_session_count_excludes_trashed_and_restores_on_untrash() {
+        let mut a = Instance::new("a", "/tmp/a");
+        a.group_path = "work".to_string();
+        let mut b = Instance::new("b", "/tmp/b");
+        b.group_path = "work".to_string();
+        let mut instances = vec![a, b];
+
+        let group_count = |instances: &[Instance]| {
+            let tree = GroupTree::new_with_groups(instances, &[]);
+            let items = flatten_tree(&tree, instances, SortOrder::Oldest);
+            items
+                .iter()
+                .find_map(|i| match i {
+                    Item::Group {
+                        path,
+                        session_count,
+                        ..
+                    } if path == "work" => Some(*session_count),
+                    _ => None,
+                })
+                .expect("work group present")
+        };
+
+        assert_eq!(group_count(&instances), 2);
+
+        // Trashing a session drops it from both the visible rows and the
+        // header badge, matching the row filter in `flatten_group`.
+        instances[0].trash();
+        assert_eq!(group_count(&instances), 1);
+
+        instances[0].untrash();
+        assert_eq!(group_count(&instances), 2);
+    }
+
+    #[test]
+    fn test_delete_group() {
+        let mut inst = Instance::new("test", "/tmp/t");
+        inst.group_path = "work".to_string();
+        let instances = vec![inst];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        assert!(tree.group_exists("work"));
+        tree.delete_group("work");
+        assert!(!tree.group_exists("work"));
+    }
+
+    #[test]
+    fn test_delete_group_removes_children() {
+        let mut inst1 = Instance::new("parent-session", "/tmp/p");
+        inst1.group_path = "parent".to_string();
+        let mut inst2 = Instance::new("child-session", "/tmp/c");
+        inst2.group_path = "parent/child".to_string();
+        let instances = vec![inst1, inst2];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        assert!(tree.group_exists("parent"));
+        assert!(tree.group_exists("parent/child"));
+
+        tree.delete_group("parent");
+
+        assert!(!tree.group_exists("parent"));
+        assert!(!tree.group_exists("parent/child"));
+    }
+
+    #[test]
+    fn test_create_group() {
+        let instances: Vec<Instance> = vec![];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        assert!(!tree.group_exists("new-group"));
+        tree.create_group("new-group");
+        assert!(tree.group_exists("new-group"));
+    }
+
+    #[test]
+    fn test_create_nested_group_creates_parents() {
+        let instances: Vec<Instance> = vec![];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        tree.create_group("a/b/c");
+        assert!(tree.group_exists("a"));
+        assert!(tree.group_exists("a/b"));
+        assert!(tree.group_exists("a/b/c"));
+    }
+
+    #[test]
+    fn test_item_depth() {
+        let ungrouped = Instance::new("ungrouped", "/tmp/u");
+        let mut inst1 = Instance::new("root-level", "/tmp/r");
+        inst1.group_path = "root".to_string();
+        let mut inst2 = Instance::new("nested", "/tmp/n");
+        inst2.group_path = "root/child".to_string();
+        let instances = vec![ungrouped, inst1, inst2];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+
+        for item in &items {
+            match item {
+                Item::Session { id, depth } if !id.is_empty() => {
+                    if *depth == 0 {
+                        continue;
+                    }
+                    assert!(*depth >= 1);
+                }
+                Item::Group { path, depth, .. } => {
+                    if path == "root" {
+                        assert_eq!(*depth, 0);
+                    } else if path == "root/child" {
+                        assert_eq!(*depth, 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_roots_returns_only_top_level() {
+        let mut inst1 = Instance::new("test1", "/tmp/1");
+        inst1.group_path = "alpha".to_string();
+        let mut inst2 = Instance::new("test2", "/tmp/2");
+        inst2.group_path = "alpha/nested".to_string();
+        let mut inst3 = Instance::new("test3", "/tmp/3");
+        inst3.group_path = "beta".to_string();
+        let instances = vec![inst1, inst2, inst3];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let roots = tree.get_roots();
+        assert_eq!(roots.len(), 2);
+
+        let root_names: Vec<_> = roots.iter().map(|g| &g.name).collect();
+        assert!(root_names.contains(&&"alpha".to_string()));
+        assert!(root_names.contains(&&"beta".to_string()));
+    }
+
+    #[test]
+    fn test_delete_group_removes_from_insertion_order() {
+        let mut inst1 = Instance::new("alpha-session", "/tmp/a");
+        inst1.group_path = "alpha".to_string();
+        let mut inst2 = Instance::new("beta-session", "/tmp/b");
+        inst2.group_path = "beta".to_string();
+        let mut inst3 = Instance::new("gamma-session", "/tmp/g");
+        inst3.group_path = "gamma".to_string();
+        let instances = vec![inst1, inst2, inst3];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let initial_groups_vec = tree.get_all_groups();
+        let initial_groups: Vec<_> = initial_groups_vec.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(initial_groups, vec!["alpha", "beta", "gamma"]);
+
+        tree.delete_group("beta");
+
+        let after_delete_vec = tree.get_all_groups();
+        let after_delete: Vec<_> = after_delete_vec.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(after_delete, vec!["alpha", "gamma"]);
+
+        tree.create_group("zeta");
+
+        let after_create_vec = tree.get_all_groups();
+        let after_create: Vec<_> = after_create_vec.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(after_create, vec!["alpha", "gamma", "zeta"]);
+    }
+
+    #[test]
+    fn test_group_sort_order_in_flatten_tree() {
+        // Groups are created in order: zebra, apple, mango (by instance order)
+        let mut inst1 = Instance::new("z-session", "/tmp/z");
+        inst1.group_path = "zebra".to_string();
+        let mut inst2 = Instance::new("a-session", "/tmp/a");
+        inst2.group_path = "apple".to_string();
+        let mut inst3 = Instance::new("m-session", "/tmp/m");
+        inst3.group_path = "mango".to_string();
+        let instances = vec![inst1, inst2, inst3];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        // SortOrder::Oldest: groups sorted by oldest session (zebra, apple, mango)
+        let items_oldest = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let group_names_none: Vec<_> = items_oldest
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(group_names_none, vec!["zebra", "apple", "mango"]);
+
+        // SortOrder::AZ: groups appear alphabetically
+        let items_az = flatten_tree(&tree, &instances, SortOrder::AZ);
+        let group_names_az: Vec<_> = items_az
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(group_names_az, vec!["apple", "mango", "zebra"]);
+
+        // SortOrder::ZA: groups appear reverse alphabetically
+        let items_za = flatten_tree(&tree, &instances, SortOrder::ZA);
+        let group_names_za: Vec<_> = items_za
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(group_names_za, vec!["zebra", "mango", "apple"]);
+    }
+
+    #[test]
+    fn test_sort_order_cycle() {
+        assert_eq!(SortOrder::Newest.cycle(), SortOrder::Attention);
+        assert_eq!(SortOrder::Attention.cycle(), SortOrder::LastActivity);
+        assert_eq!(SortOrder::LastActivity.cycle(), SortOrder::Oldest);
+        assert_eq!(SortOrder::Oldest.cycle(), SortOrder::AZ);
+        assert_eq!(SortOrder::AZ.cycle(), SortOrder::ZA);
+        assert_eq!(SortOrder::ZA.cycle(), SortOrder::Newest);
+    }
+
+    #[test]
+    fn test_sort_order_cycle_reverse() {
+        assert_eq!(SortOrder::Newest.cycle_reverse(), SortOrder::ZA);
+        assert_eq!(SortOrder::ZA.cycle_reverse(), SortOrder::AZ);
+        assert_eq!(SortOrder::AZ.cycle_reverse(), SortOrder::Oldest);
+        assert_eq!(SortOrder::Oldest.cycle_reverse(), SortOrder::LastActivity);
+        assert_eq!(
+            SortOrder::LastActivity.cycle_reverse(),
+            SortOrder::Attention
+        );
+        assert_eq!(SortOrder::Attention.cycle_reverse(), SortOrder::Newest);
+    }
+
+    #[test]
+    fn test_sort_last_activity_descending_with_none_last() {
+        use chrono::Duration;
+        let now = Utc::now();
+        let mut inst_recent = Instance::new("recent", "/tmp/r");
+        inst_recent.last_accessed_at = Some(now);
+        let mut inst_older = Instance::new("older", "/tmp/o");
+        inst_older.last_accessed_at = Some(now - Duration::hours(1));
+        let inst_never = Instance::new("never", "/tmp/n");
+        let instances = vec![inst_never, inst_older, inst_recent];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::LastActivity);
+        let titles: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Session { id, .. } => instances
+                    .iter()
+                    .find(|inst| &inst.id == id)
+                    .map(|inst| inst.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, vec!["recent", "older", "never"]);
+    }
+
+    #[test]
+    fn test_ungrouped_session_sort_oldest_preserves_insertion_order() {
+        let inst1 = Instance::new("Mango", "/tmp/m");
+        let inst2 = Instance::new("Apple", "/tmp/a");
+        let inst3 = Instance::new("Zebra", "/tmp/z");
+        let instances = vec![inst1, inst2, inst3];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let session_titles: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Session { id, .. } => instances
+                    .iter()
+                    .find(|inst| &inst.id == id)
+                    .map(|inst| inst.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(session_titles, vec!["Mango", "Apple", "Zebra"]);
+    }
+
+    #[test]
+    fn test_ungrouped_session_sort_az() {
+        let inst1 = Instance::new("Mango", "/tmp/m");
+        let inst2 = Instance::new("Apple", "/tmp/a");
+        let inst3 = Instance::new("Zebra", "/tmp/z");
+        let instances = vec![inst1, inst2, inst3];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::AZ);
+        let session_titles: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Session { id, .. } => instances
+                    .iter()
+                    .find(|inst| &inst.id == id)
+                    .map(|inst| inst.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(session_titles, vec!["Apple", "Mango", "Zebra"]);
+    }
+
+    #[test]
+    fn test_ungrouped_session_sort_za() {
+        let inst1 = Instance::new("Mango", "/tmp/m");
+        let inst2 = Instance::new("Apple", "/tmp/a");
+        let inst3 = Instance::new("Zebra", "/tmp/z");
+        let instances = vec![inst1, inst2, inst3];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::ZA);
+        let session_titles: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Session { id, .. } => instances
+                    .iter()
+                    .find(|inst| &inst.id == id)
+                    .map(|inst| inst.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(session_titles, vec!["Zebra", "Mango", "Apple"]);
+    }
+
+    #[test]
+    fn test_session_sort_oldest_within_group_preserves_insertion_order() {
+        let mut inst1 = Instance::new("Mango", "/tmp/m");
+        inst1.group_path = "work".to_string();
+        let mut inst2 = Instance::new("Apple", "/tmp/a");
+        inst2.group_path = "work".to_string();
+        let mut inst3 = Instance::new("Zebra", "/tmp/z");
+        inst3.group_path = "work".to_string();
+        let instances = vec![inst1, inst2, inst3];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let session_titles: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Session { id, .. } => instances
+                    .iter()
+                    .find(|inst| &inst.id == id)
+                    .map(|inst| inst.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(session_titles, vec!["Mango", "Apple", "Zebra"]);
+    }
+
+    #[test]
+    fn test_session_sort_az_within_group() {
+        let mut inst1 = Instance::new("Mango", "/tmp/m");
+        inst1.group_path = "work".to_string();
+        let mut inst2 = Instance::new("Apple", "/tmp/a");
+        inst2.group_path = "work".to_string();
+        let mut inst3 = Instance::new("Zebra", "/tmp/z");
+        inst3.group_path = "work".to_string();
+        let instances = vec![inst1, inst2, inst3];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::AZ);
+        let session_titles: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Session { id, .. } => instances
+                    .iter()
+                    .find(|inst| &inst.id == id)
+                    .map(|inst| inst.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(session_titles, vec!["Apple", "Mango", "Zebra"]);
+    }
+
+    #[test]
+    fn test_session_sort_za_within_group() {
+        let mut inst1 = Instance::new("Mango", "/tmp/m");
+        inst1.group_path = "work".to_string();
+        let mut inst2 = Instance::new("Apple", "/tmp/a");
+        inst2.group_path = "work".to_string();
+        let mut inst3 = Instance::new("Zebra", "/tmp/z");
+        inst3.group_path = "work".to_string();
+        let instances = vec![inst1, inst2, inst3];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::ZA);
+        let session_titles: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Session { id, .. } => instances
+                    .iter()
+                    .find(|inst| &inst.id == id)
+                    .map(|inst| inst.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(session_titles, vec!["Zebra", "Mango", "Apple"]);
+    }
+
+    #[test]
+    fn test_nested_child_groups_sort_order() {
+        let mut inst_parent = Instance::new("parent-session", "/tmp/parent");
+        inst_parent.group_path = "parent".to_string();
+        let mut inst_zeta = Instance::new("zeta-session", "/tmp/zeta");
+        inst_zeta.group_path = "parent/zeta".to_string();
+        let mut inst_alpha = Instance::new("alpha-session", "/tmp/alpha");
+        inst_alpha.group_path = "parent/alpha".to_string();
+        let instances = vec![inst_parent, inst_zeta, inst_alpha];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items_oldest = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let child_names_oldest: Vec<_> = items_oldest
+            .iter()
+            .skip(1)
+            .filter_map(|i| match i {
+                Item::Group { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(child_names_oldest, vec!["zeta", "alpha"]);
+
+        let items_az = flatten_tree(&tree, &instances, SortOrder::AZ);
+        let child_names_az: Vec<_> = items_az
+            .iter()
+            .skip(1)
+            .filter_map(|i| match i {
+                Item::Group { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(child_names_az, vec!["alpha", "zeta"]);
+
+        let items_za = flatten_tree(&tree, &instances, SortOrder::ZA);
+        let child_names_za: Vec<_> = items_za
+            .iter()
+            .skip(1)
+            .filter_map(|i| match i {
+                Item::Group { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(child_names_za, vec!["zeta", "alpha"]);
+    }
+
+    #[test]
+    fn test_sort_az_is_case_insensitive() {
+        let mut inst1 = Instance::new("z-session", "/tmp/z");
+        inst1.group_path = "Zebra".to_string();
+        let mut inst2 = Instance::new("a-session", "/tmp/a");
+        inst2.group_path = "apple".to_string();
+        let instances = vec![inst1, inst2];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::AZ);
+        let group_names: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(group_names, vec!["apple", "Zebra"]);
+    }
+
+    #[test]
+    fn test_existing_groups_vec_order_preserved_on_load() {
+        let gamma_group = Group::new("gamma", "gamma");
+        let alpha_group = Group::new("alpha", "alpha");
+        let existing_groups = vec![gamma_group, alpha_group];
+
+        let instances: Vec<Instance> = vec![];
+        let tree = GroupTree::new_with_groups(&instances, &existing_groups);
+
+        let roots = tree.get_roots();
+        let root_names: Vec<_> = roots.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(root_names, vec!["gamma", "alpha"]);
+
+        let all_groups: Vec<_> = tree
+            .get_all_groups()
+            .into_iter()
+            .map(|g| g.name.as_str().to_string())
+            .collect();
+        assert_eq!(all_groups, vec!["gamma".to_string(), "alpha".to_string()]);
+    }
+
+    #[test]
+    fn test_rename_group_simple() {
+        let mut inst = Instance::new("test", "/tmp/t");
+        inst.group_path = "work".to_string();
+        let instances = vec![inst];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        tree.rename_group("work", "projects");
+
+        assert!(!tree.group_exists("work"));
+        assert!(tree.group_exists("projects"));
+        assert_eq!(
+            tree.groups_by_path.get("projects").unwrap().name,
+            "projects"
+        );
+    }
+
+    #[test]
+    fn test_rename_group_with_children() {
+        let mut inst1 = Instance::new("test1", "/tmp/1");
+        inst1.group_path = "work".to_string();
+        let mut inst2 = Instance::new("test2", "/tmp/2");
+        inst2.group_path = "work/frontend".to_string();
+        let instances = vec![inst1, inst2];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        tree.rename_group("work", "projects");
+
+        assert!(!tree.group_exists("work"));
+        assert!(!tree.group_exists("work/frontend"));
+        assert!(tree.group_exists("projects"));
+        assert!(tree.group_exists("projects/frontend"));
+    }
+
+    #[test]
+    fn test_rename_group_merge_into_existing() {
+        let mut inst1 = Instance::new("test1", "/tmp/1");
+        inst1.group_path = "old".to_string();
+        let mut inst2 = Instance::new("test2", "/tmp/2");
+        inst2.group_path = "existing".to_string();
+        let instances = vec![inst1, inst2];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        tree.rename_group("old", "existing");
+
+        assert!(!tree.group_exists("old"));
+        assert!(tree.group_exists("existing"));
+    }
+
+    #[test]
+    fn test_rename_group_noop_same_path() {
+        let mut inst = Instance::new("test", "/tmp/t");
+        inst.group_path = "work".to_string();
+        let instances = vec![inst];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        tree.rename_group("work", "work");
+
+        assert!(tree.group_exists("work"));
+    }
+
+    #[test]
+    fn test_rename_group_noop_empty_target() {
+        let mut inst = Instance::new("test", "/tmp/t");
+        inst.group_path = "work".to_string();
+        let instances = vec![inst];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        tree.rename_group("work", "");
+
+        assert!(tree.group_exists("work"));
+    }
+
+    // ─── Archive feature tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_attention_tier_archived_returns_99() {
+        let mut waiting = Instance::new("w", "/tmp/w");
+        waiting.status = crate::session::Status::Waiting;
+        assert_eq!(attention_tier(&waiting), 0);
+
+        // Archive a Waiting session; must short-circuit to 99
+        waiting.archive();
+        assert_eq!(attention_tier(&waiting), 99);
+
+        // Same for Error
+        let mut errored = Instance::new("e", "/tmp/e");
+        errored.status = crate::session::Status::Error;
+        assert_eq!(attention_tier(&errored), 1);
+        errored.archive();
+        assert_eq!(attention_tier(&errored), 99);
+
+        // Unarchive restores the original tier
+        errored.unarchive();
+        assert_eq!(attention_tier(&errored), 1);
+    }
+
+    #[test]
+    fn test_attention_sort_within_tier_aging_ascending() {
+        // Longest-aging-first rule: within a single priority tier, the session
+        // whose last_accessed_at is oldest bubbles to the top (the one most
+        // likely to have been forgotten). Untouched (None) rows bucket after
+        // dated ones so a brand-new session doesn't falsely claim top.
+        use chrono::Duration;
+        let now = chrono::Utc::now();
+
+        let mut fresh = Instance::new("fresh", "/tmp/fresh");
+        fresh.status = crate::session::Status::Idle;
+        fresh.last_accessed_at = Some(now - Duration::minutes(5));
+
+        let mut stale = Instance::new("stale", "/tmp/stale");
+        stale.status = crate::session::Status::Idle;
+        stale.last_accessed_at = Some(now - Duration::hours(11));
+
+        let mut middle = Instance::new("middle", "/tmp/middle");
+        middle.status = crate::session::Status::Idle;
+        middle.last_accessed_at = Some(now - Duration::minutes(40));
+
+        let mut untouched = Instance::new("untouched", "/tmp/untouched");
+        untouched.status = crate::session::Status::Idle;
+        untouched.last_accessed_at = None;
+
+        let mut sessions: Vec<&Instance> = vec![&fresh, &middle, &stale, &untouched];
+        sort_sessions(&mut sessions, SortOrder::Attention);
+
+        let titles: Vec<&str> = sessions.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["stale", "middle", "fresh", "untouched"],
+            "oldest last_accessed_at should sort first within a tier; None last"
+        );
+    }
+
+    #[test]
+    fn test_attention_group_key_within_tier_aging_ascending() {
+        // Same rule at group level: the group whose most-recent member
+        // activity is oldest ranks first. Mirrors the session-level aging
+        // tiebreak so tree view and flat view stay consistent.
+        use chrono::Duration;
+        let now = chrono::Utc::now();
+
+        let mut fresh_member = Instance::new("f", "/tmp/f");
+        fresh_member.group_path = "fresh".to_string();
+        fresh_member.status = crate::session::Status::Idle;
+        fresh_member.last_accessed_at = Some(now - Duration::minutes(5));
+
+        let mut stale_member = Instance::new("s", "/tmp/s");
+        stale_member.group_path = "stale".to_string();
+        stale_member.status = crate::session::Status::Idle;
+        stale_member.last_accessed_at = Some(now - Duration::hours(11));
+
+        let instances = vec![fresh_member, stale_member];
+        let fresh_key = attention_group_key("fresh", None, &instances);
+        let stale_key = attention_group_key("stale", None, &instances);
+
+        assert!(
+            stale_key < fresh_key,
+            "stale group (11h) should sort before fresh group (5m); got stale={:?} fresh={:?}",
+            stale_key,
+            fresh_key
+        );
+    }
+
+    #[test]
+    fn test_attention_sort_archived_sinks_to_bottom() {
+        // Build: 1 Waiting, 1 Error, 1 archived (was Waiting), 1 Idle
+        let mut waiting = Instance::new("w", "/tmp/w");
+        waiting.status = crate::session::Status::Waiting;
+        let mut errored = Instance::new("e", "/tmp/e");
+        errored.status = crate::session::Status::Error;
+        let mut archived_waiting = Instance::new("aw", "/tmp/aw");
+        archived_waiting.status = crate::session::Status::Waiting;
+        archived_waiting.archive();
+        let mut idle = Instance::new("i", "/tmp/i");
+        idle.status = crate::session::Status::Idle;
+
+        let mut sessions: Vec<&Instance> = vec![&waiting, &errored, &archived_waiting, &idle];
+        sort_sessions(&mut sessions, SortOrder::Attention);
+
+        // Order should be: Waiting(0), Error(1), Idle(2), Archived(99)
+        let titles: Vec<&str> = sessions.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, vec!["w", "e", "i", "aw"]);
+    }
+
+    #[test]
+    fn test_group_toggle_archived() {
+        let mut inst = Instance::new("t", "/tmp/t");
+        inst.group_path = "work".to_string();
+        let instances = vec![inst];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        // Initial: not archived
+        assert!(tree.group_archived_at("work").is_none());
+
+        // Toggle on
+        let result = tree.toggle_archived("work");
+        assert_eq!(result, Some(true));
+        assert!(tree.group_archived_at("work").is_some());
+
+        // Toggle off
+        let result = tree.toggle_archived("work");
+        assert_eq!(result, Some(false));
+        assert!(tree.group_archived_at("work").is_none());
+
+        // Nonexistent group returns None
+        assert_eq!(tree.toggle_archived("nope"), None);
+    }
+
+    #[test]
+    fn test_attention_group_key_all_members_archived() {
+        let mut a = Instance::new("a", "/tmp/a");
+        a.group_path = "work".to_string();
+        a.status = crate::session::Status::Waiting; // would be tier 0 if not archived
+        a.archive();
+        let mut b = Instance::new("b", "/tmp/b");
+        b.group_path = "work".to_string();
+        b.status = crate::session::Status::Idle;
+        b.archive();
+
+        let instances = vec![a, b];
+        let key = attention_group_key("work", None, &instances);
+        assert_eq!(key.1, 99, "all-archived group should sort to tier 99");
+    }
+
+    #[test]
+    fn test_attention_group_key_one_active_pulls_group_up() {
+        // Mixed group: 1 archived Waiting, 1 active Idle. The active member
+        // pulls the group out of the archive tier (99) into the Idle bucket.
+        // With the unread promoter enabled (default), a non-unread Idle group
+        // encodes to rank 3 (Waiting=0, unread=1, other tiers shifted +1, so
+        // Idle tier 2 -> 3); the point is it's well above the archive tier.
+        let mut archived_waiting = Instance::new("aw", "/tmp/aw");
+        archived_waiting.group_path = "work".to_string();
+        archived_waiting.status = crate::session::Status::Waiting;
+        archived_waiting.archive();
+        let mut active_idle = Instance::new("ai", "/tmp/ai");
+        active_idle.group_path = "work".to_string();
+        active_idle.status = crate::session::Status::Idle;
+
+        let instances = vec![archived_waiting, active_idle];
+        let key = attention_group_key("work", None, &instances);
+        assert_eq!(
+            key.1, 3,
+            "active Idle group should sort in the Idle bucket, far above archive tier 99"
+        );
+    }
+
+    #[test]
+    fn test_attention_group_key_promotes_unread_below_waiting() {
+        // Group A holds a read Error (tier 1); Group B holds an unread Idle
+        // (tier 2). With the unread promoter on (default), B's unread member
+        // floats it to rank 1, above A's Error (rank 2), matching how the flat
+        // Attention view promotes unread just below Waiting.
+        let mut err = Instance::new("err", "/tmp/err");
+        err.group_path = "a".to_string();
+        err.status = crate::session::Status::Error;
+
+        let mut unread_idle = Instance::new("ui", "/tmp/ui");
+        unread_idle.group_path = "b".to_string();
+        unread_idle.status = crate::session::Status::Idle;
+        unread_idle.mark_unread();
+
+        let key_a = attention_group_key("a", None, std::slice::from_ref(&err));
+        let key_b = attention_group_key("b", None, std::slice::from_ref(&unread_idle));
+        assert!(
+            key_b < key_a,
+            "group with an unread Idle must outrank a group whose best member is a read Error: b={key_b:?} a={key_a:?}"
+        );
+    }
+
+    #[test]
+    fn test_attention_group_key_sunk_unread_member_does_not_promote() {
+        // A group with one active *read* Idle member and one *archived* member
+        // that still carries an unread marker (archive doesn't clear `unread`)
+        // must NOT be promoted: the dismissed member can't drag the group up.
+        // Rank should be the plain Idle bucket, identical to the same group
+        // without any unread anywhere.
+        let mut active_read = Instance::new("ar", "/tmp/ar");
+        active_read.group_path = "g".to_string();
+        active_read.status = crate::session::Status::Idle;
+
+        let mut archived_unread = Instance::new("au", "/tmp/au");
+        archived_unread.group_path = "g".to_string();
+        archived_unread.status = crate::session::Status::Idle;
+        archived_unread.mark_unread();
+        archived_unread.archive(); // archived_at set; unread intentionally kept
+
+        let members = vec![active_read.clone(), archived_unread];
+        let key = attention_group_key("g", None, &members);
+
+        // Same group but with the second member simply read: ranks identical,
+        // proving the sunk unread member contributed nothing.
+        let read_baseline = vec![active_read.clone(), {
+            let mut other = Instance::new("o", "/tmp/o");
+            other.group_path = "g".to_string();
+            other.status = crate::session::Status::Idle;
+            other.archive();
+            other
+        }];
+        let baseline = attention_group_key("g", None, &read_baseline);
+        assert_eq!(
+            key.1, baseline.1,
+            "an archived unread member must not promote the group: rank={} baseline={}",
+            key.1, baseline.1
+        );
+    }
+
+    #[test]
+    fn test_attention_group_key_empty_archived_group() {
+        let now = chrono::Utc::now();
+        let key = attention_group_key("empty", Some(now), &[]);
+        assert_eq!(key.1, 99, "empty archived group sinks to tier 99");
+
+        let key_unarchived = attention_group_key("empty", None, &[]);
+        assert_eq!(
+            key_unarchived.1,
+            u8::MAX,
+            "empty unarchived group keeps prior u8::MAX behavior"
+        );
+    }
+
+    #[test]
+    fn test_favorite_pins_waiting_above_non_favorited_waiting() {
+        // Two Waiting sessions. The favorited one must sort above the
+        // non-favorited one despite having no aging difference.
+        let mut fav = Instance::new("fav", "/tmp/fav");
+        fav.status = crate::session::Status::Waiting;
+        fav.favorite();
+        let plain = {
+            let mut p = Instance::new("plain", "/tmp/plain");
+            p.status = crate::session::Status::Waiting;
+            p
+        };
+        let fav_key = attention_session_key(&fav);
+        let plain_key = attention_session_key(&plain);
+        assert!(
+            fav_key < plain_key,
+            "favorited+Waiting should sort before non-favorited+Waiting: fav={fav_key:?} plain={plain_key:?}"
+        );
+    }
+
+    #[test]
+    fn test_favorite_does_not_cross_tiers() {
+        // Revised spec (2026-04-23): "favorites should be top of their
+        // respective category." Tier stays primary; a favorited lower-
+        // priority row never leaps above a non-favorited higher-priority
+        // peer. Fav+Idle (tier 2) must sink below plain+Waiting (tier 0).
+        let mut fav_idle = Instance::new("fav_idle", "/tmp/fi");
+        fav_idle.status = crate::session::Status::Idle;
+        fav_idle.favorite();
+        let mut plain_waiting = Instance::new("plain_waiting", "/tmp/pw");
+        plain_waiting.status = crate::session::Status::Waiting;
+        let fav_key = attention_session_key(&fav_idle);
+        let plain_key = attention_session_key(&plain_waiting);
+        assert!(
+            plain_key < fav_key,
+            "plain+Waiting (tier 0) must sort above fav+Idle (tier 2): plain={plain_key:?} fav={fav_key:?}"
+        );
+    }
+
+    #[test]
+    fn test_has_live_favorite_matches_inline_predicate() {
+        // A live favorited member => true.
+        let mut fav = Instance::new("fav", "/tmp/fav");
+        fav.group_path = "work".to_string();
+        fav.favorite();
+        assert!(has_live_favorite("work", std::slice::from_ref(&fav)));
+
+        // Not favorited => false.
+        let mut plain = Instance::new("plain", "/tmp/plain");
+        plain.group_path = "work".to_string();
+        assert!(!has_live_favorite("work", std::slice::from_ref(&plain)));
+
+        // A member of a nested sub-group counts for the parent group.
+        let mut nested = Instance::new("nested", "/tmp/nested");
+        nested.group_path = "work/frontend".to_string();
+        nested.favorite();
+        assert!(has_live_favorite("work", std::slice::from_ref(&nested)));
+
+        // A favorite in a different group has no effect here.
+        assert!(!has_live_favorite(
+            "personal",
+            std::slice::from_ref(&nested)
+        ));
+
+        // A snoozed favorite is not "live". `snooze` leaves `favorited_at`
+        // set, so the `!is_snoozed()` guard is what actually excludes it.
+        let mut snoozed = Instance::new("snoozed", "/tmp/snoozed");
+        snoozed.group_path = "work".to_string();
+        snoozed.favorite();
+        snoozed.snooze(60);
+        assert!(snoozed.is_favorited(), "snooze must not clear the star");
+        assert!(!has_live_favorite("work", std::slice::from_ref(&snoozed)));
+    }
+
+    /// In the Newest sort, an old favorite outranks a newer non-favorite.
+    #[test]
+    fn test_favorites_first_pins_in_newest_sort() {
+        let mut old_fav = Instance::new("old_fav", "/tmp/of");
+        old_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        old_fav.favorite();
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = [old_fav, new_plain];
+
+        // Feature off: plain newest-first, unchanged behavior.
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, false);
+        assert_eq!(refs[0].title, "new_plain");
+
+        // Feature on: the favorite floats to the top.
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, true);
+        assert_eq!(refs[0].title, "old_fav");
+        assert_eq!(refs[1].title, "new_plain");
+    }
+
+    /// Favorites keep the mode's own ordering among themselves (stable sort).
+    #[test]
+    fn test_favorites_first_preserves_order_within_favorites() {
+        let mut fav_old = Instance::new("fav_old", "/tmp/fo");
+        fav_old.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        fav_old.favorite();
+        let mut fav_new = Instance::new("fav_new", "/tmp/fnew");
+        fav_new.created_at = chrono::Utc::now();
+        fav_new.favorite();
+        let plain = Instance::new("plain", "/tmp/p");
+
+        let instances = [fav_old, fav_new, plain];
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, true);
+
+        assert_eq!(refs[0].title, "fav_new");
+        assert_eq!(refs[1].title, "fav_old");
+        assert_eq!(refs[2].title, "plain");
+    }
+
+    /// The same holds for the AZ sort.
+    #[test]
+    fn test_favorites_first_pins_in_az_sort() {
+        let mut z_fav = Instance::new("zebra", "/tmp/z");
+        z_fav.favorite();
+        let a_plain = Instance::new("apple", "/tmp/a");
+
+        let instances = [z_fav, a_plain];
+
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::AZ, true);
+        assert_eq!(refs[0].title, "zebra");
+
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::AZ, false);
+        assert_eq!(refs[0].title, "apple");
+    }
+
+    /// A snoozed favorite must not be pinned to the top.
+    #[test]
+    fn test_favorites_first_ignores_snoozed_favorite() {
+        let mut snoozed_fav = Instance::new("snoozed_fav", "/tmp/sf");
+        snoozed_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        snoozed_fav.favorite();
+        snoozed_fav.snooze(60);
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = [snoozed_fav, new_plain];
+        let mut refs: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut refs, SortOrder::Newest, true);
+
+        assert_eq!(
+            refs[0].title, "new_plain",
+            "snoozed favorite must not pin: snooze outranks the star"
+        );
+    }
+
+    /// A group holding a favorited member outranks its sibling groups.
+    #[test]
+    fn test_favorites_first_pins_groups() {
+        // "old" holds an old favorite; "new" holds a recent non-favorite.
+        let mut old_fav = Instance::new("old_fav", "/tmp/of");
+        old_fav.group_path = "old".to_string();
+        old_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        old_fav.favorite();
+
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.group_path = "new".to_string();
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = vec![old_fav, new_plain];
+        let groups = vec![Group::new("old", "old"), Group::new("new", "new")];
+
+        // Feature off: Newest ordering puts "new" on top.
+        let mut items = groups.clone();
+        sort_groups_inner(
+            &mut items,
+            SortOrder::Newest,
+            &instances,
+            |g: &Group| g.name.as_str(),
+            |g: &Group| g.path.as_str(),
+            |_: &Group| None,
+            false,
+        );
+        assert_eq!(items[0].path, "new");
+
+        // Feature on: "old" wins because it holds a favorite.
+        let mut items = groups.clone();
+        sort_groups_inner(
+            &mut items,
+            SortOrder::Newest,
+            &instances,
+            |g: &Group| g.name.as_str(),
+            |g: &Group| g.path.as_str(),
+            |_: &Group| None,
+            true,
+        );
+        assert_eq!(items[0].path, "old");
+    }
+
+    /// The all-profiles view orders its root groups with its own inline pass
+    /// (each root carries per-profile instances), so the favorites bias needs
+    /// coverage here too. Serial: this path reads the process-wide flag.
+    #[test]
+    #[serial_test::serial]
+    fn test_favorites_first_pins_root_groups_across_profiles() {
+        let _flag = crate::session::test_support::FavoritesFirstGuard::new();
+
+        let mut old_fav = Instance::new("old_fav", "/tmp/of");
+        old_fav.source_profile = "p1".to_string();
+        old_fav.group_path = "old".to_string();
+        old_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        old_fav.favorite();
+
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.source_profile = "p2".to_string();
+        new_plain.group_path = "new".to_string();
+        new_plain.created_at = chrono::Utc::now();
+
+        let mut trees = std::collections::HashMap::new();
+        trees.insert(
+            "p1".to_string(),
+            GroupTree::new_with_groups(std::slice::from_ref(&old_fav), &[]),
+        );
+        trees.insert(
+            "p2".to_string(),
+            GroupTree::new_with_groups(std::slice::from_ref(&new_plain), &[]),
+        );
+        let instances = vec![old_fav, new_plain];
+
+        let first_group = |items: &[Item]| {
+            items
+                .iter()
+                .find_map(|i| match i {
+                    Item::Group { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+                .expect("a group item is present")
+        };
+
+        crate::session::set_favorites_first(false);
+        let items = flatten_tree_all_profiles(&instances, &trees, SortOrder::Newest);
+        assert_eq!(
+            first_group(&items),
+            "new",
+            "flag off: plain Newest puts the recent group first"
+        );
+
+        crate::session::set_favorites_first(true);
+        let items = flatten_tree_all_profiles(&instances, &trees, SortOrder::Newest);
+        assert_eq!(
+            first_group(&items),
+            "old",
+            "flag on: the group holding the favorite pins to the top"
+        );
+    }
+
+    /// A group whose only favorite is archived must not be promoted.
+    /// (`favorite()` clears `archived_at`, and `has_live_favorite` filters
+    /// archived rows, so neither path may pin the group.)
+    #[test]
+    fn test_favorites_first_ignores_archived_members() {
+        let mut archived_fav = Instance::new("archived_fav", "/tmp/af");
+        archived_fav.group_path = "old".to_string();
+        archived_fav.created_at = chrono::Utc::now() - chrono::Duration::days(10);
+        archived_fav.favorite();
+        archived_fav.archive();
+
+        let mut new_plain = Instance::new("new_plain", "/tmp/np");
+        new_plain.group_path = "new".to_string();
+        new_plain.created_at = chrono::Utc::now();
+
+        let instances = vec![archived_fav, new_plain];
+        let mut items = vec![Group::new("old", "old"), Group::new("new", "new")];
+
+        sort_groups_inner(
+            &mut items,
+            SortOrder::Newest,
+            &instances,
+            |g: &Group| g.name.as_str(),
+            |g: &Group| g.path.as_str(),
+            |_: &Group| None,
+            true,
+        );
+        assert_eq!(
+            items[0].path, "new",
+            "archived favorite must not pin its group"
+        );
+    }
+
+    /// The Attention sort produces the same order regardless of the flag.
+    #[test]
+    fn test_favorites_first_does_not_change_attention_sort() {
+        let mut fav_idle = Instance::new("fav_idle", "/tmp/fi");
+        fav_idle.status = crate::session::Status::Idle;
+        fav_idle.favorite();
+        let mut plain_waiting = Instance::new("plain_waiting", "/tmp/pw");
+        plain_waiting.status = crate::session::Status::Waiting;
+
+        let instances = [fav_idle, plain_waiting];
+
+        let mut on: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut on, SortOrder::Attention, true);
+        let mut off: Vec<&Instance> = instances.iter().collect();
+        sort_sessions_inner(&mut off, SortOrder::Attention, false);
+
+        let on_titles: Vec<&str> = on.iter().map(|i| i.title.as_str()).collect();
+        let off_titles: Vec<&str> = off.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(on_titles, off_titles, "Attention sort must ignore the flag");
+        // Tier stays primary, so Waiting is still on top.
+        assert_eq!(on_titles[0], "plain_waiting");
+    }
+
+    #[test]
+    fn test_is_live_favorite_excludes_snoozed() {
+        let mut fav = Instance::new("fav", "/tmp/fav");
+        fav.favorite();
+        assert!(is_live_favorite(&fav));
+
+        fav.snooze(60);
+        assert!(!is_live_favorite(&fav), "snoozed favorite is not live");
+    }
+
+    /// `favorite()` and `archive()` clear each other, so an archived-or-trashed
+    /// favorite is only reachable via a legacy or hand-edited record. Build
+    /// those states directly: the helper must still reject them, since its
+    /// direct callers (the sort pass, the Tool-view renderer) do not pre-filter.
+    #[test]
+    fn test_is_live_favorite_excludes_archived_and_trashed() {
+        let now = chrono::Utc::now();
+
+        let mut archived = Instance::new("archived", "/tmp/a");
+        archived.favorited_at = Some(now);
+        archived.archived_at = Some(now);
+        assert!(archived.is_favorited() && archived.is_archived());
+        assert!(
+            !is_live_favorite(&archived),
+            "an archived favorite is not live"
+        );
+
+        let mut trashed = Instance::new("trashed", "/tmp/t");
+        trashed.favorited_at = Some(now);
+        trashed.trashed_at = Some(now);
+        assert!(trashed.is_favorited() && trashed.is_trashed());
+        assert!(
+            !is_live_favorite(&trashed),
+            "a trashed favorite is not live"
+        );
+    }
+
+    #[test]
+    fn test_attention_rank_unread_promoter() {
+        // Tiers: Waiting=0, Error=1, Idle=2, Unknown=3, Running=4.
+        // Feature ON: an unread row ranks just below Waiting (0) and above
+        // every other tier, so an unread Idle beats a read Error/Running.
+        let waiting = attention_rank(0, false, true);
+        let unread_idle = attention_rank(2, true, true);
+        let read_error = attention_rank(1, false, true);
+        let read_running = attention_rank(4, false, true);
+        assert!(waiting < unread_idle, "Waiting must stay above unread");
+        assert!(
+            unread_idle < read_error,
+            "unread Idle must rank above a read Error"
+        );
+        assert!(
+            unread_idle < read_running,
+            "unread Idle must rank above a read Running"
+        );
+
+        // Feature OFF: rank is the raw tier, so ordering is unchanged and an
+        // (impossible-when-off, but defensive) unread flag does not promote.
+        assert_eq!(attention_rank(0, false, false), 0);
+        assert_eq!(attention_rank(2, true, false), 2);
+        assert_eq!(attention_rank(4, false, false), 4);
+
+        assert_eq!(
+            attention_rank(99, true, true),
+            99,
+            "unread must not promote sunk rows"
+        );
+        assert_eq!(
+            attention_rank(99, false, true),
+            99,
+            "read sunk rows must keep rank 99"
+        );
+
+        // OFF ordering matches the pre-feature tier order for read rows.
+        assert!(attention_rank(0, false, false) < attention_rank(1, false, false));
+        assert!(attention_rank(1, false, false) < attention_rank(2, false, false));
+    }
+
+    #[test]
+    fn test_favorite_pins_within_running_tier() {
+        // User rule: "favorites should be top of their respective category."
+        // Running sessions (tier 4, the "processing" bucket) now pin fav
+        // above non-fav peers; previously fav was a no-op for Running.
+        let mut fav_running = Instance::new("fav_r", "/tmp/fr");
+        fav_running.status = crate::session::Status::Running;
+        fav_running.favorite();
+        let mut plain_running = Instance::new("plain_r", "/tmp/pr");
+        plain_running.status = crate::session::Status::Running;
+        let fav_key = attention_session_key(&fav_running);
+        let plain_key = attention_session_key(&plain_running);
+        assert!(
+            fav_key < plain_key,
+            "favorited Running pins above plain Running: fav={fav_key:?} plain={plain_key:?}"
+        );
+    }
+
+    #[test]
+    fn test_favorite_pins_within_stopped_tier() {
+        // Same rule applied to Stopped (tier 5). "Respective category"
+        // means every non-sunk tier; favorite is a universal within-tier
+        // pin, not a needs-help-only pin.
+        let mut fav_stopped = Instance::new("fav_s", "/tmp/fs");
+        fav_stopped.status = crate::session::Status::Stopped;
+        fav_stopped.favorite();
+        let mut plain_stopped = Instance::new("plain_s", "/tmp/ps");
+        plain_stopped.status = crate::session::Status::Stopped;
+        let fav_key = attention_session_key(&fav_stopped);
+        let plain_key = attention_session_key(&plain_stopped);
+        assert!(
+            fav_key < plain_key,
+            "favorited Stopped pins above plain Stopped: fav={fav_key:?} plain={plain_key:?}"
+        );
+    }
+
+    #[test]
+    fn test_archive_clears_favorite() {
+        // Mutual exclusion: archive() explicitly clears favorited_at. The
+        // user's rule is "archived removes fav"; pinning a sunk row is
+        // incoherent, so archive hard-wins. Previous behavior (both flags
+        // coexisting with archive-beats-favorite at sort time) produced
+        // confusing "favorite icon on an archived row" JSON output.
+        let mut inst = Instance::new("t", "/tmp/t");
+        inst.status = crate::session::Status::Waiting;
+        inst.favorite();
+        assert!(inst.is_favorited(), "pre-condition: fav is set");
+        inst.archive();
+        assert!(inst.is_archived(), "archive set");
+        assert!(!inst.is_favorited(), "archive cleared favorite");
+        let key = attention_session_key(&inst);
+        assert_eq!(key.1, 99, "tier 99 (archived)");
+        assert!(key.2, "no favorite bias (bias bool is 'true' = !pinned)");
+    }
+
+    #[test]
+    fn test_favorite_clears_archive() {
+        // User's rule: "marking as favorite unarchives." favorite()
+        // explicitly clears archived_at so pressing `f` on an archived
+        // row actually surfaces it. Without this, tier 99 suppresses the
+        // favorite bias and the row stays buried.
+        let mut inst = Instance::new("t", "/tmp/t");
+        inst.archive();
+        assert!(inst.is_archived(), "pre-condition: archived");
+        inst.favorite();
+        assert!(inst.is_favorited(), "fav set");
+        assert!(!inst.is_archived(), "fav cleared archive");
+    }
+
+    #[test]
+    fn test_favorite_clears_snooze() {
+        // Snooze shares tier 99 with archive, so a snoozed session is
+        // equally buried and equally defeats the favorite bias. Favorite's
+        // clear-everything-that-hides-me rule extends to snooze.
+        let mut inst = Instance::new("t", "/tmp/t");
+        inst.snooze(30);
+        assert!(inst.is_snoozed(), "pre-condition: snoozed");
+        inst.favorite();
+        assert!(inst.is_favorited(), "fav set");
+        assert!(!inst.is_snoozed(), "fav cleared snooze");
+    }
+
+    #[test]
+    fn test_user_interaction_wakes_archive_and_snooze() {
+        // `touch_last_accessed` is called on every user-initiated
+        // interaction (send message, attach). User rule: "messaging should
+        // unarchive." A user talking to a session is explicit evidence they
+        // care about it; leaving it sunk at tier 99 is incoherent.
+        // Favorite stays (orthogonal signal).
+        let mut inst = Instance::new("t", "/tmp/t");
+        inst.favorite();
+        inst.archive();
+        // archive cleared fav per mutex; resurrect fav for this test
+        inst.favorite();
+        inst.snooze(30);
+        // snooze preserves fav; archive was cleared by fav above. Re-archive
+        // to cover both flags simultaneously (even though the mutex prevents
+        // the CLI paths from producing this state, the test exercises the
+        // wake logic directly).
+        inst.archived_at = Some(chrono::Utc::now());
+        assert!(
+            inst.is_archived() && inst.is_snoozed() && inst.is_favorited(),
+            "pre-condition: all three set"
+        );
+        inst.touch_last_accessed();
+        assert!(!inst.is_archived(), "user interaction cleared archive");
+        assert!(!inst.is_snoozed(), "user interaction cleared snooze");
+        assert!(inst.is_favorited(), "user interaction preserved favorite");
+        assert!(inst.last_accessed_at.is_some(), "timestamp stamped");
+    }
+
+    #[test]
+    fn test_favorited_session_serde_roundtrip() {
+        let mut inst = Instance::new("t", "/tmp/t");
+        inst.favorite();
+        let json = serde_json::to_string(&inst).unwrap();
+        assert!(
+            json.contains("favorited_at"),
+            "favorited_at must serialize when set"
+        );
+        let parsed: Instance = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.is_favorited(),
+            "favorited_at round-trips through JSON"
+        );
+    }
+
+    #[test]
+    fn test_archived_session_serde_roundtrip() {
+        let mut inst = Instance::new("t", "/tmp/t");
+        inst.archive();
+        let json = serde_json::to_string(&inst).unwrap();
+        assert!(json.contains("archived_at"));
+
+        let parsed: Instance = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_archived());
+    }
+
+    #[test]
+    fn test_unarchived_session_skips_field_in_json() {
+        // skip_serializing_if = "Option::is_none" means archived_at is
+        // omitted entirely when None. Backward-compatible for existing
+        // sessions.json files.
+        let inst = Instance::new("t", "/tmp/t");
+        let json = serde_json::to_string(&inst).unwrap();
+        assert!(
+            !json.contains("archived_at"),
+            "archived_at should be omitted when None: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_snoozed_session_is_snoozed_while_future() {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.snooze(30);
+        assert!(inst.is_snoozed(), "fresh 30m snooze is active");
+        assert!(inst.snooze_remaining().is_some());
+    }
+
+    #[test]
+    fn test_expired_snooze_reports_not_snoozed() {
+        let mut inst = Instance::new("s", "/tmp/s");
+        // Stale past timestamp; the lazy predicate should reject it so
+        // the row rejoins the active Attention sort on next render.
+        inst.snoozed_until = Some(Utc::now() - chrono::Duration::minutes(5));
+        assert!(
+            !inst.is_snoozed(),
+            "past snoozed_until must read as NOT snoozed"
+        );
+        assert!(inst.snooze_remaining().is_none());
+    }
+
+    #[test]
+    fn test_unsnooze_clears_timestamp() {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.snooze(30);
+        inst.unsnooze();
+        assert!(!inst.is_snoozed());
+        assert!(inst.snoozed_until.is_none());
+    }
+
+    #[test]
+    fn test_snooze_pushes_to_tier_99() {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.status = crate::session::Status::Waiting;
+        assert_eq!(attention_tier(&inst), 0, "baseline: waiting is tier 0");
+        inst.snooze(30);
+        assert_eq!(
+            attention_tier(&inst),
+            99,
+            "snoozed waiting sinks to archive tier"
+        );
+    }
+
+    #[test]
+    fn test_expired_snooze_does_not_hold_tier_99() {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.status = crate::session::Status::Waiting;
+        inst.snoozed_until = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert_eq!(
+            attention_tier(&inst),
+            0,
+            "once the timer elapses, tier returns to the natural status bucket"
+        );
+    }
+
+    #[test]
+    fn test_snoozed_session_serde_roundtrip() {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.snooze(30);
+        let json = serde_json::to_string(&inst).unwrap();
+        assert!(
+            json.contains("snoozed_until"),
+            "snoozed_until must serialize when set"
+        );
+        let parsed: Instance = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.is_snoozed(),
+            "snoozed_until round-trips through JSON"
+        );
+    }
+
+    #[test]
+    fn test_non_snoozed_session_skips_field_in_json() {
+        let inst = Instance::new("s", "/tmp/s");
+        let json = serde_json::to_string(&inst).unwrap();
+        assert!(
+            !json.contains("snoozed_until"),
+            "snoozed_until should be omitted when None: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_archive_beats_snooze_on_prefix() {
+        // Precedence rule: archive wins over snooze. Both flags set
+        // together should still honor archive (tier 99 is shared; the
+        // prefix rule is tested in render, but here we just verify the
+        // predicates disagree cleanly).
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.archive();
+        inst.snooze(30);
+        assert!(inst.is_archived());
+        assert!(inst.is_snoozed());
+        assert_eq!(attention_tier(&inst), 99);
+    }
+
+    #[test]
+    fn test_legacy_json_without_archived_at_deserializes() {
+        // Existing sessions.json files predate this field. Verify they load
+        // cleanly with archived_at defaulting to None.
+        let legacy = r#"{
+            "id": "abc",
+            "title": "old",
+            "project_path": "/tmp/old",
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let inst: Instance = serde_json::from_str(legacy).unwrap();
+        assert!(!inst.is_archived());
+        assert!(inst.archived_at.is_none());
+    }
+
+    /// #3237: the scratch bucket's key is a sentinel, so name-ordering the
+    /// archived sub-folders on the raw key would sort it under `_` and hoist
+    /// it above every real project. It must sort where its label reads.
+    #[test]
+    fn archived_project_buckets_name_sort_uses_display_label() {
+        let myrepo = Instance::new("a", "/repos/myrepo");
+        let throwaway = Instance::new("b", "/app/scratch/x");
+        let zeta = Instance::new("c", "/repos/zeta");
+        let cases = [
+            (SortOrder::AZ, ["myrepo", SCRATCH_GROUP_NAME, "zeta"]),
+            (SortOrder::ZA, ["zeta", SCRATCH_GROUP_NAME, "myrepo"]),
+        ];
+        for (order, expected) in cases {
+            let mut buckets: Vec<(String, Vec<&Instance>)> = vec![
+                ("myrepo".to_string(), vec![&myrepo]),
+                (SCRATCH_GROUP_PATH.to_string(), vec![&throwaway]),
+                ("zeta".to_string(), vec![&zeta]),
+            ];
+            sort_archived_project_buckets(&mut buckets, order);
+            let labels: Vec<&str> = buckets
+                .iter()
+                .map(|b| project_group_display_name(&b.0))
+                .collect();
+            assert_eq!(labels, expected, "{order:?}");
+        }
+    }
 }
