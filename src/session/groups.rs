@@ -1063,43 +1063,50 @@ fn count_sessions_in_group(path: &str, instances: &[Instance]) -> usize {
     group_members(path, instances).count()
 }
 
-/// Hoist the AoE-Commander session to the absolute top of `items` (index 0,
-/// depth 0), above ungrouped sessions, every group, and the Archived section,
-/// in every sort order and grouping mode. `favorite`/`pinned_at` only pin
-/// within a status tier and sink/clear when the row goes idle or is archived;
-/// the commander must stay top-visible in every state, so we lift its row to
-/// the front as a post-pass after the natural flow is built.
+/// Hoist the commander-lane rows to the absolute top of `items` (from index
+/// 0, depth 0), above ungrouped sessions, every group, and the Archived
+/// section, in every sort order and grouping mode. `favorite`/`pinned_at` only
+/// pin within a status tier and sink/clear when the row goes idle or is
+/// archived; the commander must stay top-visible in every state, so we lift
+/// its row to the front as a post-pass after the natural flow is built.
 ///
-/// Group-/sort-/view-agnostic by construction: it finds the commander row
-/// wherever it landed and moves it. If the commander isn't already in `items`
+/// Rows are ordered by `Instance::commander_pin_rank`: the Claude
+/// `AoE-Commander` (rank 0) first, then any `AoE-Commander-<runtime>` twin
+/// (rank 1, e.g. `AoE-Commander-Codex`) directly below it; ties break on
+/// title, then id, so the order is deterministic.
+///
+/// Group-/sort-/view-agnostic by construction: it finds each ranked row
+/// wherever it landed and moves it. If a ranked row isn't already in `items`
 /// (e.g. filtered out by an active profile) it's still inserted at the top, so
 /// the fleet manager is visible from every view. No-op when no non-archived
-/// commander session exists (an archived commander stays in the Archived
-/// section rather than clawing back to the top).
+/// ranked session exists (an archived commander stays in the Archived section
+/// rather than clawing back to the top).
 pub fn pin_commander_first<'a>(
     items: &mut Vec<Item>,
     instances: impl IntoIterator<Item = &'a Instance>,
 ) {
-    let commander_id = match instances
+    let mut ranked: Vec<(u8, String, String)> = instances
         .into_iter()
-        .find(|i| i.is_commander() && !i.is_archived())
-    {
-        Some(inst) => inst.id.clone(),
-        None => return,
-    };
-    if let Some(pos) = items
-        .iter()
-        .position(|it| matches!(it, Item::Session { id, .. } if *id == commander_id))
-    {
-        items.remove(pos);
+        .filter(|i| !i.is_archived())
+        .filter_map(|i| {
+            i.commander_pin_rank()
+                .map(|rank| (rank, i.title.clone(), i.id.clone()))
+        })
+        .collect();
+    if ranked.is_empty() {
+        return;
     }
-    items.insert(
-        0,
-        Item::Session {
-            id: commander_id,
-            depth: 0,
-        },
-    );
+    ranked.sort();
+    // Insert in reverse rank order so the lowest rank ends at index 0.
+    for (_, _, id) in ranked.into_iter().rev() {
+        if let Some(pos) = items
+            .iter()
+            .position(|it| matches!(it, Item::Session { id: x, .. } if *x == id))
+        {
+            items.remove(pos);
+        }
+        items.insert(0, Item::Session { id, depth: 0 });
+    }
 }
 
 /// Append the synthetic "Archived" section to `items`, pinned to the
@@ -1451,6 +1458,108 @@ mod tests {
             !items
                 .iter()
                 .any(|it| matches!(it, Item::Session { id, .. } if *id == commander_id)),
+            "archived commander must not be pinned into the flow"
+        );
+    }
+
+    #[test]
+    fn test_commander_pin_rank_exact_title_is_zero_twin_is_one() {
+        // Rank 0 = the Claude AoE-Commander (exact title, the routing identity).
+        // Rank 1 = a manager-lane twin titled `AoE-Commander-<runtime>`
+        // (2026-09-08: `AoE-Commander-Codex`). Anything else is unranked.
+        assert_eq!(
+            Instance::new("AoE-Commander", "/tmp/c").commander_pin_rank(),
+            Some(0)
+        );
+        assert_eq!(
+            Instance::new("AoE-Commander-Codex", "/tmp/c").commander_pin_rank(),
+            Some(1)
+        );
+        assert_eq!(
+            Instance::new("AoE-Commanderish", "/tmp/c").commander_pin_rank(),
+            None
+        );
+        assert_eq!(
+            Instance::new("aoe-commander", "/tmp/c").commander_pin_rank(),
+            None
+        );
+        assert_eq!(
+            Instance::new("AoE-Commander-", "/tmp/c").commander_pin_rank(),
+            None,
+            "a bare dash with no runtime suffix is not a twin"
+        );
+        // `is_commander` stays the EXACT match: relay/cmdtop identity of the
+        // Claude Commander must not widen to the twins.
+        assert!(!Instance::new("AoE-Commander-Codex", "/tmp/c").is_commander());
+    }
+
+    #[test]
+    fn test_pin_commander_first_hoists_twin_directly_below_commander() {
+        // The Codex twin lives in the same group as the Commander and lands
+        // after the ungrouped rows and the worker without the pin. After the
+        // pin: Commander at 0, twin at 1, each exactly once, both depth 0.
+        let ungrouped = Instance::new("ungrouped", "/tmp/u");
+        let mut worker = Instance::new("worker", "/tmp/w");
+        worker.group_path = "fleet".to_string();
+        let mut twin = Instance::new("AoE-Commander-Codex", "/tmp/c");
+        twin.group_path = "fleet".to_string();
+        let twin_id = twin.id.clone();
+        let mut commander = Instance::new("AoE-Commander", "/tmp/c");
+        commander.group_path = "fleet".to_string();
+        let commander_id = commander.id.clone();
+
+        // Twin listed BEFORE the commander so natural order would put it first
+        // among the two; the rank must still put the commander above it.
+        let instances = vec![ungrouped, worker, twin, commander];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        let mut items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        assert!(
+            !matches!(&items[0], Item::Session { id, .. } if *id == commander_id),
+            "precondition: commander buried before pinning"
+        );
+
+        pin_commander_first(&mut items, &instances);
+
+        match (&items[0], &items[1]) {
+            (Item::Session { id: a, depth: da }, Item::Session { id: b, depth: db }) => {
+                assert_eq!(*a, commander_id, "commander must be row 0");
+                assert_eq!(*b, twin_id, "the twin must be row 1, directly below");
+                assert_eq!((*da, *db), (0, 0), "both pinned rows render at depth 0");
+            }
+            other => panic!("expected two pinned Session rows at the top, got {other:?}"),
+        }
+        for id in [&commander_id, &twin_id] {
+            let n = items
+                .iter()
+                .filter(|it| matches!(it, Item::Session { id: x, .. } if x == id))
+                .count();
+            assert_eq!(n, 1, "pinned row {id} must appear exactly once");
+        }
+    }
+
+    #[test]
+    fn test_pin_commander_first_twin_alone_pins_top() {
+        // No Claude Commander registered (e.g. its profile filtered out or it
+        // is archived): the twin still pins to row 0 rather than staying buried.
+        let ungrouped = Instance::new("ungrouped", "/tmp/u");
+        let mut twin = Instance::new("AoE-Commander-Codex", "/tmp/c");
+        twin.group_path = "fleet".to_string();
+        let twin_id = twin.id.clone();
+        let mut archived_commander = Instance::new("AoE-Commander", "/tmp/c");
+        archived_commander.archived_at = Some(Utc::now());
+        let archived_id = archived_commander.id.clone();
+        let instances = vec![ungrouped, twin, archived_commander];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        let mut items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        pin_commander_first(&mut items, &instances);
+        assert!(
+            matches!(&items[0], Item::Session { id, .. } if *id == twin_id),
+            "twin must be row 0 when it is the only live commander-lane row"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|it| matches!(it, Item::Session { id, .. } if *id == archived_id)),
             "archived commander must not be pinned into the flow"
         );
     }
