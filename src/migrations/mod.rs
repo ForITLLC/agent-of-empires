@@ -40,6 +40,7 @@ mod v030_global_only_profile_settings;
 mod v031_conversation_provenance;
 mod v032_bound_capture_exclusions;
 pub(crate) mod v033_isolate_sandbox_content;
+mod v034_terminal_queue_receipts;
 mod v034_trash_retention_minutes;
 mod v035_custom_sort_order;
 
@@ -87,7 +88,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 35;
+const CURRENT_VERSION: u32 = 36;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -217,7 +218,21 @@ const MIGRATIONS: &[Migration] = &[
         v034_trash_retention_minutes::run,
     ),
     (35, "custom_sort_order", v035_custom_sort_order::run),
+    (36, "terminal_queue_receipts", v036_terminal_queue_receipts),
 ];
+
+/// Fork migration, registered at 36 since the rebase onto upstream's v035. It
+/// shipped as v034 on the 1.17 fork and at 35 on the 1.18.0 fork, so those hosts
+/// record schema 34 or 35 and skip upstream's own v034 and v035. Upstream's v035 is
+/// a version step with nothing to rewrite, and its v034 conversion is idempotent
+/// (it only acts on a leftover `trash_retention_days` key), so that one runs again
+/// here. The receipt schema install is idempotent too, so hosts already at 35 can
+/// run it a second time. The module keeps its v034 file name so the fork's later
+/// edits to it still apply.
+fn v036_terminal_queue_receipts() -> Result<()> {
+    v034_trash_retention_minutes::run()?;
+    v034_terminal_queue_receipts::run()
+}
 
 /// The data-schema version this build targets, i.e. the version every install
 /// converges to after a successful startup (migration failures abort boot, so a

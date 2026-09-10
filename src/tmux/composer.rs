@@ -445,7 +445,9 @@ pub(crate) fn classify_machine_draft(
 /// chip as a unit.
 fn paste_chip_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\[Pasted text #\d+ \+\d+ lines\]").expect("static regex"))
+    RE.get_or_init(|| {
+        regex::Regex::new(r"\[Pasted text #\d+(?: \+\d+ lines)?\]").expect("static regex")
+    })
 }
 
 /// Every non-whitespace character, in order. The composer wraps rows at
@@ -565,34 +567,55 @@ fn residue_around(before: &str, after: &str, chip: bool) -> PasteResidue {
     }
 }
 
-/// Is the Claude composer clear for a queued machine delivery right now?
-///
-/// The daemon drains the server-owned prompt queue into a terminal session
-/// only through this gate (`server::send_queue`): the composer must be
-/// rendered and accepting input, and hold nothing a human typed. Text
-/// already parked there is tolerated only when it is provably machine text
-/// (`classify_machine_draft`): the queued message's own earlier attempt, or
-/// a prior machine send whose Enter was swallowed, which the verified send
-/// then completes with a bare Enter. Anything else is an operator's unsent
-/// draft and the delivery waits. It never types beside the draft and never
-/// submits it, so the WO#1872 guarantee holds for queued traffic exactly as
-/// it does for a live send. A dialog or a booting pane is "not ready", not
-/// "clear".
+/// A complete, rendered composer box. Unlike the live-send draft reader,
+/// unknown/clipped regions and queued-message hints are never called empty.
+pub(crate) fn queued_composer(raw_content: &str) -> Option<String> {
+    let clean = strip_ansi(&strip_dim_spans(raw_content));
+    let lines: Vec<&str> = clean.lines().collect();
+    let prompt = lines.iter().rposition(|line| {
+        let line = line.trim();
+        line.strip_prefix('❯').is_some_and(|rest| {
+            rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
+        })
+    })?;
+    if prompt == 0 || !claude_line_is_horizontal_rule(lines[prompt - 1].trim()) {
+        return None;
+    }
+    let close =
+        (prompt + 1..lines.len()).find(|&row| claude_line_is_horizontal_rule(lines[row].trim()))?;
+    // A history prompt or a box followed by a dialog is not the live input.
+    if lines[close + 1..]
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        > CLAUDE_COMPOSER_TAIL
+    {
+        return None;
+    }
+    let mut body = vec![lines[prompt].trim().strip_prefix('❯')?.trim().to_string()];
+    body.extend(
+        lines[prompt + 1..close]
+            .iter()
+            .map(|line| line.trim().to_string()),
+    );
+    Some(body.join("\n").trim().to_string())
+}
+
+pub(crate) fn queued_pane_is_idle(raw_content: &str) -> bool {
+    super::detect::detect("claude", &strip_ansi(raw_content), "", None).is_some_and(|d| {
+        d.status == Some(crate::session::Status::Idle) && d.visible && d.rule != "no_rule"
+    })
+}
+
+/// No machine-history exception: even this qid's text or a preexisting paste
+/// chip is occupied input. A fallback Idle status never proves readiness.
 pub(crate) fn composer_clear_for_delivery(
     raw_content: &str,
-    outgoing: &str,
-    machine_history: &[String],
+    _outgoing: &str,
+    _machine_history: &[String],
 ) -> bool {
-    if !claude_pane_input_ready(raw_content) {
-        return false;
-    }
-    match claude_composer_draft(raw_content) {
-        None => true,
-        Some(draft) => !matches!(
-            classify_machine_draft(&draft, outgoing, machine_history),
-            MachineDraft::No
-        ),
-    }
+    queued_pane_is_idle(raw_content)
+        && queued_composer(raw_content).is_some_and(|draft| draft.is_empty())
 }
 
 #[cfg(test)]
@@ -1163,6 +1186,49 @@ mod delivery_gate_tests {
     }
 
     #[test]
+    fn queued_delivery_requires_idle_and_strictly_empty_composer() {
+        for pane in [
+            with_draft("STATUS: shipped"),
+            with_draft("[Pasted text #1]"),
+            with_draft("[Pasted text #2 +4 lines]"),
+            with_draft("\nBen's draft"),
+            format!("✻ Working… (esc to interrupt)\n{EMPTY}"),
+            "❯\n  clipped continuation".to_string(),
+            "❯\n   Press up to edit queued messages".to_string(),
+        ] {
+            assert!(
+                !composer_clear_for_delivery(
+                    &pane,
+                    "STATUS: shipped",
+                    &["STATUS: shipped".to_string()],
+                ),
+                "unsafe queue boundary: {pane:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_chip_is_recognized_only_as_post_paste_residue() {
+        use super::{paste_residue, PasteResidue};
+        for chip in ["[Pasted text #1]", "[Pasted text #12 +4 lines]"] {
+            assert_eq!(
+                paste_residue(Some(chip), "the outgoing message"),
+                PasteResidue::Clean { chip: true }
+            );
+            assert!(matches!(
+                paste_residue(Some(&format!("{chip}Ben")), "the outgoing message"),
+                PasteResidue::Human { chip: true, .. }
+            ));
+            // Matching chip syntax does not establish ownership before paste.
+            assert!(!composer_clear_for_delivery(
+                &with_draft(chip),
+                "the outgoing message",
+                &[]
+            ));
+        }
+    }
+
+    #[test]
     fn operator_draft_blocks_delivery() {
         // The whole point: a human's half-typed words hold the queue.
         let pane = with_draft("yes, authorize the vendor bump and send it");
@@ -1176,19 +1242,18 @@ mod delivery_gate_tests {
     }
 
     #[test]
-    fn own_parked_copy_is_clear() {
-        // A prior attempt typed the message but lost its Enter: the verified
-        // send completes it with a bare Enter, so the gate opens.
+    fn own_parked_copy_is_not_clear() {
+        // An earlier attempt's text is occupied input, never auto-submitted.
         let msg = "STATUS: shipped - WO#1897 queue landed, build 9f221e45 live on the VM";
         let pane = with_draft(msg);
-        assert!(composer_clear_for_delivery(&pane, msg, &[]));
+        assert!(!composer_clear_for_delivery(&pane, msg, &[]));
     }
 
     #[test]
-    fn prior_machine_message_is_clear() {
+    fn prior_machine_message_is_not_clear() {
         let earlier = "STATUS: blocked - WO#1889 gateway vocabulary still emits digit tokens";
         let pane = with_draft(earlier);
-        assert!(composer_clear_for_delivery(
+        assert!(!composer_clear_for_delivery(
             &pane,
             "STATUS: shipped",
             &[earlier.to_string()]

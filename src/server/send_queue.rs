@@ -1,46 +1,16 @@
-//! Drain of the server-owned prompt queue into TERMINAL (tmux) sessions.
-//!
-//! `POST /api/sessions/{id}/send` refuses to type into a Claude composer that
-//! holds an operator's unsent draft (423 `parked_draft`; the refusal is the
-//! WO#1872 guarantee). Before this module the refused message was simply
-//! gone: the sender had to retry, and a fleet of senders whose retry windows
-//! lapsed lost their reports. Now the refusal parks the message on the
-//! session's server-owned prompt queue, the same `Instance::queued_prompts`
-//! the structured view drains, persisted in the profile's `sessions.json`,
-//! so it survives a daemon restart, and this loop delivers it once the
-//! composer is clear.
-//!
-//! The guarantee is absolute here too, and it has a second half. Delivering
-//! "the moment the composer clears" RACES THE HUMAN'S KEYSTROKES: an
-//! operator who clears their draft and starts typing has the daemon paste
-//! into the composer between two of their keys, and the paste's Enter
-//! submits it fused with their first letter (observed live: a machine
-//! message ending in a stray `c`, a human draft that then read `csn we
-//! extend`). So delivery is gated on a QUIET WINDOW (`quiet_gate`): the
-//! composer must have been clear, with no client keystroke on the pane, for
-//! `QueueTiming::quiet` (3 s by default) before anything is typed. The typing
-//! itself is guarded (`Session::send_keys_verified_guarded`): the paste is
-//! typed without Enter, read back after a settle, and submitted only if the
-//! composer holds exactly the paste; any human byte beside it aborts the
-//! delivery, strips the paste, leaves the human's bytes, and re-queues the
-//! row (same id, same position) behind a back-off. Never is a turn
-//! submitted that mixes injected text with a human's.
-//!
-//! One row per session per tick, FIFO by `seq`, each confirmed submitted
-//! before the next is considered, so a burst never fuses into one paste and
-//! every queued message lands as its own turn. Every decision is logged at
-//! `server.send_queue` with the row id: `delivered`, `held:composer_busy`,
-//! `held:quiet_window`, `held:typing`, `held:backoff`, `aborted:keystroke`.
-//!
-//! Structured sessions are NOT handled here: their queue drains through the
-//! ACP worker (`acp_reconciler::drain_queued_prompts`).
+//! Terminal queue delivery requires an idle session and an empty composer
+//! throughout the quiet window, with another check at the paste boundary.
+//! A durable (session, qid) receipt grants at most one attempt. An uncertain
+//! submit, abort, panic, or stale queue reload must never cause another paste.
+//! Claimed rows remain held for operator review; dropping one writes a
+//! tombstone before mutating the queue. Structured queues use the ACP drain.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use super::state::AppState;
-use crate::session::Instance;
+use crate::session::{Instance, Status};
 use crate::tmux::{GuardedSend, KeystrokeAbort};
 
 /// The drain's clocks. Defaults are the tuned values; each has an
@@ -100,11 +70,6 @@ pub(crate) fn timing() -> &'static QueueTiming {
     &TIMING
 }
 
-/// Tick period (see [`QueueTiming::tick`]).
-pub(crate) fn drain_interval() -> Duration {
-    timing().tick
-}
-
 /// Per-session memory of the quiet gate, kept across ticks.
 #[derive(Debug, Default)]
 pub(crate) struct QuietState {
@@ -124,19 +89,31 @@ pub(crate) struct QuietState {
 pub(crate) enum Hold {
     /// The composer is not clear (operator draft, dialog, booting pane).
     ComposerBusy,
+    AgentBusy,
+    AttemptRecorded,
+    UnsupportedReader,
     /// Clear, but not yet for the whole quiet window.
-    QuietWindow { remaining_ms: u64 },
+    QuietWindow {
+        remaining_ms: u64,
+    },
     /// A client keystroke landed on the pane inside the quiet window: a
     /// human is at the keyboard.
-    Typing { key_age_ms: u64 },
+    Typing {
+        key_age_ms: u64,
+    },
     /// Backing off after an abort.
-    Backoff { remaining_ms: u64 },
+    Backoff {
+        remaining_ms: u64,
+    },
 }
 
 impl Hold {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Hold::ComposerBusy => "held:composer_busy",
+            Hold::AgentBusy => "held:agent_busy",
+            Hold::AttemptRecorded => "held:attempt_recorded",
+            Hold::UnsupportedReader => "held:unsupported_reader",
             Hold::QuietWindow { .. } => "held:quiet_window",
             Hold::Typing { .. } => "held:typing",
             Hold::Backoff { .. } => "held:backoff",
@@ -216,6 +193,14 @@ fn should_log_hold(st: &mut QuietState, label: &'static str, now: Instant) -> bo
     log
 }
 
+fn log_hold(id: &str, qid: &str, hold: Hold) {
+    let label = hold.label();
+    if with_quiet(id, |st| should_log_hold(st, label, Instant::now())) {
+        tracing::info!(target: "server.send_queue", session = %id, %qid,
+            decision = label, detail = ?hold, "queued send held");
+    }
+}
+
 static QUIET: LazyLock<Mutex<HashMap<String, QuietState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -226,9 +211,7 @@ fn with_quiet<R>(id: &str, f: impl FnOnce(&mut QuietState) -> R) -> R {
 
 /// Terminal sessions whose queue this loop may drain: a non-empty queue on a
 /// non-structured session that is not sunk (archived / snoozed / trashed).
-/// Pure so the selection is unit-testable. Status is deliberately NOT a
-/// criterion: a Claude pane accepts (and itself queues) input mid-turn, and
-/// the composer read at delivery time is the real gate.
+/// Busy candidates still reach the gate so a turn resets its quiet window.
 pub(crate) fn drain_candidates(instances: &[Instance]) -> Vec<String> {
     instances
         .iter()
@@ -287,12 +270,12 @@ pub(crate) enum DeliverOutcome {
     /// Held this tick by the quiet gate (composer busy, window not elapsed,
     /// human typing, or backing off after an abort).
     Held(Hold),
-    /// A human's keystroke landed beside the paste; the paste was stripped,
-    /// nothing submitted, the row stays at its position behind a back-off.
+    /// A human's keystroke landed beside the paste. The attempt is consumed
+    /// and the row stays held for review, even after a successful cleanup.
     Aborted(KeystrokeAbort),
     /// The pane is not running; the row waits for a start or restart.
     PaneMissing,
-    /// A send failure; the row stays queued for the next tick.
+    /// A send failure. Any recorded claim prevents automatic retry.
     Failed(String),
     /// Nothing to deliver (empty queue, session gone, or not a candidate).
     Nothing,
@@ -314,7 +297,7 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
     else {
         return DeliverOutcome::Nothing;
     };
-    let (session_id, title, tool, head, history) = {
+    let (session_id, title, tool, status, head) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return DeliverOutcome::Nothing;
@@ -327,18 +310,47 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
         let Some(head) = queue.first().cloned() else {
             return DeliverOutcome::Nothing;
         };
-        // Every queued text is machine text: a copy of any of them parked
-        // unsubmitted by an earlier attempt is completed, never refused as
-        // a human draft.
-        let history: Vec<String> = queue.iter().map(|e| e.text.clone()).collect();
         (
             inst.id.clone(),
             inst.title.clone(),
             inst.tool.clone(),
+            inst.status,
             head,
-            history,
         )
     };
+    match state.acp_event_store.terminal_prompt_receipt(id, &head.id) {
+        Ok(Some(disposition)) if matches!(disposition.as_str(), "delivered" | "dropped") => {
+            state
+                .session_service
+                .retire_delivered_prompt(id, &head.id)
+                .await;
+            tracing::info!(target: "server.send_queue", session = %id, qid = %head.id,
+                %disposition, decision = "retired:replay", "consumed qid removed from stale queue");
+            return DeliverOutcome::Nothing;
+        }
+        Ok(Some(disposition)) => {
+            log_hold(id, &head.id, Hold::AttemptRecorded);
+            tracing::debug!(target: "server.send_queue", session = %id, qid = %head.id, %disposition,
+                "attempt requires operator review");
+            return DeliverOutcome::Held(Hold::AttemptRecorded);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(target: "server.send_queue", session = %id, qid = %head.id,
+                %error, decision = "held:receipt_unavailable", "queue receipt read failed; no input sent");
+            return DeliverOutcome::Failed(format!("queue receipt read failed: {error}"));
+        }
+    }
+    if tool != "claude" {
+        with_quiet(id, |st| st.clear_since = None);
+        log_hold(id, &head.id, Hold::UnsupportedReader);
+        return DeliverOutcome::Held(Hold::UnsupportedReader);
+    }
+    if status != Status::Idle {
+        with_quiet(id, |st| st.clear_since = None);
+        log_hold(id, &head.id, Hold::AgentBusy);
+        return DeliverOutcome::Held(Hold::AgentBusy);
+    }
     if head.text.trim().is_empty() {
         // A husk (text-less row) can never be typed into a pane; retire it
         // so the queue behind it drains, exactly as the ACP drain does.
@@ -355,6 +367,8 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
     let tool_for_send = tool.clone();
     let quiet_id = id.to_string();
     let t = *timing();
+    let receipts = Arc::clone(&state.acp_event_store);
+    let qid = head.id.clone();
     let outcome = tokio::task::spawn_blocking(move || -> DeliverOutcome {
         let session = match crate::tmux::Session::new(&session_id, &title) {
             Ok(s) => s,
@@ -364,7 +378,7 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
             return DeliverOutcome::PaneMissing;
         }
         let composer_clear =
-            match session.composer_clear_for_delivery(&text_for_send, &tool_for_send, &history) {
+            match session.composer_clear_for_delivery(&text_for_send, &tool_for_send, &[]) {
                 Ok(clear) => clear,
                 Err(e) => return DeliverOutcome::Failed(e.to_string()),
             };
@@ -382,8 +396,8 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
             &text_for_send,
             delay,
             &tool_for_send,
-            &history,
             t.settle,
+            || receipts.claim_terminal_prompt(&session_id, &qid),
         ) {
             Ok(GuardedSend::Delivered) => {
                 tracing::debug!(target: "server.send_queue", session = %quiet_id,
@@ -391,6 +405,11 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
                     "delivery typed and confirmed");
                 DeliverOutcome::Delivered
             }
+            Ok(GuardedSend::NotReady) => {
+                with_quiet(&quiet_id, |st| st.clear_since = None);
+                DeliverOutcome::Held(Hold::ComposerBusy)
+            }
+            Ok(GuardedSend::AlreadyAttempted) => DeliverOutcome::Held(Hold::AttemptRecorded),
             Ok(GuardedSend::Aborted(abort)) => {
                 with_quiet(&quiet_id, |st| {
                     st.clear_since = None;
@@ -416,6 +435,11 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
 
     match &outcome {
         DeliverOutcome::Delivered => {
+            if let Err(error) = state.acp_event_store.complete_terminal_prompt(id, &head.id) {
+                tracing::error!(target: "server.send_queue", session = %id, qid = %head.id,
+                    %error, "delivered receipt failed; existing claim prevents retry");
+                return DeliverOutcome::Failed(error.to_string());
+            }
             // Same acknowledgement a live send makes: delivery is the
             // authoritative "someone is handling this" for the urgent flag.
             let ack = crate::hooks::ack_hook_urgent_on_send(id, &text);
@@ -433,15 +457,7 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
                 urgent_ack = ack.as_str(), "queued send delivered");
         }
         DeliverOutcome::Held(hold) => {
-            let label = hold.label();
-            let now = Instant::now();
-            if with_quiet(id, |st| should_log_hold(st, label, now)) {
-                tracing::info!(target: "server.send_queue", session = %id, qid = %head.id,
-                    decision = label, detail = ?hold, "queued send held");
-            } else {
-                tracing::debug!(target: "server.send_queue", session = %id, qid = %head.id,
-                    decision = label, detail = ?hold, "queued send held");
-            }
+            log_hold(id, &head.id, *hold);
         }
         DeliverOutcome::Aborted(abort) => {
             let aborts = with_quiet(id, |st| st.aborts);
@@ -452,16 +468,15 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
                 rounds = abort.rounds, restored = abort.restored, aborts,
                 backoff_ms = timing().abort_backoff.as_millis() as u64,
                 "queued send aborted: human keystroke beside the paste; paste stripped, \
-                 row re-queued at its position: {}", abort.detail);
+                 row held for operator review (no automatic retry): {}", abort.detail);
         }
         DeliverOutcome::PaneMissing => {
             tracing::debug!(target: "server.send_queue", session = %id, qid = %head.id,
                 decision = "held:pane_missing", "pane not running; queued send waits");
         }
         DeliverOutcome::Failed(e) => {
-            // Typed-but-unconfirmed lands here too: the next tick finds the
-            // parked copy, classifies it as this row's own text and submits
-            // it with a bare Enter.
+            // A pre-paste claim survives every ambiguous result. The next
+            // tick holds the qid even if retirement failed or state reloads.
             tracing::warn!(target: "server.send_queue", session = %id, qid = %head.id,
                 decision = "failed", "queued send not delivered: {e}");
         }
