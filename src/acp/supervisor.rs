@@ -508,6 +508,14 @@ pub struct SpawnRequest {
     pub provider_env: Vec<(String, String)>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Provenance of `effort`: true only when the user explicitly set it
+    /// (persisted in `Instance.acp_effort`), making it a session pin that
+    /// survives a later model-pin change. A nonempty `effort` alone proves
+    /// nothing — the creation path forwards the daemon-resolved default
+    /// while `Instance.acp_effort` stays `None` — so an inherited effort
+    /// must read false and re-resolve against the pinned model on respawn.
+    /// See #3683 review.
+    pub effort_explicit: bool,
     /// ACP session id from a previous run; when `Some` and the agent
     /// advertises `load_session = true`, the spawn calls
     /// `LoadSessionRequest` instead of `NewSessionRequest`.
@@ -721,6 +729,42 @@ fn log_wrapper_substitution(session_id: &str, tool: &str, wrapper: &str, base: &
         base = %base,
         "agent_detect_as resolved this wrapper to its base for structured view; the wrapper binary will not be executed, so account, gateway, or env overrides it sets do not apply; set [session.agent_acp_cmd] to run the wrapper itself"
     );
+}
+
+/// Re-run the spawn model/effort resolution on a `SpawnConfig` cached at
+/// first launch, so a pin changed since then applies to the respawn. The
+/// cached values stand in for the original request. They are resolved
+/// values, so when the pin moves the model, the effort keyed on the new
+/// model replaces a cached effort keyed on the old one.
+fn refresh_spawn_model_effort(
+    config: &mut SpawnConfig,
+    defaults: Option<&crate::session::config::AcpAgentDefaults>,
+) {
+    let cached_model = config
+        .provider_env
+        .iter()
+        .find(|(key, _)| key == "AOE_AGENT_MODEL")
+        .map(|(_, value)| value.clone());
+    // An explicit effort is a session pin: it survives the model-pin move.
+    // Inherited effort re-resolves for the model the respawn runs on, the
+    // keyed entry when one exists or the ordinary fallback (`effort_for_model`)
+    // when it does not; passing no request effort lets the resolver do that.
+    let (model, effort) = if config.default_effort_explicit {
+        crate::session::config::resolve_spawn_model_effort(
+            defaults,
+            cached_model.clone(),
+            config.default_effort.take(),
+        )
+    } else {
+        crate::session::config::resolve_spawn_model_effort(defaults, cached_model.clone(), None)
+    };
+    config
+        .provider_env
+        .retain(|(key, _)| key != "AOE_AGENT_MODEL");
+    if let Some(model) = model {
+        config.provider_env.push(("AOE_AGENT_MODEL".into(), model));
+    }
+    config.default_effort = effort;
 }
 
 impl<S: BroadcastSink> Supervisor<S> {
@@ -1661,6 +1705,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             provider_env,
             model,
             effort,
+            effort_explicit,
             stored_acp_session_id,
             fork_from,
             sandbox_info,
@@ -1760,14 +1805,21 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
 
-        // Resolve the per-agent structured-view defaults once, at this single
-        // spawn choke point, so CLI create, reconciler respawn, and web create
-        // all honor the same model/effort/mode defaults. An explicit
-        // per-request model or effort wins; otherwise the configured default
-        // fills in. Mode has no per-request override today.
+        // Resolve the per-agent structured-view defaults at this single spawn
+        // choke point, so every create path honors the same model/effort/mode
+        // defaults and the same pin. A pin wins over everything; otherwise an
+        // explicit model or effort wins and the default fills in. Mode has no
+        // per-request override today. The worker's own respawn re-runs this
+        // on its cached config, see `refresh_spawn_model_effort`.
         // ponytail: resolve here instead of threading model/effort/mode through
         // every SpawnRequest site; revisit if explicit per-request values land.
         let acp_defaults = resolved_cfg.acp.acp_defaults_for(&agent);
+        // Provenance of the effort now going into the SpawnConfig: an
+        // explicit request effort is a session pin and must survive a later
+        // model-pin change on respawn; only inherited effort re-resolves.
+        // The flag travels on the request: a nonempty `effort` alone is not
+        // proof — the creation path forwards the daemon-resolved default
+        // while `Instance.acp_effort` is `None`.
         let (model, effort) =
             crate::session::config::resolve_spawn_model_effort(acp_defaults, model, effort);
         let default_mode = acp_defaults.and_then(|defaults| defaults.mode());
@@ -1906,6 +1958,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             provider_env: env,
             host_environment,
             default_effort: effort,
+            default_effort_explicit: effort_explicit,
             default_mode,
             socket_path: Some(socket_path),
             stored_acp_session_id: stored_acp_session_id.clone(),
@@ -2449,6 +2502,34 @@ impl<S: BroadcastSink> Supervisor<S> {
                             finish_cancelled(reason, None).await;
                         }
                         return;
+                    }
+
+                    // The cached config carries the first launch's model and
+                    // effort. Re-run the spawn resolution so a pin changed
+                    // since then applies to this launch too.
+                    let pin_agent = respawn_config.agent_key.clone();
+                    let pin_profile = respawn_config.source_profile.clone().unwrap_or_default();
+                    let pin_cwd = respawn_config.cwd.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                            &pin_profile,
+                            &pin_cwd,
+                        )
+                        .acp
+                        .acp_defaults_for(&pin_agent)
+                        .cloned()
+                    })
+                    .await
+                    {
+                        Ok(defaults) => {
+                            refresh_spawn_model_effort(&mut respawn_config, defaults.as_ref())
+                        }
+                        Err(e) => warn!(
+                            target: "acp.supervisor",
+                            session = %session_id,
+                            error = %e,
+                            "model re-resolution on respawn failed; keeping the cached model"
+                        ),
                     }
 
                     // Re-mint `before_session` env so a rotated credential
@@ -4245,6 +4326,185 @@ mod tests {
         }
     }
 
+    /// A respawn relaunches the `SpawnConfig` cached at first launch, so a
+    /// pin changed since then is re-applied to it, with the effort keyed on
+    /// the model it now launches on. Without a pin the cached values stand.
+    #[test]
+    fn respawn_refreshes_a_changed_pin_on_the_cached_config() {
+        use crate::session::config::AcpAgentDefaults;
+        let cached = SpawnConfig {
+            wrapper_substitution: None,
+            agent_key: "claude".into(),
+            tool: "claude".into(),
+            spec: spec("claude-agent-acp", &[]),
+            cwd: std::env::temp_dir(),
+            additional_dirs: vec![],
+            provider_env: vec![
+                ("AOE_AGENT_MODEL".into(), "model-a".into()),
+                ("OTHER".into(), "kept".into()),
+            ],
+            host_environment: vec![],
+            default_effort: Some("low".into()),
+            default_effort_explicit: false,
+            default_mode: None,
+            socket_path: None,
+            stored_acp_session_id: None,
+            fork_from: None,
+            seed_history_replay: false,
+            artifact_dir: None,
+            sandbox_info: None,
+            source_profile: None,
+            mcp_servers: Vec::new(),
+            generation: 0,
+        };
+        let pin = |model: &str| AcpAgentDefaults {
+            model: Some(model.into()),
+            pin_model: true,
+            effort: Some("low".into()),
+            effort_by_model: [("model-b".to_string(), "high".to_string())].into(),
+            ..Default::default()
+        };
+        let unpinned = AcpAgentDefaults {
+            model: Some("model-b".into()),
+            effort: Some("low".into()),
+            ..Default::default()
+        };
+
+        for (name, defaults, want_model, want_effort) in [
+            (
+                "pin moved to b",
+                Some(pin("model-b")),
+                "model-b",
+                Some("high"),
+            ),
+            ("pin still a", Some(pin("model-a")), "model-a", Some("low")),
+            // No configuration at all: the stale inherited effort must not
+            // fossilize; the respawn resolves to nothing.
+            ("no entry", None, "model-a", None),
+            ("plain default", Some(unpinned), "model-a", Some("low")),
+        ] {
+            let want_effort: Option<String> = want_effort.map(str::to_string);
+            let mut config = cached.clone();
+            refresh_spawn_model_effort(&mut config, defaults.as_ref());
+            let models: Vec<&str> = config
+                .provider_env
+                .iter()
+                .filter(|(key, _)| key == "AOE_AGENT_MODEL")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(models, [want_model], "{name}");
+            assert_eq!(config.default_effort, want_effort, "{name}");
+            assert!(
+                config
+                    .provider_env
+                    .contains(&("OTHER".into(), "kept".into())),
+                "{name}"
+            );
+        }
+    }
+
+    /// The creation handoff must carry effort provenance, not derive it from
+    /// the value: the create path forwards the daemon-resolved default while
+    /// `Instance.acp_effort` is `None`, so a nonempty `effort` is NOT a pin.
+    /// Drives the real `Supervisor::spawn` with the request the create path
+    /// sends, then asserts the installed SpawnConfig reads inherited.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn creation_handoff_keeps_resolved_default_effort_inherited() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4343);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control)
+                .with_launcher(gated_launcher(entered.clone(), gate.clone(), 4343)),
+        );
+
+        // What the create path sends: an effort that was resolved from the
+        // pinned model's defaults, with no user selection behind it.
+        let mut req = spawn_request("s-prov");
+        req.effort = Some("low".into());
+        req.effort_explicit = false;
+
+        // The launcher parks on the gate until released, so spawn runs
+        // beside this task like the create path's detached spawn does.
+        let spawner = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { sup.spawn(req).await })
+        };
+        entered.notified().await;
+        gate.notify_one();
+        spawner.await.unwrap().expect("spawn");
+
+        let config = sup
+            .workers
+            .lock()
+            .await
+            .get("s-prov")
+            .map(|handle| match &handle.kind {
+                WorkerKind::Runner { spawn_config } => spawn_config.default_effort_explicit,
+                _ => panic!("runner handle expected"),
+            })
+            .expect("worker installed");
+        assert!(
+            !config,
+            "a resolved default effort must not read as a session pin; \
+             the watchdog would refuse the new model's inherited effort"
+        );
+    }
+
+    /// An explicit request effort is a session pin (persisted in
+    /// `Instance.acp_effort`): a model pin that later moves re-resolves the
+    /// model but must not overwrite the effort the user asked for.
+    #[test]
+    fn respawn_keeps_an_explicit_effort_when_the_pin_changes() {
+        use crate::session::config::AcpAgentDefaults;
+        let cached = SpawnConfig {
+            wrapper_substitution: None,
+            agent_key: "claude".into(),
+            tool: "claude".into(),
+            spec: spec("claude-agent-acp", &[]),
+            cwd: std::env::temp_dir(),
+            additional_dirs: vec![],
+            provider_env: vec![("AOE_AGENT_MODEL".into(), "model-a".into())],
+            host_environment: vec![],
+            default_effort: Some("low".into()),
+            default_effort_explicit: true,
+            default_mode: None,
+            socket_path: None,
+            stored_acp_session_id: None,
+            fork_from: None,
+            seed_history_replay: false,
+            artifact_dir: None,
+            sandbox_info: None,
+            source_profile: None,
+            mcp_servers: Vec::new(),
+            generation: 0,
+        };
+        let pin = |model: &str| AcpAgentDefaults {
+            model: Some(model.into()),
+            pin_model: true,
+            effort_by_model: [("model-b".to_string(), "high".to_string())].into(),
+            ..Default::default()
+        };
+        let mut config = cached;
+        refresh_spawn_model_effort(&mut config, Some(&pin("model-b")));
+        let models: Vec<&str> = config
+            .provider_env
+            .iter()
+            .filter(|(key, _)| key == "AOE_AGENT_MODEL")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(models, ["model-b"], "the pin still moves the model");
+        assert_eq!(
+            config.default_effort.as_deref(),
+            Some("low"),
+            "an explicit effort must survive the pin move"
+        );
+    }
+
     fn ovr(tool: &str, command: &str) -> AgentCommandOverride {
         AgentCommandOverride {
             logical_tool: tool.into(),
@@ -4654,6 +4914,7 @@ mod tests {
                 provider_env: vec![],
                 model: None,
                 effort: None,
+                effort_explicit: false,
                 stored_acp_session_id: None,
                 fork_from: None,
                 seed_history_replay: false,
@@ -4905,6 +5166,7 @@ cursor-acp-bridge = "agent acp"
                 provider_env: vec![],
                 model: None,
                 effort: None,
+                effort_explicit: false,
                 stored_acp_session_id: None,
                 fork_from: None,
                 seed_history_replay: false,
@@ -4939,6 +5201,7 @@ cursor-acp-bridge = "agent acp"
                 provider_env: vec![],
                 model: None,
                 effort: None,
+                effort_explicit: false,
                 stored_acp_session_id: None,
                 fork_from: None,
                 seed_history_replay: false,
@@ -5163,6 +5426,7 @@ cursor-acp-bridge = "agent acp"
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
+            default_effort_explicit: false,
             default_mode: None,
             socket_path: Some(socket_path.clone()),
             stored_acp_session_id: None,
@@ -5258,6 +5522,7 @@ cursor-acp-bridge = "agent acp"
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
+            default_effort_explicit: false,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
@@ -5368,6 +5633,7 @@ cursor-acp-bridge = "agent acp"
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
+            default_effort_explicit: false,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
@@ -5446,6 +5712,7 @@ cursor-acp-bridge = "agent acp"
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
+            default_effort_explicit: false,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
@@ -5572,6 +5839,7 @@ cursor-acp-bridge = "agent acp"
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
+            default_effort_explicit: false,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
@@ -6595,6 +6863,7 @@ cursor-acp-bridge = "agent acp"
             provider_env: vec![],
             model: None,
             effort: None,
+            effort_explicit: false,
             stored_acp_session_id: None,
             fork_from: None,
             seed_history_replay: false,
@@ -6622,6 +6891,7 @@ cursor-acp-bridge = "agent acp"
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
+            default_effort_explicit: false,
             default_mode: None,
             socket_path: Some(socket_path),
             stored_acp_session_id: None,
@@ -7396,6 +7666,7 @@ cursor-acp-bridge = "agent acp"
                 provider_env: vec![],
                 model: None,
                 effort: None,
+                effort_explicit: false,
                 stored_acp_session_id: None,
                 fork_from: None,
                 seed_history_replay: false,
@@ -7474,6 +7745,7 @@ cursor-acp-bridge = "agent acp"
                 provider_env: vec![],
                 model: None,
                 effort: None,
+                effort_explicit: false,
                 stored_acp_session_id: None,
                 fork_from: None,
                 seed_history_replay: false,
