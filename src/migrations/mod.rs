@@ -38,6 +38,7 @@ mod v030_global_only_profile_settings;
 mod v031_conversation_provenance;
 mod v032_bound_capture_exclusions;
 pub(crate) mod v033_isolate_sandbox_content;
+mod v034_terminal_queue_receipts;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -83,7 +84,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 33;
+const CURRENT_VERSION: u32 = 34;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -206,6 +207,11 @@ const MIGRATIONS: &[Migration] = &[
         33,
         "isolate_sandbox_content",
         v033_isolate_sandbox_content::run,
+    ),
+    (
+        34,
+        "terminal_queue_receipts",
+        v034_terminal_queue_receipts::run,
     ),
 ];
 

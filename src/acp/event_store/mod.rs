@@ -4,6 +4,7 @@ mod attachments;
 mod rate_limit;
 mod replay;
 mod search;
+pub(crate) mod terminal_queue;
 mod turns;
 mod wakeups;
 
@@ -48,6 +49,7 @@ impl EventStore {
         // Prefix "acp" maps to the existing acp_events / acp_attachments tables.
         let schema = events::Schema::new("acp")?;
         let conn = events::open(db_path, &schema)?;
+        terminal_queue::initialize(&conn)?;
         let search_conn = Connection::open_with_flags(
             db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
