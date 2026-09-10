@@ -46,6 +46,17 @@ fn run_in(app_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// Older snapshots need not satisfy today's unrelated sandbox metadata.
+// Validate the fields that determine queue identity and terminal ownership.
+#[derive(serde::Deserialize)]
+struct LegacyQueueSession {
+    id: String,
+    #[serde(default)]
+    view: crate::session::View,
+    #[serde(default)]
+    queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
+}
+
 fn read_snapshot(path: &Path, queued: &mut Vec<(String, String)>) -> Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -54,16 +65,23 @@ fn read_snapshot(path: &Path, queued: &mut Vec<(String, String)>) -> Result<()> 
     }
     let bytes =
         fs::read(path).with_context(|| format!("read legacy queue snapshot {}", path.display()))?;
-    let instances: Vec<crate::session::Instance> = serde_json::from_slice(&bytes)
+    let instances: Vec<LegacyQueueSession> = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse legacy queue snapshot {}", path.display()))?;
     for instance in instances {
-        if !instance.is_structured() {
-            queued.extend(
-                instance
-                    .queued_prompts
-                    .into_iter()
-                    .map(|prompt| (instance.id.clone(), prompt.id)),
-            );
+        anyhow::ensure!(
+            !instance.id.is_empty(),
+            "empty legacy session id in {}",
+            path.display()
+        );
+        if instance.view != crate::session::View::Structured {
+            for prompt in instance.queued_prompts {
+                anyhow::ensure!(
+                    !prompt.id.is_empty(),
+                    "empty legacy qid in {}",
+                    path.display()
+                );
+                queued.push((instance.id.clone(), prompt.id));
+            }
         }
     }
     Ok(())
@@ -117,7 +135,11 @@ mod tests {
         fs::write(&snapshot, &original).unwrap();
         fs::write(
             dir.path().join("sessions.json"),
-            serde_json::to_vec(&vec![session("root", &["old"])]).unwrap(),
+            serde_json::to_vec(&serde_json::json!([{
+                "id": "root", "sandbox": {"enabled": true},
+                "queued_prompts": session("root", &["old"]).queued_prompts
+            }]))
+            .unwrap(),
         )
         .unwrap();
         run_in(dir.path()).unwrap();
