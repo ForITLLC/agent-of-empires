@@ -1090,10 +1090,13 @@ impl SessionService {
         self: &Arc<Self>,
         id: &str,
         prompt_id: String,
-    ) -> bool {
+    ) -> anyhow::Result<bool> {
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
-            return false;
+            return Ok(false);
         };
+        // Tombstone first, even if a stale in-memory snapshot lost the row.
+        // Failure must reach the caller, never acknowledge a non-durable drop.
+        self.acp_event_store.drop_terminal_prompt(id, &prompt_id)?;
         let prompt_id_cleanup = prompt_id.clone();
         let removed = self
             .mutate_instance_persisted(id, move |inst| {
@@ -1107,7 +1110,7 @@ impl SessionService {
             self.acp_event_store
                 .delete_pending_attachments_for_ref(id, &prompt_id_cleanup);
         }
-        removed
+        Ok(removed)
     }
 
     /// Drop every queued prompt for a session, plus every attachment blob
@@ -1117,10 +1120,13 @@ impl SessionService {
     /// inside the drain's snapshot-to-send window empties the durable rows
     /// while the batch the drain already copied still goes to the agent, so
     /// the user watches the queue empty and then sees it sent anyway.
-    pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
+    pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) -> anyhow::Result<()> {
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
-            return;
+            return Ok(());
         };
+        for row in self.queued_prompts_snapshot(id).await {
+            self.acp_event_store.drop_terminal_prompt(id, &row.id)?;
+        }
         let cleared_ids = self
             .mutate_instance_persisted(id, move |inst| {
                 let ids: Vec<String> = inst.queued_prompts.iter().map(|q| q.id.clone()).collect();
@@ -1133,6 +1139,7 @@ impl SessionService {
             self.acp_event_store
                 .delete_pending_attachments_for_ref(id, &prompt_id);
         }
+        Ok(())
     }
 
     /// Snapshot the session's queue, ordered by `seq`.
@@ -2425,7 +2432,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), clear)
             .await
             .expect("the clear lands once the delivery releases the session")
-            .expect("clear task must not panic");
+            .expect("clear task must not panic")
+            .expect("clear must persist");
         assert!(service.queued_prompts_snapshot("sess-mut").await.is_empty());
     }
 
@@ -2780,12 +2788,18 @@ mod tests {
             Some("second edited"),
             "a refused edit must not have mutated the row"
         );
-        assert!(service.remove_queued_prompt("sess-q", "a".into()).await);
-        assert!(!service.remove_queued_prompt("sess-q", "a".into()).await);
+        assert!(service
+            .remove_queued_prompt("sess-q", "a".into())
+            .await
+            .unwrap());
+        assert!(!service
+            .remove_queued_prompt("sess-q", "a".into())
+            .await
+            .unwrap());
         let snap = service.queued_prompts_snapshot("sess-q").await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].text, "second edited");
-        service.clear_queued_prompts("sess-q").await;
+        service.clear_queued_prompts("sess-q").await.unwrap();
         assert!(service.queued_prompts_snapshot("sess-q").await.is_empty());
 
         // A gone session is a None/no-op, never a panic.

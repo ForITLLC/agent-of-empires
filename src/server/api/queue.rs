@@ -109,6 +109,27 @@ pub async fn queue_enqueue(
     // `buffer_and_enqueue` because the prompt endpoint's `Queued` disposition
     // reaches that helper already holding the guard, and it is not reentrant.
     let _submission = state.session_service.prompt_submission(&id).await;
+    match state.acp_event_store.terminal_prompt_receipt(&id, &req.id) {
+        Ok(Some(disposition)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(
+                    serde_json::json!({"error": "queue_id_consumed", "queue_id": req.id,
+                "disposition": disposition, "retry_safe": false}),
+                ),
+            )
+                .into_response()
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%error, session = %id, "queue receipt lookup failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "queue receipt lookup failed",
+            )
+                .into_response();
+        }
+    }
     // Depth cap. Re-enqueuing an existing id replaces that row rather than
     // adding one, so it must not count against a full queue.
     {
@@ -296,14 +317,21 @@ pub async fn queue_remove(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    if state
+    match state
         .session_service
         .remove_queued_prompt(&id, prompt_id)
         .await
     {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "queued prompt not found").into_response()
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "queued prompt not found").into_response(),
+        Err(error) => {
+            tracing::error!(%error, session = %id, "queue drop could not persist its receipt");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "queue drop was not durably recorded",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -315,8 +343,17 @@ pub async fn queue_clear(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    state.session_service.clear_queued_prompts(&id).await;
-    StatusCode::NO_CONTENT.into_response()
+    match state.session_service.clear_queued_prompts(&id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, session = %id, "queue clear could not persist its receipts");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "queue clear was not durably recorded",
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]

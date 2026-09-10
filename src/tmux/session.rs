@@ -10,10 +10,10 @@ use super::{
     composer::{
         classify_machine_draft, claude_composer_draft, claude_composer_draft_region,
         claude_message_stuck_in_composer, claude_pane_input_ready, composer_clear_for_delivery,
-        paste_residue, restore_verdict, strip_whitespace, MachineDraft, ParkedDraftRefusal,
-        PasteResidue, SubmitUnconfirmed, ABORT_MAX_ROUNDS, DRAFT_TIMEOUT, MAX_SUBMIT_RETRIES,
-        PRE_ENTER_CAPTURE_LINES, PRE_ENTER_REGION, PRE_ENTER_RENDER_GRACE, READY_POLL,
-        READY_TIMEOUT, VERIFY_CAPTURE_LINES, VERIFY_SETTLE,
+        paste_residue, queued_composer, queued_pane_is_idle, restore_verdict, strip_whitespace,
+        MachineDraft, ParkedDraftRefusal, PasteResidue, SubmitUnconfirmed, ABORT_MAX_ROUNDS,
+        DRAFT_TIMEOUT, MAX_SUBMIT_RETRIES, PRE_ENTER_CAPTURE_LINES, PRE_ENTER_REGION,
+        PRE_ENTER_RENDER_GRACE, READY_POLL, READY_TIMEOUT, VERIFY_CAPTURE_LINES, VERIFY_SETTLE,
     },
     composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
@@ -46,6 +46,10 @@ pub enum GuardedSend {
     /// A human's bytes appeared beside the paste before Enter. Nothing was
     /// submitted; the paste was stripped and the human's bytes restored.
     Aborted(KeystrokeAbort),
+    /// The delivery boundary ceased to be idle and empty; no input sent.
+    NotReady,
+    /// This qid was already claimed or dropped, including before a restart.
+    AlreadyAttempted,
 }
 
 /// Counts describing an aborted delivery. Never the human's text.
@@ -1538,8 +1542,8 @@ impl Session {
     /// capture, no waiting (see [`composer_clear_for_delivery`]). The queue
     /// drain asks this every tick for every session holding a queue, so a
     /// pane whose operator is mid-sentence costs one capture per tick, not a
-    /// ten-second draft wait. Tools other than Claude have no composer read
-    /// here and are always clear. A pane that does not exist is never clear:
+    /// ten-second draft wait. Tools without a verified composer reader fail
+    /// closed. A pane that does not exist is never clear:
     /// there is nothing to deliver into, and the drain does not revive.
     pub fn composer_clear_for_delivery(
         &self,
@@ -1551,9 +1555,10 @@ impl Session {
             return Ok(false);
         }
         if tool != "claude" {
-            return Ok(true);
+            // No verified composer reader for this tool: unknown is not empty.
+            return Ok(false);
         }
-        let content = self.capture_pane(VERIFY_CAPTURE_LINES)?;
+        let content = self.capture_pane(PRE_ENTER_CAPTURE_LINES)?;
         Ok(composer_clear_for_delivery(&content, text, machine_history))
     }
 
@@ -1645,38 +1650,27 @@ impl Session {
         Ok(ComposerPrep::Clear)
     }
 
-    /// A queued delivery's verified send with the keystroke-race guard
-    /// (WO#1897-R): phases 1-2 as [`send_keys_verified_with_history`]
-    /// (Self::send_keys_verified_with_history), then the text is typed
-    /// WITHOUT Enter, the composer is given `settle` to render it, and it is
-    /// read back and decomposed against the text ([`paste_residue`]). Only a
-    /// composer holding exactly the paste gets the Enter, immediately after
-    /// that read. Any other byte beside the paste is a human's keystroke:
-    /// the paste is removed, the human's bytes are restored, nothing is
-    /// submitted, and the caller re-queues the row.
-    ///
-    /// Two shapes the read cannot decide are handled explicitly and logged:
-    /// a composer whose region is clipped past the capture (a very long
-    /// inline paste) is submitted as before, a documented limitation; text
-    /// the paste does not explain at all withholds the Enter and leaves the
-    /// row queued for the next tick's classification.
+    /// One claimed queued attempt. Never adopts parked machine text, guesses
+    /// a clipped paste is complete, or retries Enter after an ambiguous submit.
+    /// The claim must commit before typing; every subsequent exit consumes it.
     pub fn send_keys_verified_guarded(
         &self,
         text: &str,
         enter_delay_ms: u64,
         tool: &str,
-        machine_history: &[String],
         settle: Duration,
+        claim: impl FnOnce() -> Result<bool>,
     ) -> Result<GuardedSend> {
-        if tool != "claude" {
-            self.send_keys_with_delay(text, enter_delay_ms)?;
-            return Ok(GuardedSend::Delivered);
+        if !self.composer_clear_for_delivery(text, tool, &[])? {
+            return Ok(GuardedSend::NotReady);
         }
-        if !self.exists() {
-            bail!("Session does not exist: {}", self.name);
+        if !claim()? {
+            return Ok(GuardedSend::AlreadyAttempted);
         }
-        if let ComposerPrep::Submitted = self.prepare_composer(text, tool, machine_history)? {
-            return Ok(GuardedSend::Delivered);
+        // The durable write took time. Re-read the live pane after it and
+        // immediately before pasting, even though the quiet gate passed.
+        if !self.composer_clear_for_delivery(text, tool, &[])? {
+            return Ok(GuardedSend::NotReady);
         }
 
         let target = format!("{}:^.0", self.name);
@@ -1688,8 +1682,17 @@ impl Session {
         loop {
             // This read is the "still clear immediately before Enter" check:
             // the Enter below follows it by one tmux call.
-            let draft = self.pre_enter_draft()?;
-            match paste_residue(draft.as_deref(), text) {
+            let content = self.capture_pane(PRE_ENTER_CAPTURE_LINES)?;
+            if !queued_pane_is_idle(&content) {
+                bail!("agent no longer positively idle; Enter withheld, attempt held for review");
+            }
+            let draft = queued_composer(&content);
+            let residue = if draft.is_some() {
+                paste_residue(draft.as_deref().filter(|d| !d.is_empty()), text)
+            } else {
+                PasteResidue::Unverifiable
+            };
+            match residue {
                 PasteResidue::Clean { chip } => {
                     tracing::debug!(target: "tmux.command",
                         "guarded send: composer holds exactly the paste (chip={chip}) in {}; submitting",
@@ -1709,38 +1712,27 @@ impl Session {
                         std::thread::sleep(Duration::from_millis(100));
                         continue;
                     }
-                    match draft {
-                        None => {
-                            // The paste is gone without our Enter: the pane
-                            // submitted it (a human Enter, or a boot-time
-                            // mode churn). Nothing is left to type; treating
-                            // it as undelivered would paste it twice.
-                            tracing::warn!(target: "tmux.command",
-                                "guarded send: paste vanished from {} before Enter; treating as submitted",
-                                self.name);
-                            return Ok(GuardedSend::Delivered);
-                        }
-                        Some(_) => {
-                            tracing::warn!(target: "tmux.command",
-                                "guarded send: composer region in {} is clipped past {} rows; residue check \
-                                 cannot see its end (documented limitation); submitting",
-                                self.name, PRE_ENTER_REGION);
-                            break;
-                        }
-                    }
+                    bail!("queued paste is missing or clipped; Enter withheld, attempt held for review");
                 }
                 PasteResidue::Unverifiable => {
                     tracing::warn!(target: "tmux.command",
                         "guarded send: composer text in {} does not match the paste; Enter withheld, \
-                         row stays queued for the next classification",
+                         attempt held for review without retry",
                         self.name);
                     bail!("pre-Enter composer read unverifiable; Enter withheld");
                 }
             }
         }
         Self::tmux_send(&target, &["Enter"])?;
-        self.confirm_submitted(text, tool, false)?;
-        Ok(GuardedSend::Delivered)
+        // Observe once. A swallowed Enter is ambiguous, never permission to
+        // press Enter again on a composer the operator may have started using.
+        std::thread::sleep(VERIFY_SETTLE);
+        let content = self.capture_pane(PRE_ENTER_CAPTURE_LINES)?;
+        if queued_composer(&content).is_some_and(|draft| draft.is_empty()) {
+            Ok(GuardedSend::Delivered)
+        } else {
+            bail!("queued submit unconfirmed; attempt held for review without retry")
+        }
     }
 
     /// The composer's content for the pre-Enter check: a deeper capture and

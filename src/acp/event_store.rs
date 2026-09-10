@@ -56,6 +56,8 @@ use super::approvals::Nonce;
 use super::state::{Event, Plan, RateLimitInfo};
 use crate::events::{self, Order, SeqBound};
 
+pub(crate) mod terminal_queue;
+
 /// Externally-tagged JSON discriminants for non-substantive structured view
 /// events: lifecycle and metadata snapshots the agent emits once per
 /// session (or on every cold-start resume) that must not count as session
@@ -188,6 +190,7 @@ impl EventStore {
         // tables, so an established database opens unchanged (no migration).
         let schema = events::Schema::new("acp")?;
         let conn = events::open(db_path, &schema)?;
+        terminal_queue::initialize(&conn)?;
         // Separate read-only handle for content search; the writer above
         // already created the file and tables, so opening read-only here
         // always succeeds. query_only is belt-and-suspenders on top of the
