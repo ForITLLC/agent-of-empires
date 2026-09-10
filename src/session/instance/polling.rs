@@ -105,31 +105,36 @@ fn try_acquire_managed_capture_lease(
 /// The tmux session name to seed a session-id poller with, or `None` when
 /// this instance has no agent pane for one to follow.
 ///
-/// `live_any_kind` is the live name of any kind carrying the id (agent, else a
-/// paired terminal, else a container terminal); `derived` is the title-derived
-/// name, asked only when nothing is live yet so a poller started alongside its
-/// tmux session still gets a target. Both are filtered to the agent shape: a
-/// poller seeded with a terminal name re-resolves to that same live name every
-/// tick, probes `Alive`, and so never terminates, holding a budget slot for an
-/// agent that is gone while reading session-id state off the wrong pane.
+/// `live_agent` is the live agent session for the id, which a fresh scan
+/// classifies by the kind each session was stamped with at creation. It is
+/// decisive: a row whose agent pane is gone has nothing a session-id poller
+/// can follow, however many paired terminals outlived it. Seeded with one of
+/// those, a poller re-resolves to that same live name every tick, probes
+/// `Alive`, and so never terminates, holding a budget slot for an agent that
+/// is gone while reading session-id state off the wrong pane (#3880).
 ///
-/// A live terminal is a decisive answer rather than a reason to fall back: it
-/// is only reached when the agent pane is absent or dead, and the derived name
-/// would then name a session that is not running.
+/// `derived` is the title-derived agent name, asked only when the scan found
+/// nothing live for the id: a poller started alongside its own tmux session
+/// still needs a target, and `MISSING_TARGET_GRACE` covers the race. It keeps
+/// the name-shape filter because there is no live session to read a kind
+/// marker from, so a title sanitizing under an auxiliary prefix fails closed
+/// there (see `tmux::session_kind`).
 ///
-/// Fails closed for a title sanitizing under the agent shape's excluded
-/// prefixes: its own agent name reads as a paired terminal's, so such a
-/// session runs no session-id poller at all. See
-/// `tmux::live_agent_name_for_id_in` for why that ambiguity has no cheaper
-/// answer.
+/// A scan that found panes for the id but no agent among them is not that
+/// case: the derived name would then be a session that is not running, and a
+/// poller on it burns a budget slot until `MISSING_TARGET_GRACE` expires.
 fn poller_seed_name(
-    live_any_kind: Option<String>,
+    live: AgentSeed,
     derived: impl FnOnce() -> Option<String>,
     session_id: &str,
 ) -> Option<String> {
-    live_any_kind
-        .or_else(derived)
-        .filter(|name| crate::tmux::agent_session_belongs_to(name, session_id))
+    match live {
+        AgentSeed::Agent(name) => Some(name),
+        AgentSeed::OtherKindOnly => None,
+        AgentSeed::NothingLive => {
+            derived().filter(|name| crate::tmux::agent_session_belongs_to(name, session_id))
+        }
+    }
 }
 
 impl Instance {
@@ -343,7 +348,7 @@ impl Instance {
         // reported as over budget, and the next repair tick stops looking once
         // its own snapshot agrees the agent pane is gone.
         let Some(tmux_session_name) = poller_seed_name(
-            self.tmux_env_session_name(),
+            self.live_agent_seed(),
             || self.tmux_session().ok().map(|s| s.name().to_string()),
             &self.id,
         ) else {
@@ -1051,40 +1056,64 @@ mod tests {
         );
     }
 
-    /// The seed must name the AGENT pane whichever arm answers. A paired or
-    /// container terminal outliving its agent still answers the live lookup,
-    /// and a poller seeded with that name re-resolves to it forever.
+    /// The live arm is decisive and the derived arm is the fallback only when
+    /// the scan found nothing live at all. The live arm's own filtering is the
+    /// kind-aware scan in `tmux::live_agent_name_for_id`, pinned there; here
+    /// the seed must take whatever agent name that scan returns, including one
+    /// whose sanitized title reads as a paired terminal's, and must not fall
+    /// back to a derived name for a row whose agent pane is gone.
     #[test]
-    fn poller_seed_name_accepts_only_an_agent_name() {
+    fn poller_seed_name_prefers_the_live_agent_and_falls_back_to_the_derived_name() {
         const ID: &str = "9f2c41d6-0000-4000-8000-000000000001";
         let agent = crate::tmux::Session::generate_name(ID, "Vikings");
-        let terminal = crate::tmux::TerminalSession::generate_name(ID, "Vikings");
-        let container = crate::tmux::ContainerTerminalSession::generate_name(ID, "Vikings");
-        // A title sanitizing under TERMINAL_PREFIX makes even the agent's own
-        // name unrecognizable as one.
+        let renamed = crate::tmux::Session::generate_name(ID, "Vikings the sequel");
+        // A title sanitizing under TERMINAL_PREFIX: the agent name the name
+        // shape alone refuses, which the live scan now answers with because
+        // the session says what kind it is.
         let aux_shaped = crate::tmux::Session::generate_name(ID, "term rewriting");
 
-        // (case, live name of any kind, derived name, expected seed)
-        type Case<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>);
-        let cases: &[Case] = &[
-            ("agent pane live", Some(&agent), Some(&agent), Some(&agent)),
+        // (case, what the live scan says, derived name, expected seed)
+        type Case<'a> = (&'a str, super::AgentSeed, Option<&'a str>, Option<&'a str>);
+        let cases: Vec<Case> = vec![
             (
-                "only a paired terminal live",
-                Some(&terminal),
+                "agent pane live",
+                super::AgentSeed::Agent(agent.clone()),
                 Some(&agent),
-                None,
+                Some(&agent),
             ),
             (
-                "only a container terminal live",
-                Some(&container),
+                "live agent under its pre-rename name",
+                super::AgentSeed::Agent(agent.clone()),
+                Some(&renamed),
                 Some(&agent),
-                None,
             ),
-            ("nothing live yet", None, Some(&agent), Some(&agent)),
-            ("nothing live and no derived name", None, None, None),
             (
-                "aux-shaped title",
+                "live agent whose title reads as a terminal",
+                super::AgentSeed::Agent(aux_shaped.clone()),
                 Some(&aux_shaped),
+                Some(&aux_shaped),
+            ),
+            (
+                "only a terminal outlived the agent",
+                super::AgentSeed::OtherKindOnly,
+                Some(&agent),
+                None,
+            ),
+            (
+                "nothing live yet",
+                super::AgentSeed::NothingLive,
+                Some(&agent),
+                Some(&agent),
+            ),
+            (
+                "nothing live and no derived name",
+                super::AgentSeed::NothingLive,
+                None,
+                None,
+            ),
+            (
+                "nothing live and an aux-shaped derived name",
+                super::AgentSeed::NothingLive,
                 Some(&aux_shaped),
                 None,
             ),
@@ -1092,16 +1121,53 @@ mod tests {
 
         for (case, live, derived, expected) in cases {
             assert_eq!(
-                super::poller_seed_name(
-                    live.map(str::to_string),
-                    || derived.map(str::to_string),
-                    ID,
-                )
-                .as_deref(),
-                *expected,
+                super::poller_seed_name(live, || derived.map(str::to_string), ID).as_deref(),
+                expected,
                 "{case}"
             );
         }
+    }
+
+    /// #3888 end to end: a row titled `term rewriting` whose agent session is
+    /// live and marked gets a poller, on that session. Before the kind
+    /// marker its own agent name was indistinguishable from a paired
+    /// terminal's, so every start declined and the row captured no
+    /// conversation id.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn an_aux_shaped_title_polls_its_marked_agent_pane() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
+        let temp = tempfile::tempdir().unwrap();
+        let mut inst = Instance::new("term rewriting", "/tmp/aux-shaped-title");
+        inst.tool = "claude".to_string();
+        let live_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        assert!(
+            !crate::tmux::agent_session_belongs_to(&live_name, &inst.id),
+            "fixture: this title's agent name is one the name shape refuses"
+        );
+
+        // A `tmux` answering every query with that one session, marked as the
+        // agent, which is what the real `list-sessions -F` scan reads back.
+        let shim = temp.path().join("tmux");
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\necho '{live_name}|1789065184|agent'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _guard = crate::session::test_support::EnvGuard::set(&[("PATH", path)]);
+
+        assert_eq!(inst.maybe_start_poller(), PollerStart::Started);
+        assert!(inst.session_id_poller_is_running());
+        inst.stop_poller();
     }
 
     /// The race #3880 describes: repair sees a live agent pane in its
