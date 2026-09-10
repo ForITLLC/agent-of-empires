@@ -14,6 +14,11 @@ Database errors fail closed.
 
 The dispositions are:
 
+- `legacy_uncertain`: v029 found this terminal row in a pre-upgrade snapshot.
+  The old daemon may already have pasted it, so it is held for review without
+  another attempt. Migration includes archived/snoozed terminal queues and
+  the legacy root snapshot, excludes structured ACP, and preserves all text
+  and existing receipts. Unreadable or malformed snapshots abort migration.
 - `claimed`: an attempt may have reached the terminal. A crash, failed
   readback, swallowed Enter, or keystroke abort leaves it held for operator
   review. There is no automatic second paste or recovery Enter.
