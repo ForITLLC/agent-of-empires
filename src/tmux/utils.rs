@@ -380,6 +380,159 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The tmux glob matching sessions aoe manages.
+fn managed_session_glob() -> String {
+    format!("{}*", crate::tmux::SESSION_PREFIX)
+}
+
+/// A managed session entered by switch-client returns to its caller.
+fn detach_return_condition(managed_glob: &str) -> String {
+    format!(
+        "#{{&&:#{{m:{glob},#{{session_name}}}},\
+         #{{&&:#{{!=:#{{client_last_session}},}},\
+         #{{==:#{{m:{glob},#{{client_last_session}}}},0}}}}}}",
+        glob = managed_glob
+    )
+}
+
+/// Dashboard prefix-d must keep the client attached, including on a mosh login.
+fn detach_return_binding(own_condition: &str) -> [String; 5] {
+    [
+        "if-shell".into(),
+        "-F".into(),
+        "#{||:#{==:#{pane_current_command},aoe},#{m/r:^(cx|aoe|moshi_cx|moshi_aoe)$,#{session_name}}}".into(),
+        "display-message 'Already at the AoE dashboard'".into(),
+        format!("if-shell -F '{own_condition}' 'switch-client -l' 'detach-client'"),
+    ]
+}
+
+/// Split one `tmux list-keys` line into its arguments, undoing tmux's own
+/// quoting (`args_escape`: a double-quoted word with backslash escapes, a
+/// single-quoted word, or a bare word) so a binding can be compared with
+/// aoe's own token for token.
+fn split_tmux_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_word = true;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(n) = chars.next() {
+                                cur.push(n);
+                            }
+                        }
+                        _ => cur.push(c),
+                    }
+                }
+            }
+            '\'' => {
+                in_word = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    cur.push(c);
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            _ => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    words
+}
+
+/// Replace only an unbound key, stock detach, or an exact current/previous
+/// aoe binding. Custom conditions and commands remain the user's choice.
+fn should_install_detach_return(list_keys_output: &str, own_condition: &str) -> bool {
+    let line = list_keys_output.trim();
+    if line.is_empty() {
+        return true;
+    }
+    let toks = split_tmux_words(line);
+    let Some(i) = toks
+        .windows(2)
+        .position(|w| w[0] == "prefix" && w[1] == "d")
+    else {
+        return false;
+    };
+    let bound: Vec<&str> = toks[i + 2..].iter().map(String::as_str).collect();
+    let current_binding = detach_return_binding(own_condition);
+    bound
+        == current_binding
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+        || bound == ["detach-client"]
+        || bound
+            == [
+                "if-shell",
+                "-F",
+                own_condition,
+                "switch-client -l",
+                "detach-client",
+            ]
+}
+
+/// Restore the dashboard/return binding on TUI startup and every attach.
+/// Custom bindings are preserved; errors never prevent opening a session.
+pub(crate) fn install_detach_return_binding() {
+    let listing = match crate::tmux::tmux_command()
+        .args(["list-keys", "-T", "prefix", "d"])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(e) => {
+            tracing::debug!(target: "tmux.attach", "list-keys prefix d failed: {e}");
+            return;
+        }
+    };
+    let cond = detach_return_condition(&managed_session_glob());
+    if !should_install_detach_return(&listing, &cond) {
+        tracing::debug!(
+            target: "tmux.attach",
+            "prefix d is user-bound ({}); leaving it alone",
+            listing.trim()
+        );
+        return;
+    }
+    match crate::tmux::tmux_command()
+        .args(["bind-key", "-T", "prefix", "d"])
+        .args(detach_return_binding(&cond))
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => tracing::debug!(
+            target: "tmux.attach",
+            "bind-key prefix d failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => tracing::debug!(target: "tmux.attach", "bind-key prefix d failed: {e}"),
+    }
+}
+
 /// Convert tmux's raw prefix notation (e.g. "C-a", "M-b", "F12") to the
 /// display form shown in UI hints. Preserves case from tmux so users see the
 /// same letter they typed in `~/.tmux.conf`.
@@ -972,5 +1125,217 @@ mod tests {
             "title\n",
             "a newline the title itself carried must survive"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn detach_return_keeps_the_same_client_on_the_dashboard_after_reload_and_restart() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("Skipping: tmux unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("tmux.sock");
+        let config = dir.path().join("tmux.conf");
+        struct Server<'a>(&'a std::path::Path);
+        impl Drop for Server<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["-S", self.0.to_str().unwrap(), "kill-server"])
+                    .output();
+            }
+        }
+        let _server = Server(&socket);
+        let tmux = |args: &[&str]| {
+            let out = Command::new("tmux")
+                .args([
+                    "-S",
+                    socket.to_str().unwrap(),
+                    "-f",
+                    config.to_str().unwrap(),
+                ])
+                .args(args)
+                .env_remove("TMUX")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let cond = detach_return_condition("aoe_*");
+        let command = detach_return_binding(&cond)
+            .iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        std::fs::write(&config, format!("bind-key -T prefix d {command}\n")).unwrap();
+        let wait_client = |expected: &str| {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let clients = tmux(&["list-clients", "-F", "#{client_name} #{session_name}"]);
+                if clients.split_whitespace().nth(1) == Some(expected) {
+                    break clients.split_whitespace().next().unwrap().to_owned();
+                }
+                assert!(
+                    Instant::now() < until,
+                    "expected {expected}, clients={clients:?}"
+                );
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        };
+        for restart in 0..2 {
+            tmux(&["new-session", "-d", "-s", "cx", "sleep", "60"]);
+            tmux(&["new-session", "-d", "-s", "aoe_agent", "sleep", "60"]);
+            tmux(&[
+                "new-session",
+                "-d",
+                "-s",
+                "host",
+                "env",
+                "-u",
+                "TMUX",
+                "tmux",
+                "-S",
+                socket.to_str().unwrap(),
+                "attach-session",
+                "-t",
+                "=cx",
+            ]);
+            let client = wait_client("cx");
+            assert!(should_install_detach_return(
+                &tmux(&["list-keys", "-T", "prefix", "d"]),
+                &cond
+            ));
+            for dashboard in ["cx", "aoe", "moshi_cx", "moshi_aoe"] {
+                if dashboard != "cx" {
+                    tmux(&["new-session", "-d", "-s", dashboard, "sleep", "60"]);
+                }
+                tmux(&[
+                    "switch-client",
+                    "-c",
+                    &client,
+                    "-t",
+                    &format!("={dashboard}"),
+                ]);
+                tmux(&["switch-client", "-c", &client, "-t", "=aoe_agent"]);
+                tmux(&["send-keys", "-t", "host:0.0", "C-b", "d"]);
+                assert_eq!(wait_client(dashboard), client);
+                tmux(&["source-file", config.to_str().unwrap()]);
+                for _ in 0..3 {
+                    tmux(&["send-keys", "-t", "host:0.0", "C-b", "d"]);
+                    // Let tmux dispatch the key before checking the client still exists.
+                    std::thread::sleep(Duration::from_millis(80));
+                    assert_eq!(wait_client(dashboard), client);
+                }
+            }
+            tmux(&["kill-server"]);
+            if restart == 0 {
+                // The next server must load the binding from its config again.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    /// Only tmux's stock `detach-client`, an unbound key, or aoe's own
+    /// binding (exact condition AND both branches) may be rebound.
+    #[test]
+    fn should_install_detach_return_only_over_stock_or_own_binding() {
+        let cond = detach_return_condition("aoe_*");
+        assert!(should_install_detach_return("", &cond));
+        assert!(should_install_detach_return(
+            "bind-key -T prefix d detach-client\n",
+            &cond
+        ));
+        assert!(should_install_detach_return(
+            "bind-key    -T prefix d                    detach-client",
+            &cond
+        ));
+        // aoe's own binding, exactly as tmux 3.4 lists it back
+        let own = format!(
+            r#"bind-key -T prefix d if-shell -F "{cond}" "switch-client -l" detach-client"#
+        );
+        assert!(should_install_detach_return(&own, &cond));
+        assert!(!should_install_detach_return(
+            "bind-key -T prefix d kill-session",
+            &cond
+        ));
+        assert!(!should_install_detach_return(
+            "bind-key -T prefix d run-shell my-script",
+            &cond
+        ));
+        assert!(!should_install_detach_return(
+            "bind-key -T prefix d detach-client -a",
+            &cond
+        ));
+    }
+
+    /// A user's own `if-shell` binding that merely contains `switch-client -l`
+    /// — a different condition, a different fallback, or a missing one — is
+    /// theirs and must never be replaced.
+    #[test]
+    fn should_install_detach_return_leaves_custom_switch_client_bindings_alone() {
+        let cond = detach_return_condition("aoe_*");
+        assert!(!should_install_detach_return(
+            r##"bind-key -T prefix d if-shell -F "#{&&:x}" "switch-client -l" detach-client"##,
+            &cond
+        ));
+        assert!(!should_install_detach_return(
+            "bind-key -T prefix d if-shell -F '#{==:1,1}' 'switch-client -l' detach-client",
+            &cond
+        ));
+        assert!(!should_install_detach_return(
+            &format!(
+                r#"bind-key -T prefix d if-shell -F "{cond}" "switch-client -l" kill-session"#
+            ),
+            &cond
+        ));
+        assert!(!should_install_detach_return(
+            &format!(r#"bind-key -T prefix d if-shell -F "{cond}" "switch-client -l""#),
+            &cond
+        ));
+        assert!(!should_install_detach_return(
+            &format!(
+                r#"bind-key -T prefix d if-shell -F "{cond}" "switch-client -l -t other" detach-client"#
+            ),
+            &cond
+        ));
+        assert!(!should_install_detach_return(
+            "bind-key -T prefix d switch-client -l",
+            &cond
+        ));
+    }
+
+    /// `list-keys` output is split the way tmux quoted it: double quotes with
+    /// backslash escapes, single quotes verbatim, bare words on whitespace.
+    #[test]
+    fn split_tmux_words_undoes_tmux_quoting() {
+        assert_eq!(
+            split_tmux_words(
+                r##"bind-key -T prefix d if-shell -F "#{a,b}" "switch-client -l" detach-client"##
+            ),
+            [
+                "bind-key",
+                "-T",
+                "prefix",
+                "d",
+                "if-shell",
+                "-F",
+                "#{a,b}",
+                "switch-client -l",
+                "detach-client"
+            ]
+        );
+        assert_eq!(
+            split_tmux_words(r#"a "b \"c\" d" 'e f' g\ h"#),
+            ["a", "b \"c\" d", "e f", "g h"]
+        );
+        assert_eq!(split_tmux_words("   "), Vec::<String>::new());
     }
 }
