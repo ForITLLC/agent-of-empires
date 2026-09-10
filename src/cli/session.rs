@@ -657,6 +657,11 @@ async fn queue_drop(identifier: &str, qid: &str) -> Result<()> {
     }
     let storage = Storage::open_unwatched(&profile)?;
     let target = inst.id.clone();
+    let receipts = crate::acp::event_store::EventStore::open(
+        &crate::session::get_app_dir()?.join("acp_events.db"),
+        1000,
+    )?;
+    receipts.drop_terminal_prompt(&target, qid)?;
     let found = storage.update(|instances, _groups| {
         Ok(instances
             .iter_mut()
