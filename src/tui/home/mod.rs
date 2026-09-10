@@ -108,6 +108,12 @@ pub(super) struct GroupRenameContext {
     pub(super) old_profile: String,
 }
 
+/// Destination for a response from the shared permission dialog.
+pub(super) enum PermissionResponseTarget {
+    Terminal(String),
+    Structured { session_id: String, nonce: String },
+}
+
 /// View mode for the home screen
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ViewMode {
@@ -317,9 +323,8 @@ pub struct HomeView {
     pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
-    /// Session to receive the permission-response keystrokes once the
-    /// dialog resolves.
-    pub(super) pending_permission_response_session: Option<String>,
+    /// Destination for the response once the dialog resolves.
+    pub(super) pending_permission_response: Option<PermissionResponseTarget>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
     /// Which pane the pending send-message dialog will target. Set
@@ -543,6 +548,11 @@ pub struct HomeView {
     /// `session.daemon_sidebar`: whether the feed runs at all.
     pub(super) daemon_sidebar: bool,
     pub(super) sidebar_source: super::session_feed::SidebarSource,
+    // Structured (ACP) rows also surface their pending approval nonces from
+    // the daemon; the home permission dialog resolves them. See
+    // `structured_approval_poller`.
+    pub(super) structured_pending_approvals: HashMap<String, Vec<crate::daemon::PendingApproval>>,
+    pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
 
     // Performance: background deletion
     pub(super) deletion_poller: DeletionPoller,

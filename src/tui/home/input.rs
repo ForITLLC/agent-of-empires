@@ -6,7 +6,10 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::bindings::{self, ActionId};
-use super::{live_send, DragKind, HomeView, PreviewSelection, TerminalMode, ViewMode};
+use super::{
+    live_send, DragKind, HomeView, PermissionResponseTarget, PreviewSelection, TerminalMode,
+    ViewMode,
+};
 use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SortOrder,
@@ -2554,12 +2557,19 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.permission_response_dialog = None;
-                    self.pending_permission_response_session = None;
+                    self.pending_permission_response = None;
                 }
                 DialogResult::Submit(choice) => {
                     self.permission_response_dialog = None;
-                    if let Some(session_id) = self.pending_permission_response_session.take() {
-                        self.execute_permission_response(&session_id, choice);
+                    if let Some(target) = self.pending_permission_response.take() {
+                        match target {
+                            PermissionResponseTarget::Terminal(session_id) => {
+                                self.execute_permission_response(&session_id, choice);
+                            }
+                            PermissionResponseTarget::Structured { session_id, nonce } => {
+                                self.resolve_structured_approval(session_id, nonce, choice);
+                            }
+                        }
                     }
                 }
             }
@@ -6502,14 +6512,21 @@ impl HomeView {
         true
     }
 
-    /// Open the permission-response dialog for the currently-selected
-    /// session, letting the user answer a permission prompt they can see
-    /// in the pane without attaching. Unlike `open_send_message_dialog`,
-    /// this has no `Status::Waiting` gate: the user has already visually
-    /// confirmed the prompt is showing, and AoE never parses pane content
-    /// to verify it. Silently no-ops when there's no valid session
-    /// selected or it's mid create/delete; shows an info dialog when the
-    /// selected session's agent has no mapped keystroke sequences yet.
+    /// Open the shared permission-response dialog for the selected session.
+    ///
+    /// Terminal sessions send the agent's own quick-response keystrokes. AoE
+    /// never parses pane content to detect or validate the prompt: the premise
+    /// is that the user has already seen the CLI's "Do you want to proceed?"
+    /// on the pane they are looking at, which is why there is no
+    /// `Status::Waiting` gate here.
+    ///
+    /// Structured (ACP) sessions have no pane to have looked at. The dialog
+    /// instead carries the tool name, target, and destructive flag from the
+    /// daemon's `pending_approvals` projection, so the user sees what they are
+    /// answering without entering the structured view. The nonce is captured
+    /// here, at open time, not re-read on the keypress: a poll tick landing
+    /// between open and submit must not retarget the answer at a different
+    /// approval (a stale nonce 404s instead).
     fn open_permission_response_dialog(&mut self) {
         let Some(id) = self.selected_session.clone() else {
             return;
@@ -6517,14 +6534,53 @@ impl HomeView {
         let Some(inst) = self.get_instance(&id) else {
             return;
         };
-        if matches!(inst.status, Status::Creating | Status::Deleting) {
-            return;
-        }
-        if inst.is_structured() {
+        // Archived and trashed rows keep no live worker, so any cached
+        // approval they might still carry is stale and its resolve can only
+        // 404.
+        if matches!(inst.status, Status::Creating | Status::Deleting)
+            || inst.is_archived()
+            || inst.is_trashed()
+        {
             return;
         }
         let title = inst.title.clone();
         let tool = inst.tool.clone();
+        if inst.is_structured() {
+            let Some(approval) = self
+                .structured_pending_approvals
+                .get(&id)
+                .and_then(|approvals| approvals.first())
+                .cloned()
+            else {
+                self.info_dialog = Some(InfoDialog::new(
+                    "No Pending Approval",
+                    "The daemon has no pending approval for this session.",
+                ));
+                return;
+            };
+            // A choice list is answers, not allow/deny: the generic dialog
+            // has no labels to show and its Allow would answer the agent's
+            // first option. Send the user where the choices are rendered.
+            if approval.choice {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Answer in the Structured View",
+                    "This request offers several answers, not allow/deny. Open the structured view to pick one.",
+                ));
+                return;
+            }
+            self.permission_response_dialog =
+                Some(crate::tui::dialogs::PermissionResponseDialog::structured(
+                    &title,
+                    &approval.tool_name,
+                    &approval.target,
+                    approval.destructive,
+                ));
+            self.pending_permission_response = Some(PermissionResponseTarget::Structured {
+                session_id: id,
+                nonce: approval.nonce,
+            });
+            return;
+        }
         let Some(response) = crate::agents::get_agent(&tool).and_then(|a| a.permission_response)
         else {
             self.info_dialog = Some(InfoDialog::new(
@@ -6533,7 +6589,7 @@ impl HomeView {
             ));
             return;
         };
-        self.pending_permission_response_session = Some(id);
+        self.pending_permission_response = Some(PermissionResponseTarget::Terminal(id));
         self.permission_response_dialog = Some(crate::tui::dialogs::PermissionResponseDialog::new(
             &title,
             response.allow_always,
