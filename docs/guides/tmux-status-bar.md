@@ -41,3 +41,15 @@ Read `@aoe_kind`, but do not set it. A value at server, window, or global-window
 - **No status bar**: you have a tmux config, so `"auto"` stepped aside. Set `status_bar = "enabled"`, or add `aoe tmux status` to your own config.
 - **Stale info**: renaming a session refreshes `@aoe_title` on its agent pane immediately, but the paired terminal and container panes keep the old title, and `@aoe_branch` keeps the old branch after a tied branch rename, until those sessions restart.
 - **No branch or container**: those are shown only for worktree and sandboxed sessions. Container names follow `aoe-sandbox-<first 8 chars of session id>`.
+
+## Returning to the dashboard
+
+When the aoe TUI runs inside tmux, pressing the tmux prefix followed by `d`
+in an agent session returns to the TUI session you came from. Pressing it
+again on the dashboard keeps the client attached, so a mosh login stays open.
+This covers panes running `aoe` and the `aoe`, `cx`, `moshi_aoe`, and
+`moshi_cx` dashboard sessions. Use `tmux detach-client` to disconnect explicitly.
+
+AoE restores this binding on TUI startup and session attach. Existing custom
+`prefix d` bindings are preserved; manage those in your tmux configuration.
+When aoe runs outside tmux, ordinary detach still returns to that outer TUI.
