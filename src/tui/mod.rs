@@ -221,6 +221,10 @@ pub(crate) fn clear_terminal<B: Backend>(terminal: &mut Terminal<B>) -> Result<(
 }
 
 pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
+    if std::env::var_os("TMUX").is_some() {
+        crate::tmux::utils::install_detach_return_binding();
+    }
+
     // Cross-machine entrypoint: when `AOE_DAEMON_URL` is set, swap the
     // local home view for the remote structured view picker so the user never
     // sees a session list that doesn't reflect the daemon they pointed
