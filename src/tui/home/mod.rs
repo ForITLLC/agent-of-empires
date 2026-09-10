@@ -454,6 +454,11 @@ pub struct HomeView {
     /// into the next compose dialog the user opens, so voice/dictation never
     /// gets thrown on the floor with a scolding info dialog.
     pub(super) pending_paste: Option<String>,
+    /// Unsent paste drafts captured on 'm', keyed by the structured session
+    /// they were captured for. Drained into that session's composer when its
+    /// view mounts; entries for other targets survive, so a failed open is
+    /// recoverable by returning to the session.
+    pub(super) pending_paste_for_structured_view: HashMap<String, String>,
     /// Session to attach after the custom instruction warning dialog is dismissed
     pub(super) pending_attach_after_warning: Option<String>,
     /// Session to stop after the confirmation dialog is accepted
