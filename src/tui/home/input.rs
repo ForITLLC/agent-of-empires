@@ -1505,6 +1505,7 @@ impl HomeView {
             if let Some(DialogResult::Submit(action)) = dialog.handle_click(col, row) {
                 match action {
                     NoAgentsAction::Recheck => {
+                        crate::tmux::invalidate_agent_availability();
                         let tools = crate::tmux::AvailableTools::detect();
                         if tools.any_available() {
                             self.set_available_tools(tools);
@@ -1891,6 +1892,7 @@ impl HomeView {
                     return Some(Action::Quit);
                 }
                 DialogResult::Submit(NoAgentsAction::Recheck) => {
+                    crate::tmux::invalidate_agent_availability();
                     let tools = crate::tmux::AvailableTools::detect();
                     if tools.any_available() {
                         self.set_available_tools(tools);
