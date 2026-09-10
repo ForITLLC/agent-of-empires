@@ -469,7 +469,7 @@ const ESCAPED_TAIL_SEP: &str = r"\037";
 /// so a socket path that happens to contain either phrase cannot fake the
 /// empty case on a different errno. Callers MUST use [`tmux_query_command`] so
 /// the `strerror` text is stable English (see #3327/#3328).
-fn tmux_no_server_running(stderr: &[u8]) -> bool {
+pub(super) fn tmux_no_server_running(stderr: &[u8]) -> bool {
     let s = String::from_utf8_lossy(stderr);
     // tmux (`client.c`) prints both markers at the start of their own line
     // (`no server running on <socket>` / `error connecting to <socket>
@@ -847,6 +847,33 @@ impl LiveSessionSnapshot {
             .map(|meta| meta.pane_dead)
             .unwrap_or(false)
     }
+}
+
+/// The live AGENT session name for `session_id`, ignoring a paired terminal or
+/// container pane. The session-id poller needs this rather than
+/// [`live_any_kind_name_for_id_in`]: seeded with a terminal name, it probes
+/// that pane as alive and holds a budget slot for an agent that is gone.
+///
+/// Fails closed on one case, deliberately. A title sanitizing under
+/// [`AGENT_EXCLUDED_PREFIXES`] gives an agent name `NameShape::agent` refuses,
+/// so that session gets no poller repair. Accepting the instance's own derived
+/// name instead would reopen the leak: `aoe_term_Foo_<id>` is both the agent
+/// name for title `term_Foo` and the paired-terminal name for title `Foo`, so a
+/// smart rename across that boundary makes the surviving terminal
+/// indistinguishable from the agent by name alone, and nothing durable on the
+/// pane records which kind it is.
+pub(crate) fn live_agent_name_for_id_in(
+    snapshot: &LiveSessionSnapshot,
+    session_id: &str,
+) -> Option<String> {
+    let names = snapshot.names()?;
+    let suffix = id_suffix(session_id);
+    let agent = NameShape::agent(&suffix);
+    names
+        .iter()
+        .map(String::as_str)
+        .find(|name| agent.matches(name) && !snapshot.pane_dead(name))
+        .map(str::to_string)
 }
 
 /// [`live_any_kind_name_for_id`] against an already-taken snapshot, so a batch
@@ -3402,6 +3429,51 @@ mod tests {
             live_any_kind_name_for_id([container.as_str()], ID).as_deref(),
             Some(container.as_str()),
         );
+    }
+
+    /// The poller must not accept a paired terminal or container pane as
+    /// evidence of a live agent: seeded with that name it probes a pane that
+    /// really is alive and holds a budget slot for an agent that is gone.
+    #[test]
+    #[serial_test::serial]
+    fn live_agent_name_for_id_ignores_terminal_and_container_panes() {
+        let agent = format!("{P}Refactor_{ID8}");
+        let terminal = format!("{TERMINAL_PREFIX}Refactor_{ID8}");
+        let container = format!("{CONTAINER_TERMINAL_PREFIX}Refactor_{ID8}");
+
+        let snapshot = LiveSessionSnapshot::from_parts(
+            Some(vec![agent.clone(), terminal.clone(), container.clone()]),
+            Some(HashMap::new()),
+        );
+        assert_eq!(
+            live_agent_name_for_id_in(&snapshot, ID).as_deref(),
+            Some(agent.as_str()),
+        );
+        // The case that leaked the slot: agent gone, terminal still up.
+        let snapshot = LiveSessionSnapshot::from_parts(
+            Some(vec![terminal.clone(), container.clone()]),
+            Some(HashMap::new()),
+        );
+        assert_eq!(
+            live_agent_name_for_id_in(&snapshot, ID),
+            None,
+            "a surviving terminal is not a live agent pane"
+        );
+        // And the any-kind lookup still answers it, since peer exclusion and
+        // the TUI reload legitimately want any live pane for the id.
+        assert_eq!(
+            live_any_kind_name_for_id([terminal.as_str(), container.as_str()], ID).as_deref(),
+            Some(terminal.as_str()),
+        );
+
+        // A title sanitizing under an auxiliary prefix is refused, and stays
+        // refused: `aoe_term_Foo_<id>` is simultaneously the agent name for
+        // title `term_Foo` and the paired-terminal name for title `Foo`, so
+        // accepting it would let a surviving terminal pass as the agent.
+        let shadowed = format!("{TERMINAL_PREFIX}rewriting_{ID8}");
+        let snapshot =
+            LiveSessionSnapshot::from_parts(Some(vec![shadowed.clone()]), Some(HashMap::new()));
+        assert_eq!(live_agent_name_for_id_in(&snapshot, ID), None);
     }
 
     #[test]
