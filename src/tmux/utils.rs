@@ -380,31 +380,12 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Glob matching every session aoe creates (agents, terminals, tools): they
-/// all share [`crate::tmux::SESSION_PREFIX`].
-/// The tmux glob matching every session aoe manages (`<SESSION_PREFIX>*`),
-/// as used by the `prefix d` binding's format condition.
+/// The tmux glob matching sessions aoe manages.
 fn managed_session_glob() -> String {
     format!("{}*", crate::tmux::SESSION_PREFIX)
 }
 
-/// The tmux format condition under which `prefix d` hands the client back to
-/// the session it came from instead of detaching it.
-///
-/// When the aoe TUI itself runs inside tmux (a `tmux new-session … aoe`
-/// wrapper, a grouped mirror session for mosh, a tmux window running `aoe`),
-/// attaching to an agent is a `switch-client`, so the TUI keeps running unseen
-/// in its own session. tmux's stock `prefix d` is `detach-client`: it drops the
-/// whole client, the TUI's session is left with nothing attached, and the user
-/// lands on whatever launched tmux — a bare shell, or a dead terminal when the
-/// wrapper session is `destroy-unattached`. The intro dialog promises "prefix
-/// then d comes back to aoe", so make that true: inside an aoe-managed session
-/// whose client has a previous session that is NOT aoe-managed, `prefix d` is
-/// `switch-client -l`; everywhere else it stays `detach-client`.
-///
-/// tmux evaluates the condition itself (`if-shell -F`, no shell fork) and
-/// clears `client_last_session` when that session is destroyed, so a vanished
-/// TUI session degrades to a plain detach rather than a stuck client.
+/// A managed session entered by switch-client returns to its caller.
 fn detach_return_condition(managed_glob: &str) -> String {
     format!(
         "#{{&&:#{{m:{glob},#{{session_name}}}},\
@@ -412,6 +393,17 @@ fn detach_return_condition(managed_glob: &str) -> String {
          #{{==:#{{m:{glob},#{{client_last_session}}}},0}}}}}}",
         glob = managed_glob
     )
+}
+
+/// Dashboard prefix-d must keep the client attached, including on a mosh login.
+fn detach_return_binding(own_condition: &str) -> [String; 5] {
+    [
+        "if-shell".into(),
+        "-F".into(),
+        "#{||:#{==:#{pane_current_command},aoe},#{m/r:^(cx|aoe|moshi_cx|moshi_aoe)$,#{session_name}}}".into(),
+        "display-message 'Already at the AoE dashboard'".into(),
+        format!("if-shell -F '{own_condition}' 'switch-client -l' 'detach-client'"),
+    ]
 }
 
 /// Split one `tmux list-keys` line into its arguments, undoing tmux's own
@@ -472,13 +464,8 @@ fn split_tmux_words(line: &str) -> Vec<String> {
     words
 }
 
-/// Whether aoe may (re)install its `prefix d` binding, given the output of
-/// `tmux list-keys -T prefix d` and the exact condition aoe binds: only when
-/// the key is unbound, holds tmux's stock `detach-client`, or already holds
-/// aoe's own binding — `if-shell -F <own_condition> "switch-client -l"
-/// detach-client`, matched token for token. Anything else is the user's, and
-/// is left alone; an `if-shell` of their own that merely contains
-/// `switch-client -l` (a different condition or fallback) is NOT aoe's.
+/// Replace only an unbound key, stock detach, or an exact current/previous
+/// aoe binding. Custom conditions and commands remain the user's choice.
 fn should_install_detach_return(list_keys_output: &str, own_condition: &str) -> bool {
     let line = list_keys_output.trim();
     if line.is_empty() {
@@ -492,7 +479,13 @@ fn should_install_detach_return(list_keys_output: &str, own_condition: &str) -> 
         return false;
     };
     let bound: Vec<&str> = toks[i + 2..].iter().map(String::as_str).collect();
-    bound == ["detach-client"]
+    let current_binding = detach_return_binding(own_condition);
+    bound
+        == current_binding
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+        || bound == ["detach-client"]
         || bound
             == [
                 "if-shell",
@@ -503,10 +496,8 @@ fn should_install_detach_return(list_keys_output: &str, own_condition: &str) -> 
             ]
 }
 
-/// Install the `prefix d` binding described on [`detach_return_condition`].
-/// Runs on every attach — one cheap, idempotent tmux call — so a restarted
-/// tmux server picks it up again. Never fails the attach: a tmux error is
-/// logged and the stock behaviour stands.
+/// Restore the dashboard/return binding on TUI startup and every attach.
+/// Custom bindings are preserved; errors never prevent opening a session.
 pub(crate) fn install_detach_return_binding() {
     let listing = match crate::tmux::tmux_command()
         .args(["list-keys", "-T", "prefix", "d"])
@@ -528,17 +519,8 @@ pub(crate) fn install_detach_return_binding() {
         return;
     }
     match crate::tmux::tmux_command()
-        .args([
-            "bind-key",
-            "-T",
-            "prefix",
-            "d",
-            "if-shell",
-            "-F",
-            &cond,
-            "switch-client -l",
-            "detach-client",
-        ])
+        .args(["bind-key", "-T", "prefix", "d"])
+        .args(detach_return_binding(&cond))
         .output()
     {
         Ok(o) if o.status.success() => {}
@@ -1146,11 +1128,119 @@ mod tests {
     }
 
     #[test]
-    fn detach_return_condition_is_managed_current_and_foreign_last_session() {
-        assert_eq!(
-            detach_return_condition("aoe_*"),
-            "#{&&:#{m:aoe_*,#{session_name}},#{&&:#{!=:#{client_last_session},},#{==:#{m:aoe_*,#{client_last_session}},0}}}"
-        );
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn detach_return_keeps_the_same_client_on_the_dashboard_after_reload_and_restart() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("Skipping: tmux unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("tmux.sock");
+        let config = dir.path().join("tmux.conf");
+        struct Server<'a>(&'a std::path::Path);
+        impl Drop for Server<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["-S", self.0.to_str().unwrap(), "kill-server"])
+                    .output();
+            }
+        }
+        let _server = Server(&socket);
+        let tmux = |args: &[&str]| {
+            let out = Command::new("tmux")
+                .args([
+                    "-S",
+                    socket.to_str().unwrap(),
+                    "-f",
+                    config.to_str().unwrap(),
+                ])
+                .args(args)
+                .env_remove("TMUX")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let cond = detach_return_condition("aoe_*");
+        let command = detach_return_binding(&cond)
+            .iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        std::fs::write(&config, format!("bind-key -T prefix d {command}\n")).unwrap();
+        let wait_client = |expected: &str| {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let clients = tmux(&["list-clients", "-F", "#{client_name} #{session_name}"]);
+                if clients.split_whitespace().nth(1) == Some(expected) {
+                    break clients.split_whitespace().next().unwrap().to_owned();
+                }
+                assert!(
+                    Instant::now() < until,
+                    "expected {expected}, clients={clients:?}"
+                );
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        };
+        for restart in 0..2 {
+            tmux(&["new-session", "-d", "-s", "cx", "sleep", "60"]);
+            tmux(&["new-session", "-d", "-s", "aoe_agent", "sleep", "60"]);
+            tmux(&[
+                "new-session",
+                "-d",
+                "-s",
+                "host",
+                "env",
+                "-u",
+                "TMUX",
+                "tmux",
+                "-S",
+                socket.to_str().unwrap(),
+                "attach-session",
+                "-t",
+                "=cx",
+            ]);
+            let client = wait_client("cx");
+            assert!(should_install_detach_return(
+                &tmux(&["list-keys", "-T", "prefix", "d"]),
+                &cond
+            ));
+            for dashboard in ["cx", "aoe", "moshi_cx", "moshi_aoe"] {
+                if dashboard != "cx" {
+                    tmux(&["new-session", "-d", "-s", dashboard, "sleep", "60"]);
+                }
+                tmux(&[
+                    "switch-client",
+                    "-c",
+                    &client,
+                    "-t",
+                    &format!("={dashboard}"),
+                ]);
+                tmux(&["switch-client", "-c", &client, "-t", "=aoe_agent"]);
+                tmux(&["send-keys", "-t", "host:0.0", "C-b", "d"]);
+                assert_eq!(wait_client(dashboard), client);
+                tmux(&["source-file", config.to_str().unwrap()]);
+                for _ in 0..3 {
+                    tmux(&["send-keys", "-t", "host:0.0", "C-b", "d"]);
+                    // Let tmux dispatch the key before checking the client still exists.
+                    std::thread::sleep(Duration::from_millis(80));
+                    assert_eq!(wait_client(dashboard), client);
+                }
+            }
+            tmux(&["kill-server"]);
+            if restart == 0 {
+                // The next server must load the binding from its config again.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
 
     /// Only tmux's stock `detach-client`, an unbound key, or aoe's own

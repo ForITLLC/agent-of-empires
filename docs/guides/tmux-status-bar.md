@@ -147,3 +147,15 @@ Branch is only displayed for worktree sessions (sessions created with `aoe add -
 ### Container not showing
 
 Container name is only displayed for sandboxed sessions (sessions created with `aoe add --sandbox`). The container name follows the pattern `aoe-sandbox-<session_id_first_8_chars>`.
+
+## Returning to the dashboard
+
+When the aoe TUI runs inside tmux, pressing the tmux prefix followed by `d`
+in an agent session returns to the TUI session you came from. Pressing it
+again on the dashboard keeps the client attached, so a mosh login stays open.
+This covers panes running `aoe` and the `aoe`, `cx`, `moshi_aoe`, and
+`moshi_cx` dashboard sessions. Use `tmux detach-client` to disconnect explicitly.
+
+AoE restores this binding on TUI startup and session attach. Existing custom
+`prefix d` bindings are preserved; manage those in your tmux configuration.
+When aoe runs outside tmux, ordinary detach still returns to that outer TUI.
