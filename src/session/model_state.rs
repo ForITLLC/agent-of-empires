@@ -63,6 +63,7 @@ pub struct LiveModel {
 /// The flattened view on a session row (`/api/sessions`, `aoe list --json`,
 /// `aoe status --json`). Every field is absent/false without evidence.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionModel {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_model: Option<String>,

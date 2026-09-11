@@ -1154,7 +1154,7 @@ mod keep_tests {
         assert_eq!(back.kept_by.as_deref(), Some("who"));
 
         // Older rows without the field deserialize as not-kept.
-        let mut legacy = serde_json::to_value(&Instance::new("l", "/tmp/l")).unwrap();
+        let mut legacy = serde_json::to_value(Instance::new("l", "/tmp/l")).unwrap();
         legacy.as_object_mut().unwrap().remove("kept_at");
         let legacy: Instance = serde_json::from_value(legacy).unwrap();
         assert!(!legacy.is_kept());
