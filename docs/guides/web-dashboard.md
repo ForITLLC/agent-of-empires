@@ -143,3 +143,36 @@ Produce one with `aoe cityhall export --out cityhall.toml` or from the dashboard
 To have a workspace fetch its bundle at startup, set `AOE_CITYHALL_BUNDLE_URL` (and `AOE_CITYHALL_BUNDLE_TOKEN` for the bearer token). The fetch happens before any config is read. On a first boot a fetch failure is fatal, rather than leaving a user in a workspace with no projects; once a bundle has been applied it is cached, and a later failure only warns and serves the cached configuration. A malformed bundle, or one naming an unknown setting, is fatal either way.
 
 A git identity and credential arrive in the same document (`[git]`), which is what makes clone, pull, and push work inside a workspace. `export` never writes that section; the host serving the bundle composes it per user.
+
+## Same-host automation with passphrase authentication
+
+A passphrase daemon writes an independent owner-only credential to
+`$APP_DIR/serve.local-token` (0600). It rotates on daemon startup. The local
+CLI discovers and rereads it automatically; browser login and remote URLs do
+not expose or accept this credential.
+
+Automation may send it as `Authorization: Bearer <credential>` over a direct
+loopback connection. The daemon rejects this capability from non-loopback
+peers, requests with forwarding headers, and browser-origin requests. It is
+never accepted from cookies or URL query parameters. This is an owner
+capability, so protect it like access to the daemon's files. Existing read-only
+server policy continues to apply. Remote callers still sign in using the
+passphrase and device binding.
+
+Read the file per request and do not follow redirects or use an environment
+HTTP proxy. Do not put the credential in process arguments, logs, or a public
+URL. For a local curl probe, feed a private config on stdin rather than using
+`curl -H` with a secret argument:
+
+```sh
+python3 - <<'PYTHON' | curl --config - --noproxy '*' --fail --silent --show-error http://127.0.0.1:8787/api/sessions
+from pathlib import Path
+import json
+value = (Path.home() / ".agent-of-empires/serve.local-token").read_text().strip()
+print("header = " + json.dumps("Authorization: Bearer " + value))
+PYTHON
+```
+
+When `--behind-proxy` is used, a request without this credential or a valid
+browser session remains unauthorized, even when the proxy connects over
+loopback. Changing the service to `--auth none` is unnecessary.

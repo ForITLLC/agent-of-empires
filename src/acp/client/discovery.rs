@@ -80,14 +80,30 @@ impl DaemonEndpoint {
 
     fn resolved_token_from_path(&self, token_path: &Path) -> Option<String> {
         let cached = self.cached_token();
-        cached.as_ref()?;
         if self.source != Source::LocalDaemon || !is_loopback(&self.base_url) {
             return cached;
         }
-        read_valid_token(token_path).map_or(cached, |current| {
-            *self.token.write().unwrap_or_else(|e| e.into_inner()) = Some(current.clone());
-            Some(current)
-        })
+        if cached.is_none()
+            && token_path.file_name().and_then(|s| s.to_str()) != Some("serve.local-token")
+        {
+            return None;
+        }
+        let Some(current) = read_valid_token(token_path) else {
+            return cached;
+        };
+        *self.token.write().unwrap_or_else(|e| e.into_inner()) = Some(current.clone());
+        Some(current)
+    }
+
+    pub(super) fn uses_local_api_token(&self) -> bool {
+        self.source == Source::LocalDaemon
+            && is_loopback(&self.base_url)
+            && self
+                .local_token_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                == Some("serve.local-token")
     }
 
     pub(crate) fn has_token(&self) -> bool {
@@ -227,15 +243,25 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
         return Err(DiscoveryError::Malformed);
     }
     let endpoint = DaemonEndpoint::new(base_url, token, Source::LocalDaemon);
-    let app_dir = is_loopback(&endpoint.base_url)
+    let endpoint = match is_loopback(&endpoint.base_url)
         .then(crate::session::get_app_dir)
-        .and_then(Result::ok);
-    Ok(match app_dir {
-        Some(dir) => endpoint
-            .with_local_token_path(dir.join("serve.token"))
-            .with_local_passphrase_path(dir.join("serve.passphrase")),
+        .and_then(Result::ok)
+    {
+        // A token-auth daemon's bearer is `serve.token`; a passphrase daemon
+        // also mints a private loopback bearer, `serve.local-token`.
+        Some(dir) => {
+            let name = if endpoint.has_token() {
+                "serve.token"
+            } else {
+                "serve.local-token"
+            };
+            endpoint
+                .with_local_token_path(dir.join(name))
+                .with_local_passphrase_path(dir.join("serve.passphrase"))
+        }
         None => endpoint,
-    })
+    };
+    Ok(endpoint)
 }
 
 fn preferred_daemon_url(urls: &[ServeUrl]) -> Option<&ServeUrl> {
@@ -572,5 +598,40 @@ mod tests {
         // override and the local file lookup requires loopback, so no
         // passphrase resolves and there is nothing to cache.
         assert_eq!(endpoint.session_cache_dir(), None);
+    }
+
+    #[test]
+    fn env_endpoint_never_reads_local_daemon_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        let explicit = "a".repeat(64);
+        std::fs::write(&path, "b".repeat(64)).unwrap();
+
+        let endpoint = endpoint(Some(&explicit), Source::Env);
+        assert_eq!(endpoint.resolved_token_from_path(&path), Some(explicit));
+    }
+
+    #[test]
+    fn local_passphrase_endpoint_reads_and_refreshes_private_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.local-token");
+        let endpoint = endpoint(None, Source::LocalDaemon).with_local_token_path(path.clone());
+        for token in ["a".repeat(64), "b".repeat(64)] {
+            std::fs::write(&path, &token).unwrap();
+            assert_eq!(endpoint.resolved_token(), Some(token));
+        }
+        let remote = DaemonEndpoint::new("https://example.com".into(), None, Source::LocalDaemon)
+            .with_local_token_path(path);
+        assert_eq!(remote.resolved_token(), None);
+    }
+
+    #[test]
+    fn no_auth_endpoint_ignores_lingering_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        std::fs::write(&path, "b".repeat(64)).unwrap();
+
+        let endpoint = endpoint(None, Source::LocalDaemon);
+        assert_eq!(endpoint.resolved_token_from_path(&path), None);
     }
 }
