@@ -389,3 +389,49 @@ mod tests {
         assert!(mgr.is_no_auth().await);
     }
 }
+
+/// Rotate the private local credential atomically on daemon startup.
+pub(super) async fn issue_local_api_token(path: &std::path::Path) -> anyhow::Result<String> {
+    use tokio::io::AsyncWriteExt;
+    let token = generate_token();
+    let temporary = path.with_extension(format!("tmp-{}", generate_token()));
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary).await?;
+    file.write_all(token.as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&temporary, path).await?;
+    Ok(token)
+}
+
+#[cfg(test)]
+mod local_token_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn private_local_token_rotates_and_persists_without_disclosure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.local-token");
+        let first = issue_local_api_token(&path).await.unwrap();
+        let second = issue_local_api_token(&path).await.unwrap();
+        assert_ne!(first, second);
+        assert!(is_valid_token_format(&second));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), second);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(
+            issue_local_api_token(&dir.path().join("missing/credential"))
+                .await
+                .is_err()
+        );
+    }
+}

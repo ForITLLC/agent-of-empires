@@ -275,6 +275,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     });
     let token_grace = test_token_grace_override().unwrap_or(DEFAULT_TOKEN_GRACE);
 
+    let local_api_token = if matches!(auth_mode, AuthMode::Passphrase) {
+        let path = crate::session::get_app_dir()?.join("serve.local-token");
+        Some(super::token::issue_local_api_token(&path).await?)
+    } else {
+        None
+    };
+
     let token_manager = Arc::new(TokenManager::with_grace(
         auth_token.clone(),
         token_lifetime,
@@ -701,6 +708,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         instances,
         session_service,
         token_manager: Arc::clone(&token_manager),
+        local_api_token,
         login_manager: Arc::clone(&login_manager),
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,
