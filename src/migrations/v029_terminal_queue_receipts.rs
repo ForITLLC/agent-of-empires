@@ -92,7 +92,7 @@ mod tests {
     use super::*;
     use crate::{
         acp::event_store::EventStore,
-        acp::state::QueuedPromptEntry,
+        daemon::QueuedPromptEntry,
         session::{Instance, View},
     };
 
