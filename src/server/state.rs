@@ -116,6 +116,8 @@ pub struct AppState {
     /// `AppState`.
     pub session_service: Arc<session_service::SessionService>,
     pub token_manager: Arc<TokenManager>,
+    /// Owner-only bearer accepted only from direct loopback connections.
+    pub local_api_token: Option<String>,
     pub login_manager: Arc<login::LoginManager>,
     pub rate_limiter: Arc<RateLimiter>,
     pub behind_tunnel: bool,
