@@ -81,6 +81,36 @@ fn is_local_trusted(client_ip: IpAddr) -> bool {
     client_ip.is_loopback()
 }
 
+/// A proxy or browser origin can never exercise the filesystem-owner capability.
+fn local_api_bearer<'a>(
+    addr: SocketAddr,
+    request: &Request,
+    expected: Option<&'a str>,
+) -> Option<&'a str> {
+    let expected = expected.filter(|token| !token.is_empty())?;
+    if !addr.ip().is_loopback()
+        || [
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "cf-connecting-ip",
+            "origin",
+        ]
+        .iter()
+        .any(|h| request.headers().contains_key(*h))
+    {
+        return None;
+    }
+    let supplied = request
+        .headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    constant_time_eq(supplied, expected).then_some(expected)
+}
+
 /// Build a Set-Cookie header value with optional Secure flag for HTTPS tunnels.
 fn build_cookie(token: &str, secure: bool, max_age_secs: u64) -> String {
     let mut cookie = format!(
@@ -756,6 +786,14 @@ pub async fn auth_middleware(
             ws_protocol_count = ws_protocols.len(),
             "auth_middleware entered for structured view ws"
         );
+    }
+
+    if let Some(token) = local_api_bearer(addr, &request, state.local_api_token.as_deref()) {
+        request.extensions_mut().insert(LoopbackTrusted);
+        request
+            .extensions_mut()
+            .insert(AuthenticatedTokenHash(super::push::sha256_token(token)));
+        return next.run(request).await;
     }
 
     // Token gate disabled (--auth=none or --auth=passphrase). Insert a
@@ -1753,5 +1791,92 @@ mod tests {
         // But listing devices (read-only) and self-logout are not gated.
         assert!(!requires_elevation(&Method::GET, "/api/devices"));
         assert!(!requires_elevation(&Method::POST, "/api/logout"));
+    }
+}
+
+#[cfg(test)]
+mod local_api_tests {
+    use super::*;
+    use axum::{body::Body, routing::get, Router};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn passphrase_proxy_wall_accepts_only_direct_local_bearer() {
+        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.behind_tunnel = true;
+        inner.local_api_token = Some("private-local-credential".into());
+        inner.login_manager = Arc::new(super::super::login::LoginManager::new(Some(
+            "browser-passphrase",
+        )));
+        let app = Router::new()
+            .route("/api/sessions", get(|| async { "live rows" }))
+            .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
+        for (peer, auth, extra, expected) in [
+            (
+                "127.0.0.1:1234",
+                Some("Bearer private-local-credential"),
+                None,
+                200,
+            ),
+            (
+                "[::1]:1234",
+                Some("Bearer private-local-credential"),
+                None,
+                200,
+            ),
+            ("127.0.0.1:1234", None, None, 401),
+            ("127.0.0.1:1234", Some("Bearer wrong"), None, 401),
+            (
+                "192.0.2.1:1234",
+                Some("Bearer private-local-credential"),
+                None,
+                401,
+            ),
+            (
+                "127.0.0.1:1234",
+                Some("Bearer private-local-credential"),
+                Some(("x-forwarded-for", "127.0.0.1")),
+                401,
+            ),
+            (
+                "127.0.0.1:1234",
+                Some("Bearer private-local-credential"),
+                Some(("forwarded", "for=127.0.0.1")),
+                401,
+            ),
+            (
+                "127.0.0.1:1234",
+                Some("Bearer private-local-credential"),
+                Some(("cf-connecting-ip", "192.0.2.1")),
+                401,
+            ),
+            (
+                "127.0.0.1:1234",
+                Some("Bearer private-local-credential"),
+                Some(("origin", "http://localhost")),
+                401,
+            ),
+            (
+                "127.0.0.1:1234",
+                None,
+                Some(("cookie", "aoe_token=private-local-credential")),
+                401,
+            ),
+        ] {
+            let mut req = Request::builder().uri("/api/sessions");
+            if let Some(value) = auth {
+                req = req.header(header::AUTHORIZATION, value);
+            }
+            if let Some((key, value)) = extra {
+                req = req.header(key, value);
+            }
+            let mut req = req.body(Body::empty()).unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(response.status().as_u16(), expected, "{peer} {extra:?}");
+            assert!(!response.headers().contains_key("x-aoe-token"));
+        }
     }
 }
