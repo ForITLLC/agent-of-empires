@@ -70,7 +70,7 @@ async fn queue_parked_send(
     id: &str,
     message: String,
     sender: Option<String>,
-) -> Result<(crate::acp::state::QueuedPromptEntry, usize), NotQueued> {
+) -> Result<(crate::daemon::QueuedPromptEntry, usize), NotQueued> {
     if message.len() > crate::server::api::queue::MAX_QUEUED_TEXT_BYTES {
         return Err(NotQueued::TooLarge);
     }
@@ -120,7 +120,7 @@ async fn queue_parked_send(
 /// (a resend double-queues). Draft size only, never its text.
 fn queued_send_parts(
     refusal: &crate::tmux::ParkedDraftRefusal,
-    entry: &crate::acp::state::QueuedPromptEntry,
+    entry: &crate::daemon::QueuedPromptEntry,
     position: usize,
 ) -> (StatusCode, serde_json::Value) {
     (
@@ -1041,7 +1041,7 @@ mod send_error_contract_tests {
     fn queued_parked_send_is_202_with_queue_id_and_position() {
         let draft = "yes, authorize the vendor bump and send the escalation emails";
         let refusal = crate::tmux::ParkedDraftRefusal::from_draft(draft);
-        let entry = crate::acp::state::QueuedPromptEntry {
+        let entry = crate::daemon::QueuedPromptEntry {
             id: "send-0123456789ab".to_string(),
             seq: 7,
             text: "STATUS: shipped".to_string(),

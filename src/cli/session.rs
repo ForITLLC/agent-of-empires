@@ -684,7 +684,7 @@ async fn queue_drop(identifier: &str, qid: &str) -> Result<()> {
 }
 
 /// The daemon's view of the queue, or `None` when no daemon is reachable.
-async fn daemon_queue_list(session_id: &str) -> Option<Vec<crate::acp::state::QueuedPromptEntry>> {
+async fn daemon_queue_list(session_id: &str) -> Option<Vec<crate::daemon::QueuedPromptEntry>> {
     use crate::acp::client::{discovery, HttpClient};
     let endpoint = discovery::discover_local().ok()?;
     let client = HttpClient::new(endpoint).ok()?;
@@ -712,7 +712,7 @@ async fn daemon_queue_remove(session_id: &str, qid: &str) -> Result<Option<bool>
 /// `<qid> <age> <sender> <first 80 chars>`: one queued row for a human.
 /// Whitespace is collapsed so a multi-line report reads as one line.
 fn format_queue_row(
-    entry: &crate::acp::state::QueuedPromptEntry,
+    entry: &crate::daemon::QueuedPromptEntry,
     now: chrono::DateTime<chrono::Utc>,
 ) -> String {
     let age = chrono::DateTime::parse_from_rfc3339(&entry.created_at)
@@ -3992,7 +3992,7 @@ mod queue_command_tests {
     #[test]
     fn queue_row_shows_sender_age_and_first_80_chars() {
         let long = "STATUS: shipped ".repeat(10);
-        let entry = crate::acp::state::QueuedPromptEntry {
+        let entry = crate::daemon::QueuedPromptEntry {
             id: "send-0123456789ab".to_string(),
             seq: 3,
             text: format!("{long}\n\nEVIDENCE: build 9f221e45"),

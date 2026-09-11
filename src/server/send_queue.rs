@@ -488,7 +488,7 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
 #[cfg(test)]
 mod tests {
     use super::{drain_candidates, quiet_gate, Gate, Hold, QueueTiming, QuietState};
-    use crate::acp::state::QueuedPromptEntry;
+    use crate::daemon::QueuedPromptEntry;
     use crate::session::Instance;
     use std::time::{Duration, Instant};
 
