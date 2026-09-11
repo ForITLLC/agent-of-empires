@@ -374,7 +374,8 @@ mod tests {
             .join("config.toml");
         std::fs::write(
             &config_path,
-            "[session.agent_detect_as]\nmy-claude = \"claude\"\n\n\
+            "[session.agent_extra_args]\ncodex = \"-m fleet-codex\"\nclaude = \"--model legacy-claude\"\n\n\
+             [session.agent_detect_as]\nmy-claude = \"claude\"\n\n\
              [acp.acp_defaults.opencode]\nmodel = \"openai/gpt-5.5\"\n\n\
              [acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
         )
@@ -392,6 +393,10 @@ mod tests {
             Some("claude-pinned")
         );
         assert_eq!(pinned_model_for_agent("default", "gemini").await, None);
+        assert_eq!(
+            pinned_model_for_agent("default", "codex").await.as_deref(),
+            Some("fleet-codex")
+        );
     }
     #[test]
     fn parse_model_flag_extracts_the_pinned_model() {

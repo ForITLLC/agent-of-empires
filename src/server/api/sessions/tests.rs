@@ -4275,7 +4275,12 @@ fn session_response_carries_the_keep_fields() {
     assert!(bare.get("kept_by").is_none());
 
     inst.keep(Some("tui"));
+    inst.goal = Some("preserve fleet fields".to_string());
     let v = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+    let decoded: crate::daemon::SessionResponse = serde_json::from_value(v.clone()).unwrap();
+    assert!(decoded.kept);
+    assert_eq!(decoded.goal, inst.goal);
+    assert_eq!(decoded.kept_by, inst.kept_by);
     assert_eq!(v["kept"], true);
     assert_eq!(v["kept_by"], "tui");
     assert_eq!(
