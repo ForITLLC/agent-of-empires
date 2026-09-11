@@ -5,7 +5,9 @@
 //!
 //! The bearer token rides a `?token=` query param rather than a header, which
 //! most WS clients do not surface cleanly; the daemon's auth middleware accepts
-//! both. Only the redacted URL is ever logged.
+//! both. A private local credential (`serve.local-token`) is sent as an
+//! Authorization header instead and never enters the URL. Only the redacted URL
+//! is ever logged.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,9 +132,19 @@ pub async fn connect_with(
         url = %sanitize_for_log(&url),
         "connecting to structured view ws"
     );
-    let request = url
+    let mut request = url
         .into_client_request()
         .map_err(|e| WsError::InvalidUrl(e.to_string()))?;
+    if endpoint.uses_local_api_token() {
+        if let Some(token) = endpoint.resolved_token() {
+            request.headers_mut().insert(
+                "authorization",
+                format!("Bearer {token}")
+                    .parse()
+                    .map_err(|_| WsError::InvalidUrl("invalid local credential".into()))?,
+            );
+        }
+    }
     let (stream, _) = connect_async(request).await?;
     let (frame_tx, frame_rx) = mpsc::channel(64);
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -293,8 +305,10 @@ fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64, forward_frame
     if !forward_frames {
         params.push("frames=0".to_string());
     }
-    if let Some(token) = endpoint.resolved_token() {
-        params.push(format!("token={token}"));
+    if !endpoint.uses_local_api_token() {
+        if let Some(token) = endpoint.resolved_token() {
+            params.push(format!("token={token}"));
+        }
     }
     if params.is_empty() {
         format!("{base}{path}")
@@ -325,6 +339,20 @@ mod tests {
 
     /// `since=0` is omitted, `frames=0` marks a projections-only consumer, and
     /// an https endpoint upgrades to `wss`.
+    #[test]
+    fn private_local_credential_never_enters_websocket_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.local-token");
+        std::fs::write(&path, "a".repeat(64)).unwrap();
+        let endpoint =
+            DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::LocalDaemon)
+                .with_local_token_path(path);
+        assert_eq!(
+            ws_url(&endpoint, "s-1", 42, true),
+            "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42"
+        );
+    }
+
     #[test]
     fn ws_url_query_shape() {
         let e = endpoint("http://127.0.0.1:8080", Some("abc"));
