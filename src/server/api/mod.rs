@@ -53,15 +53,14 @@ pub use relay::relay_send;
 pub use sessions::{
     attach_session_project, create_session, delete_session, delete_workspace,
     ensure_container_terminal, ensure_session, ensure_terminal, force_smart_rename,
-    get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
-    read_output, rename_session, restore_session, search_sessions, send_message,
-    serve_session_artifact, session_diff_file, session_diff_files, session_file, set_worktree_name,
-    start_session, stop_session, summarize_session, trash_session, update_session_archive,
-    update_session_color, update_session_diff_base, update_session_group,
-    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
-    update_workspace_ordering, OutputQuery, SendMessageRequest,
-    get_session_goal, set_session_goal,
-    update_session_keep,
+    get_recent_projects, get_session_goal, kill_terminal, list_sessions, paste_image,
+    preview_volume_ignores_globs, read_output, rename_session, restore_session, search_sessions,
+    send_message, serve_session_artifact, session_diff_file, session_diff_files, session_file,
+    set_session_goal, set_worktree_name, start_session, stop_session, summarize_session,
+    trash_session, update_session_archive, update_session_color, update_session_diff_base,
+    update_session_group, update_session_keep, update_session_notifications, update_session_pin,
+    update_session_snooze, update_session_unread, update_workspace_ordering, OutputQuery,
+    SendMessageRequest,
 };
 // Daemon-side restart (POST /api/sessions/{id}/restart + GET restart-status): a
 // separate `use` so this branch stacks beside other route additions without
