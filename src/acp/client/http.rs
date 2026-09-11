@@ -434,7 +434,7 @@ impl HttpClient {
         prompt_id: &str,
         text: &str,
         origin_device: Option<&str>,
-    ) -> Result<crate::acp::state::QueuedPromptEntry, HttpError> {
+    ) -> Result<crate::daemon::QueuedPromptEntry, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/queue",
             self.endpoint.base_url, session_id

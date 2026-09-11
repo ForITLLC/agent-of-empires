@@ -54,7 +54,7 @@ struct LegacyQueueSession {
     #[serde(default)]
     view: crate::session::View,
     #[serde(default)]
-    queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
+    queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
 }
 
 fn read_snapshot(path: &Path, queued: &mut Vec<(String, String)>) -> Result<()> {

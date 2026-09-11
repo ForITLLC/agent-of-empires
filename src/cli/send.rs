@@ -289,15 +289,14 @@ fn disk_enqueue(
         };
         let seq = inst.queued_prompt_next_seq;
         inst.queued_prompt_next_seq = seq.saturating_add(1);
-        inst.queued_prompts
-            .push(crate::acp::state::QueuedPromptEntry {
-                id: qid.to_string(),
-                seq,
-                text: message.to_string(),
-                attachments: Vec::new(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                origin_device: Some(sender.to_string()),
-            });
+        inst.queued_prompts.push(crate::daemon::QueuedPromptEntry {
+            id: qid.to_string(),
+            seq,
+            text: message.to_string(),
+            attachments: Vec::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            origin_device: Some(sender.to_string()),
+        });
         Ok(inst.queued_prompts.len())
     })
 }
