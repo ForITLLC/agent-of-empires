@@ -275,7 +275,11 @@ async fn pinned_model_for_agent(profile: &str, agent: &str) -> Option<String> {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         crate::acp::pinned_model_for_tool(&config, &agent, None).or_else(|| {
             // Retain the fleet's legacy CLI model pins alongside explicit ACP pins.
-            config.session.agent_extra_args.get(&agent).and_then(|args| parse_model_flag(args))
+            config
+                .session
+                .agent_extra_args
+                .get(&agent)
+                .and_then(|args| parse_model_flag(args))
         })
     })
     .await
