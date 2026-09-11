@@ -1724,6 +1724,11 @@ export function MobileLiveTerminal({
     [sendData, ctrlActiveRef, clearCtrl],
   );
 
+  const activeRef = useRef(active);
+  useLayoutEffect(() => {
+    activeRef.current = active;
+  }, [active]);
+
   // Native (not React-synthetic) beforeinput: React's onBeforeInput is
   // backed by keypress in Chromium and carries no inputType, so the
   // soft-keyboard input types below would never match through it.
@@ -1863,15 +1868,17 @@ export function MobileLiveTerminal({
         );
         const parts = [text.trim(), ...paths.map(escapePastePath)].filter((s) => s.length > 0);
         if (parts.length === 0) return;
-        // Leading and trailing spaces keep the path from gluing onto queued
-        // text or the user's next keystroke. No newline: never auto-submit.
-        // Re-invalidated here too: the upload's await leaves room for the
-        // user to type a syllable this insert would then displace.
-        invalidateRetainedImeContext();
+        const target = inputRef.current;
+        if (!target) return;
+        // An unmounted session cannot send; a background session may finish
+        // its own paste but must not invalidate the foreground proxy.
+        if (activeRef.current) invalidateRetainedImeContext(target);
+        else target.value = "";
+        // Pad the path without submitting the command.
         sendData(bracketedPaste(` ${parts.join(" ")} `));
       })();
     },
-    [sendData, uploadPastedImage],
+    [inputRef, sendData, uploadPastedImage],
   );
 
   const handleCompositionStart = useCallback(() => {
@@ -1902,16 +1909,14 @@ export function MobileLiveTerminal({
       // Only a composition that took over the typed word may have its prefix
       // dropped; anything else is new text and goes to the pane whole.
       const rest = retroactive && data.startsWith(run) ? data.slice(run.length) : data;
-      // The typed word is still the one under the caret, so a second
-      // composition over it (a suggestion tap, then the space commit) has to
-      // be stripped against everything the pane has of that word. A
-      // composition that stood on its own leaves no typed word behind: its
-      // result must not become a run for the next composition to strip.
       if (!rest) typedWordRef.current = run;
-      else if (sendKeys(rest) && retroactive) typedWordRef.current = plainRunAfter(run, rest);
-      // Leave the committed text in the textarea: an IME that re-edits a
-      // committed syllable (delete + reinsert) needs it there for the delete
-      // to surface as a beforeinput. See forwardTerminalBeforeInput.
+      else if (!sendKeys(rest)) {
+        invalidateRetainedImeContext(e.target instanceof HTMLTextAreaElement ? e.target : null);
+      } else if (retroactive) {
+        // A later suggestion must strip the whole word already sent.
+        typedWordRef.current = plainRunAfter(run, rest);
+      }
+      // Only accepted text may remain as context for an IME delete + reinsert.
     },
     [sendKeys, typedWordRef],
   );
