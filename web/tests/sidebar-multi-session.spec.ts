@@ -176,7 +176,19 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.mouse.up();
     await page.waitForTimeout(16);
 
-    expect(await row.getAttribute("class")).toContain("border-brand-600");
+    expect(await row.getAttribute("class")).toContain("ring-session-active");
+    // The frame has to resolve to the projected token, not just be requested:
+    // `ring-session-active` with no matching `@theme` entry leaves
+    // `--tw-ring-color` invalid at computed-value time, and `ring-2` then
+    // paints in currentColor instead of the theme accent (#3912).
+    const ring = await row.evaluate((el) => ({
+      color: getComputedStyle(el).getPropertyValue("--tw-ring-color").trim(),
+      token: getComputedStyle(document.documentElement).getPropertyValue("--color-session-active").trim(),
+      shadow: getComputedStyle(el).boxShadow,
+    }));
+    expect(ring.color).not.toBe("");
+    expect(ring.color).toBe(ring.token);
+    expect(ring.shadow).not.toBe("none");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
   });
 
