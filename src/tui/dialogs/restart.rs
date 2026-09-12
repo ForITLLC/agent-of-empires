@@ -402,7 +402,7 @@ impl RestartDialog {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Wide enough that the Tool row's "(configured)  Ctrl+P: edit" suffix
         // isn't clipped (the cycler + suffix run past the old 54-col width).
-        let dialog_area = super::centered_rect(area, 64, 14);
+        let dialog_area = super::fit_dialog(area, 64, 14);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -977,6 +977,9 @@ mod tests {
         // Real dialog geometry: 64 columns leaves a 60-column inner row. With
         // three tools, a configured command, and extra args, this fails if the
         // lifecycle suffix moves behind the trailing configuration metadata.
+        // The frame is one cell larger on each side than the dialog: a
+        // fitted dialog keeps that margin clear, so this is the smallest
+        // frame in which it still gets its natural 64 columns.
         use ratatui::{backend::TestBackend, Terminal};
 
         let cases = [("gemini", true), ("claude", false)];
@@ -995,7 +998,7 @@ mod tests {
                 ],
             );
             dialog.focused_field = 1;
-            let mut terminal = Terminal::new(TestBackend::new(64, 14)).expect("terminal");
+            let mut terminal = Terminal::new(TestBackend::new(66, 16)).expect("terminal");
             let theme = crate::tui::styles::Theme::default();
             terminal
                 .draw(|frame| dialog.render(frame, frame.area(), &theme))
