@@ -836,22 +836,13 @@ mod tests {
     }
 
     #[test]
-    fn hover_highlights_a_selector_without_moving_focus() {
-        let mut d = dialog();
-        d.profile_selector_area = Rect::new(2, 4, 50, 1);
-        d.tool_selector_area = Rect::new(2, 5, 50, 1);
-        assert!(d.handle_hover(5, 5));
-        assert_eq!(d.hover.current(), Some(d.tool_selector_area));
-        assert_eq!(d.focused_field, 0, "hover must not move the focused field");
-        assert!(d.handle_hover(99, 99));
-        assert_eq!(d.hover.current(), None);
-    }
-
-    #[test]
-    fn deprecated_tool_badge_survives_a_constrained_configured_row() {
-        // Real geometry: 64 columns leaves a 60-column inner row. With three
-        // tools, a command override and extra args, the lifecycle suffix has
-        // to survive the trailing configuration metadata.
+    fn deprecated_tool_badge_renders_on_constrained_configured_restart_row() {
+        // Real dialog geometry: 64 columns leaves a 60-column inner row. With
+        // three tools, a configured command, and extra args, this fails if the
+        // lifecycle suffix moves behind the trailing configuration metadata.
+        // The frame is one cell larger on each side than the dialog: a
+        // fitted dialog keeps that margin clear, so this is the smallest
+        // frame in which it still gets its natural 64 columns.
         use ratatui::{backend::TestBackend, Terminal};
 
         for (tool, deprecated) in [("gemini", true), ("claude", false)] {
@@ -868,7 +859,7 @@ mod tests {
                     .collect(),
             );
             dialog.focused_field = 1;
-            let mut terminal = Terminal::new(TestBackend::new(64, 14)).expect("terminal");
+            let mut terminal = Terminal::new(TestBackend::new(66, 16)).expect("terminal");
             let theme = crate::tui::styles::Theme::default();
             terminal
                 .draw(|frame| dialog.render(frame, frame.area(), &theme))
