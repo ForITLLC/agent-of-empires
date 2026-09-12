@@ -197,34 +197,6 @@ impl Instance {
         self.idle_dormant_since = None;
     }
 
-    /// True for the single fleet-manager session ("AoE-Commander"). Used to
-    /// pin it to the absolute top of every sidebar view regardless of status
-    /// tier or group membership (see `HomeView::build_flat_items`).
-    /// `favorite`/`pinned_at` only pin within a status tier and sink when the
-    /// row goes idle; the commander must stay top-visible in every state.
-    /// Title-based so it tracks the session the user sees as the commander.
-    pub fn is_commander(&self) -> bool {
-        self.title == "AoE-Commander"
-    }
-
-    /// Pin rank for the commander lane: `Some(0)` for the Claude
-    /// `AoE-Commander` (exact title), `Some(1)` for a manager-lane twin titled
-    /// `AoE-Commander-<runtime>` (2026-09-08: `AoE-Commander-Codex`, the same
-    /// brief on OpenAI Codex), `None` for every other session. Ranked rows are
-    /// hoisted to the top of every view in rank order (see
-    /// `pin_commander_first`). `is_commander` stays the exact match on purpose:
-    /// it is the relay/routing identity of the one Claude Commander, and
-    /// widening it would re-target the twins.
-    pub fn commander_pin_rank(&self) -> Option<u8> {
-        if self.is_commander() {
-            return Some(0);
-        }
-        match self.title.strip_prefix("AoE-Commander-") {
-            Some(runtime) if !runtime.is_empty() => Some(1),
-            _ => None,
-        }
-    }
-
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
     }

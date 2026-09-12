@@ -2525,3 +2525,114 @@ fn test_all_profiles_view_shows_all_sessions_flat() {
         }
     }
 }
+
+/// Projection of the flat list that a title rename must leave untouched:
+/// (row kind, id-or-path, depth). Titles are deliberately NOT part of it.
+fn row_shape(items: &[Item]) -> Vec<(&'static str, String, usize)> {
+    items
+        .iter()
+        .map(|it| match it {
+            Item::Session { id, depth } => ("session", id.clone(), *depth),
+            Item::Group { path, depth, .. } => ("group", path.clone(), *depth),
+        })
+        .collect()
+}
+
+/// A session titled `AoE-Commander`, or an `AoE-Commander-<runtime>` twin
+/// such as `AoE-Commander-Codex`, is ordered by exactly the same comparator
+/// as any other title. The fleet-local "commander pin" that hoisted those
+/// rows to row 0 / rank 1 (depth 0, above the ungrouped rows, every group and
+/// the shelf) is retired.
+///
+/// The control is the identical fixture with the two rows renamed to neutral
+/// titles — same ids, same `created_at`, same group — so the title is the only
+/// variable. `Oldest`/`Newest` key on `created_at` alone, so the flat list
+/// must come out identical row-for-row, and the commander rows must sit
+/// inside their group at depth 1 exactly where the neutral rows do.
+#[test]
+#[serial]
+fn commander_titles_sort_like_any_other_title() {
+    use crate::session::config::{GroupByMode, SortOrder};
+    use chrono::{Duration, Utc};
+
+    let mut env = create_test_env_empty();
+    env.view.group_by = GroupByMode::Manual;
+
+    let base = Utc::now() - Duration::minutes(10);
+    let mut add = |title: &str, group: &str, minute: i64| -> String {
+        let mut inst = Instance::new(title, "/tmp/unpin");
+        inst.source_profile = "test".to_string();
+        inst.created_at = base + Duration::minutes(minute);
+        inst.group_path = group.to_string();
+        let id = inst.id.clone();
+        env.view.instances.insert(id.clone(), inst);
+        id
+    };
+    // Oldest→newest: the ungrouped row, then the group members. The two
+    // commander-lane rows are the NEWEST, so a hoist to row 0 is unmistakable
+    // under `Oldest`, and under `Newest` they must still sit below the
+    // ungrouped row and the group header, never above them at depth 0.
+    let ungrouped = add("ungrouped", "", 0);
+    let _worker = add("worker", "fleet", 1);
+    let commander = add("AoE-Commander", "fleet", 2);
+    let twin = add("AoE-Commander-Codex", "fleet", 3);
+    env.view.rebuild_group_trees();
+
+    let rename = |view: &mut HomeView, id: &str, title: &str| {
+        view.instances.get_mut(id).unwrap().title = title.to_string();
+    };
+
+    for (sort_order, label) in [(SortOrder::Oldest, "Oldest"), (SortOrder::Newest, "Newest")] {
+        env.view.sort_order = sort_order;
+
+        rename(&mut env.view, &commander, "AoE-Commander");
+        rename(&mut env.view, &twin, "AoE-Commander-Codex");
+        env.view.rebuild_group_trees();
+        env.view.flat_items = env.view.build_flat_items();
+        let with_commander_titles = row_shape(&env.view.flat_items);
+
+        // Control: identical state, neutral titles.
+        rename(&mut env.view, &commander, "neutral-a");
+        rename(&mut env.view, &twin, "neutral-b");
+        env.view.rebuild_group_trees();
+        env.view.flat_items = env.view.build_flat_items();
+        let with_neutral_titles = row_shape(&env.view.flat_items);
+
+        assert_eq!(
+            with_commander_titles, with_neutral_titles,
+            "{label}: renaming AoE-Commander / AoE-Commander-Codex to neutral titles \
+             must not move any row — the commander lane is not pinned"
+        );
+
+        // Spelled out: no commander-lane row is hoisted to row 0 / depth 0.
+        let ungrouped_pos = with_commander_titles
+            .iter()
+            .position(|(kind, id, _)| *kind == "session" && *id == ungrouped)
+            .expect("ungrouped row present");
+        let header_pos = with_commander_titles
+            .iter()
+            .position(|(kind, path, _)| *kind == "group" && path == "fleet")
+            .expect("fleet header present");
+        assert!(
+            ungrouped_pos < header_pos,
+            "{label}: the ungrouped row precedes the fleet header (natural flow)"
+        );
+        for (id, name) in [
+            (&commander, "AoE-Commander"),
+            (&twin, "AoE-Commander-Codex"),
+        ] {
+            let pos = with_commander_titles
+                .iter()
+                .position(|(kind, x, _)| *kind == "session" && x == id)
+                .unwrap_or_else(|| panic!("{label}: {name} row present"));
+            assert!(
+                pos > header_pos,
+                "{label}: {name} must sit below its group header, not hoisted to row {pos}"
+            );
+            assert_eq!(
+                with_commander_titles[pos].2, 1,
+                "{label}: {name} renders inside its group at depth 1, not pinned at depth 0"
+            );
+        }
+    }
+}
