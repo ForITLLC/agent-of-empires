@@ -151,7 +151,7 @@ impl PermissionResponseDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = super::centered_rect(area, 56, 9);
+        let dialog_area = super::fit_dialog(area, 56, 9);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
