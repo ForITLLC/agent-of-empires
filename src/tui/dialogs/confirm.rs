@@ -181,11 +181,15 @@ impl ConfirmDialog {
         // a multi-sentence body (e.g. the switch-view confirm) is never
         // clipped by a fixed row budget; short messages keep the historical
         // minimum so routine confirms don't shrink.
-        let width: u16 = if self.dont_ask_again.is_some() {
+        let natural_width: u16 = if self.dont_ask_again.is_some() {
             56
         } else {
             50
         };
+        // Fit the width to the live frame first: the message wraps at the
+        // width the dialog actually gets, so a frame narrower than the
+        // natural width grows the height instead of clipping the tail.
+        let width = super::fit_width(area, natural_width);
         // Border (2) + horizontal layout margin (2) eat four columns.
         let text_width = width.saturating_sub(4).max(1);
         let message_rows = wrapped_line_count(&self.message, text_width as usize);
@@ -193,11 +197,8 @@ impl ConfirmDialog {
         // variant adds spacer + checkbox + spacer.
         let chrome: u16 = if self.dont_ask_again.is_some() { 9 } else { 6 };
         let min_height: u16 = if self.dont_ask_again.is_some() { 11 } else { 8 };
-        let height = (message_rows as u16)
-            .saturating_add(chrome)
-            .max(min_height)
-            .min(area.height);
-        let dialog_area = super::centered_rect(area, width, height);
+        let height = (message_rows as u16).saturating_add(chrome).max(min_height);
+        let dialog_area = super::fit_dialog(area, width, height);
 
         frame.render_widget(Clear, dialog_area);
 
@@ -592,6 +593,56 @@ mod tests {
         assert!(
             yes_row > msg_row,
             "buttons must be below the last message line (yes_row={yes_row}, msg_row={msg_row})"
+        );
+    }
+
+    /// A frame narrower than the dialog's natural width (a phone-sized
+    /// tmux client) must wrap the message at the width the dialog actually
+    /// gets. Sizing the height from the natural width under-counts the rows
+    /// and clips the tail — the very case the row estimate exists to
+    /// prevent.
+    #[test]
+    fn narrow_frame_wraps_at_the_fitted_width() {
+        use crate::tui::styles::load_theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let body = "Switch this session to the structured view? The tmux pane \
+                    and its scrollback are destroyed; the agent restarts under \
+                    the aoe serve daemon (a local one is started if none is \
+                    running) with a fresh conversation.";
+        let mut dialog = ConfirmDialog::new("Switch to structured view", body, "switch_view");
+        let theme = load_theme("empire");
+        let backend = TestBackend::new(40, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| dialog.render(f, f.area(), &theme))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+
+        assert!(
+            screen.contains("fresh"),
+            "message tail should be visible at 40 columns, not clipped:\n{screen}"
+        );
+        let msg_row = screen
+            .lines()
+            .position(|l| l.contains("fresh"))
+            .expect("message tail row");
+        let yes_row = screen
+            .lines()
+            .position(|l| l.contains("Yes"))
+            .expect("yes button row");
+        assert!(
+            yes_row > msg_row,
+            "buttons must be below the last message line (yes_row={yes_row}, msg_row={msg_row}):\n{screen}"
         );
     }
 
