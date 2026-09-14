@@ -408,6 +408,140 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     assert_eq!(parked.acp_session_id.as_deref(), Some("acp-sess-1"));
 }
 
+/// Only a tool swap removes the sandbox container, and a failed removal fails the restart (#3959).
+#[cfg(unix)]
+#[test]
+#[serial]
+fn restart_selected_session_tool_swap_discards_sandbox_container() {
+    use crate::session::SandboxInfo;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    let bin = env._temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let calls = env._temp.path().join("runtime-calls");
+    let fail_removal = env._temp.path().join("fail-removal");
+    // Record every runtime call and fail all but removal (unless the
+    // `fail_removal` file exists), so the relaunch stops at the container probe
+    // instead of reaching tmux.
+    for binary in ["docker", "podman", "container"] {
+        let script = bin.join(binary);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = rm ] && [ ! -e '{}' ]; then exit 0; fi\n\
+                 echo 'permission denied' >&2\nexit 1\n",
+                calls.display(),
+                fail_removal.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _path = crate::session::test_support::path_prepended(&bin);
+
+    let seed = |inst: &mut Instance| {
+        inst.tool = "claude".to_string();
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "ubuntu:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+    };
+    env.view.mutate_instance(&id, seed);
+    env.view
+        .storages
+        .get("test")
+        .unwrap()
+        .update(|instances, _groups| {
+            seed(instances.iter_mut().find(|i| i.id == id).unwrap());
+            Ok(())
+        })
+        .unwrap();
+
+    let container = crate::containers::DockerContainer::from_session_id(&id).name;
+    let runtime_calls = || {
+        std::fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let removals = || {
+        runtime_calls()
+            .iter()
+            .filter(|line| line.starts_with("rm ") && line.ends_with(&container))
+            .count()
+    };
+    let restart = |env: &mut TestEnv, tool: Option<&str>| {
+        env.view.restart_cooldown_at.clear();
+        env.view
+            .restart_selected_session(None, tool, None, None)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !env.view.apply_restart_results() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restart did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+
+    for (tool, removal_fails, expected_removals, case) in [
+        (None, false, 0, "a plain restart must reuse the container"),
+        (
+            Some("claude"),
+            false,
+            0,
+            "restarting on the same tool is not a swap",
+        ),
+        (
+            Some("codex"),
+            false,
+            1,
+            "a tool swap must remove the container",
+        ),
+        (
+            Some("claude"),
+            true,
+            2,
+            "a failed removal must fail the restart",
+        ),
+    ] {
+        if removal_fails {
+            std::fs::write(&fail_removal, "").unwrap();
+        }
+        let calls_before = runtime_calls().len();
+        restart(&mut env, tool);
+        assert!(
+            runtime_calls().len() > calls_before,
+            "{case}: the relaunch never reached the container runtime"
+        );
+        assert_eq!(removals(), expected_removals, "{case}");
+        let error = env
+            .view
+            .instance_at(0)
+            .last_error
+            .clone()
+            .unwrap_or_default();
+        assert_eq!(
+            error.contains(&format!("{container} built for the previous tool")),
+            removal_fails,
+            "{case}: {error}"
+        );
+    }
+}
+
 /// The disk row a tool swap writes must resolve `agent_detect_as` against the
 /// session's own profile. `source_profile` is `skip_serializing`, so a
 /// storage-loaded row comes back blank and would key the default profile's
