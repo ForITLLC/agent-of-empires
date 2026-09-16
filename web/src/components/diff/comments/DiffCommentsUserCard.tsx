@@ -54,8 +54,13 @@ export function DiffCommentsUserCard({ payload }: Props) {
  *  block style. Falls back to plain `<pre>` while loading or when the
  *  language can't be resolved. See `lib/snippetHighlighter.ts`. */
 function HighlightedSnippet({ code, language, filePath }: { code: string; language?: string; filePath: string }) {
-  const [html, setHtml] = useState<string | null>(null);
+  // Keyed by the inputs that produced it, so a superseded request resolving
+  // before its effect cleanup renders nothing. Theme is left out of the key
+  // so a theme switch keeps the old palette until the re-highlight lands.
+  const inputKey = `${code} ${language ?? ""} ${filePath}`;
+  const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const shiki = useShikiTheme();
+
   useEffect(() => {
     let cancelled = false;
     const hint = language && language.length > 0 ? language : (filePath.split(".").pop() ?? "");
@@ -63,8 +68,8 @@ function HighlightedSnippet({ code, language, filePath }: { code: string; langua
     (async () => {
       try {
         const out = await highlightSnippet(code, { langHint: hint, theme: shiki.theme, appearance: shiki.appearance });
-        if (cancelled) return;
-        if (out) setHtml(out);
+        if (cancelled || !out) return;
+        setResult({ key: inputKey, html: out });
       } catch {
         // Unknown lang → fall through to plain rendering.
       }
@@ -72,7 +77,9 @@ function HighlightedSnippet({ code, language, filePath }: { code: string; langua
     return () => {
       cancelled = true;
     };
-  }, [code, language, filePath, shiki.theme, shiki.appearance]);
+  }, [code, language, filePath, inputKey, shiki.theme, shiki.appearance]);
+
+  const html = result && result.key === inputKey ? result.html : null;
 
   if (html) {
     // Shiki HTML-escapes the user-supplied `code` before tokenizing, so
