@@ -69,6 +69,7 @@ use super::watchdog::{
     OFF_PROTOCOL_WORK_GRACE_FLOOR,
 };
 use super::SessionResources;
+use crate::acp::control_protocol::SessionReplayed;
 
 /// Fully silent grace after reattaching to an in-flight turn. Any inbound
 /// notification disarms this watchdog because later silence may be reasoning.
@@ -287,9 +288,9 @@ pub(super) async fn run_connection_task<W, R>(
     // the original run, so passing them through would double the
     // transcript on the next reload; every prior assistant bubble
     // appears once from disk replay, then again from the agent's
-    // history dump. Suppress agent-side notifications during the
-    // window between session/load success and the first user prompt;
-    // cleared on the first ClientCmd::Prompt below.
+    // history dump. Suppress transcript events from session/load until
+    // the first ClientCmd::Prompt below; a runner-hosted load waits for its
+    // replay to apply before the loop can take that prompt.
     let suppress_history_replay = Arc::new(AtomicBool::new(false));
     let suppress_for_notif = suppress_history_replay.clone();
     let suppress_for_block = suppress_history_replay.clone();
@@ -409,6 +410,7 @@ pub(super) async fn run_connection_task<W, R>(
     let agent_msg_dedup_for_block = agent_msg_dedup.clone();
     let control_notifications = control_client.is_some();
     let control_on_close = control_client.clone();
+    let control_for_replayed = control_client.clone();
     let control_on_exit = control_client.clone();
 
     let apply_notification = Arc::new(
@@ -726,6 +728,15 @@ pub(super) async fn run_connection_task<W, R>(
                     let Some((notification, _guard)) = ingress.notification(notification, wire_bytes).await? else { return Ok(()); };
                     apply(notification, true).await
                 }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_notification(
+            move |marker: SessionReplayed, _cx| {
+                if let Some(control) = control_for_replayed.as_ref() {
+                    control.mark_session_replayed(marker);
+                }
+                async { Ok(()) }
             },
             agent_client_protocol::on_receive_notification!(),
         )
@@ -1274,12 +1285,18 @@ pub(super) async fn run_connection_task<W, R>(
                                 .mcp_servers(mcp_servers.clone());
                             // Detached v3 runners own session/load.
                             let load_result = if let Some(control) = control_client.as_ref() {
-                                establish_session_v3::<LoadSessionResponse>(
+                                let result = establish_session_v3::<LoadSessionResponse>(
                                     control,
                                     "session/load",
                                     &req,
                                 )
-                                .await
+                                .await;
+                                // The runner sends SessionReady ahead of the replay;
+                                // a prompt must not end suppression mid-replay (#4016).
+                                if result.is_ok() {
+                                    control.session_replayed().await;
+                                }
+                                result
                             } else {
                                 connection.send_request(req).block_task().await
                             };
