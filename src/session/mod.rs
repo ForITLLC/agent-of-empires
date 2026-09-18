@@ -49,10 +49,10 @@ pub(crate) use anchored_fs::AnchoredDir;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, update_app_state, update_config,
-    validate_snooze_duration, AgentRuntimeConfig, AttachMode, CapabilityGrant, ClickAction, Config,
-    ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionMode, PluginConfig,
-    RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxSettingMode,
-    UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
+    validate_snooze_duration, AccountsConfig, AgentRuntimeConfig, AttachMode, CapabilityGrant,
+    ClickAction, Config, ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionMode,
+    PluginConfig, RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig,
+    TmuxSettingMode, UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
