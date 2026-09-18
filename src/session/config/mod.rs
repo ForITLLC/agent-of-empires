@@ -73,6 +73,12 @@ pub struct Config {
     #[serde(default)]
     pub relay: RelayConfig,
 
+    /// Account dirs the daemon treats as credential-file-only (never
+    /// usage-polled, never token-refreshed). Global/profile only: a repo
+    /// never decides which of the host's accounts are drawn on.
+    #[serde(default)]
+    pub accounts: AccountsConfig,
+
     #[serde(default)]
     pub acp: AcpConfig,
 
@@ -2148,6 +2154,45 @@ pub struct RelayBoard {
     pub secret_file: String,
 }
 
+/// `[accounts]`: which account dirs are credential-file-only.
+///
+/// A management, personal or work-gated account is one nothing in the fleet
+/// draws on. For such an account the daemon reads the credential file's
+/// expiry for the `/status` identity and nothing else: it never calls the
+/// account's OAuth usage endpoint and never refreshes its token. The
+/// classification lives here, in the one config the daemon reads, so every
+/// poller (and any tool that reads `config.toml`) shares it instead of
+/// carrying its own list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AccountsConfig {
+    /// Exact account names (config-dir basenames) that are credential-file-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub management: Vec<String>,
+    /// Account-name prefixes that are credential-file-only (`personal-`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub management_prefixes: Vec<String>,
+}
+
+impl AccountsConfig {
+    /// Whether `account` (a config-dir basename) is credential-file-only.
+    /// Case-sensitive: account names are directory names. An empty prefix
+    /// never matches, so a stray `""` cannot classify every account.
+    pub fn is_management(&self, account: &str) -> bool {
+        self.management.iter().any(|m| m == account)
+            || self
+                .management_prefixes
+                .iter()
+                .any(|p| !p.is_empty() && account.starts_with(p.as_str()))
+    }
+
+    /// Whether any classification is configured. An empty section means
+    /// every account dir is usage-polled, which the daemon warns about on
+    /// each pass.
+    pub fn is_configured(&self) -> bool {
+        !self.management.is_empty() || !self.management_prefixes.is_empty()
+    }
+}
+
 /// Serde default for `Config.default_profile`. Empty means "not explicitly
 /// chosen"; the active profile is then resolved at runtime by
 /// `resolve_default_profile`, which picks the first existing profile or
@@ -3730,6 +3775,35 @@ mod model_value_quoting_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[accounts]` parses into the policy, a config without the section is
+    /// the empty (unconfigured) policy, and classification is exact-name or
+    /// prefix, case-sensitive, with an empty prefix matching nothing.
+    #[test]
+    fn accounts_section_parses_and_classifies() {
+        let cfg: Config = toml::from_str(
+            "[accounts]\nmanagement = [\"aoe-wmw\", \"forit-work\"]\nmanagement_prefixes = [\"personal-\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.accounts.is_configured());
+        assert!(cfg.accounts.is_management("aoe-wmw"));
+        assert!(cfg.accounts.is_management("forit-work"));
+        assert!(cfg.accounts.is_management("personal-x"));
+        assert!(!cfg.accounts.is_management("bp-main"));
+        assert!(!cfg.accounts.is_management("AOE-WMW"));
+        assert!(!cfg.accounts.is_management("personal"));
+
+        let none: Config = toml::from_str("[theme]\nname = \"zinc\"\n").unwrap();
+        assert_eq!(none.accounts, AccountsConfig::default());
+        assert!(!none.accounts.is_configured());
+        assert!(!none.accounts.is_management("aoe-wmw"));
+
+        let empty_prefix = AccountsConfig {
+            management_prefixes: vec![String::new()],
+            ..Default::default()
+        };
+        assert!(!empty_prefix.is_management("anything"));
+    }
 
     /// Drives the `auto` branch of [`resolve_tmux_setting`]: a config that does
     /// not set the option must read as "silent" so aoe still applies its own

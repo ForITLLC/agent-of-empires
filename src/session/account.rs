@@ -24,6 +24,9 @@ pub const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 pub const OAUTH_BETA: &str = "oauth-2025-04-20";
 /// Minimum spacing between two usage reads of one account.
 pub const USAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Shortest pause after the endpoint answers 429, and the pause when its
+/// `Retry-After` is absent or unreadable.
+pub const USAGE_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(60);
 /// How deep below a pane's shell we look for the agent process.
 const ENV_WALK_DEPTH: usize = 4;
 
@@ -70,6 +73,10 @@ pub struct UsageSnapshot {
     /// Unix seconds when the endpoint was read (or the read failed).
     pub read_at: u64,
     pub error: Option<String>,
+    /// Seconds the endpoint asked us to wait, set only when the read was a
+    /// 429 (already clamped to [`USAGE_BACKOFF_MIN`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
 }
 
 /// Where a session's account came from.
@@ -257,6 +264,17 @@ pub fn usage_error(read_at: u64, error: impl Into<String>) -> UsageSnapshot {
         error: Some(error.into()),
         ..Default::default()
     }
+}
+
+/// How long a 429 asks us to stay away, from its `Retry-After` header:
+/// delta-seconds clamped up to [`USAGE_BACKOFF_MIN`]; the minimum when the
+/// header is absent or not a plain number (the HTTP-date form is treated as
+/// unreadable rather than parsed).
+pub fn retry_after_secs(header: Option<&str>) -> u64 {
+    let min = USAGE_BACKOFF_MIN.as_secs();
+    header
+        .and_then(|h| h.trim().parse::<u64>().ok())
+        .map_or(min, |s| s.max(min))
 }
 
 /// One environment variable of a live process, or `None` when the process
@@ -701,6 +719,19 @@ mod tests {
         assert_eq!(e.error.as_deref(), Some("http 401"));
         assert_eq!(e.fable_pct, None);
         assert_eq!(e.read_at, 5);
+    }
+
+    #[test]
+    fn retry_after_is_clamped_to_the_minimum_and_defaults_to_it() {
+        assert_eq!(retry_after_secs(None), 60);
+        assert_eq!(retry_after_secs(Some("5")), 60);
+        assert_eq!(retry_after_secs(Some("120")), 120);
+        assert_eq!(retry_after_secs(Some(" 300 ")), 300);
+        assert_eq!(retry_after_secs(Some("garbage")), 60);
+        assert_eq!(retry_after_secs(Some("Wed, 21 Oct 2026 07:28:00 GMT")), 60);
+        assert_eq!(retry_after_secs(Some("")), 60);
+        // A failed read never carries a wait unless it was a 429.
+        assert_eq!(usage_error(1, "http 401").retry_after_secs, None);
     }
 
     #[test]
