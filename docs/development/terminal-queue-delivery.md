@@ -25,12 +25,14 @@ The dispositions are:
   review. There is no automatic second paste or recovery Enter.
 - `released` / `released:N`: one more attempt is granted. Bare `released` is
   an operator's (`aoe session queue release <session> <qid>`, or
-  `POST /api/sessions/{id}/queue/{promptId}/release`), written only over
-  `claimed` or `legacy_uncertain`. `released:N` is the drain's own, written
-  when an Enter was withheld after the paste and the composer was verifiably
-  restored (empty, or exactly the human's bytes again); N counts the
-  automatic attempts so far. The next claim overwrites a release; a
-  delivered or dropped row can never be released.
+  `POST /api/sessions/{id}/queue/{promptId}/release`), written only over a
+  held receipt: `claimed`, `legacy_uncertain`, or a `released:N` whose
+  automatic attempts are spent (it resets the count). `released:N` is the
+  drain's own, written when an Enter was withheld after the paste and the
+  composer was verifiably restored (empty, or exactly the human's bytes
+  again); N counts the automatic attempts so far, and at the cap (3) the row
+  is held. The next claim overwrites a release; a delivered or dropped row
+  can never be released.
 - `delivered`: the one Enter was sent and an empty rendered composer was
   observed afterward. The receipt is persisted before removing the row.
 - `dropped`: removal writes this receipt first, including the CLI's offline
@@ -45,7 +47,8 @@ and delivers the first row that may be attempted. Held rows wait for an
 operator to release or drop them, and the release is refused (HTTP 409
 `queue_row_not_held`) for a row that is not held. `GET
 /api/sessions/{id}/queue/receipts` lists the receipts of the queued rows;
-`aoe session queue <session>` shows them as a HOLD column.
+`aoe session queue <session>` shows them as a HOLD column (`-` never
+attempted, `review`, `released`, `exhausted`, `retiring`).
 
 An Enter withheld after the paste (the pane stopped reading as idle, the paste
 never rendered whole, or the composer could not be read) does not leave the
@@ -54,7 +57,21 @@ to its own paste (one Backspace for a chip, one per character inline, the
 abort path when a human's bytes sit beside it) and never touches text it cannot
 explain. When the composer is verifiably restored the row is released for
 another attempt, up to three automatic attempts (`held:attempts_exhausted`
-after that); otherwise it is held for review with the composer as it was.
+after that, until an operator releases it); otherwise it is held for review
+with the composer as it was.
+
+The idle read immediately before Enter runs on the capture with the composer
+body collapsed to an empty prompt row. The paste itself can fill the box over
+many rows on a narrow pane, and neither idle rule survives that: `ready_prompt`
+wants an empty `❯` row, and `completed_turn` reads the last non-empty row above
+the box, where Claude's `/goal` chrome sits on a session with a goal. A
+46-column pane with a goal withheld every attempt as `agent_not_idle` with no
+status change logged, purely because of what the drain had typed. With the body
+collapsed the capture is the shape the pre-paste check passed on; a spinner or
+interrupt banner above the box still reads as running. A box scrolled to its
+caret shows only the paste's tail: a visible tail of at least 24 characters
+that ends the paste is the daemon's own (`Scrolled`), submitted before Enter
+and deleted whole by the strip.
 
 Hold logs include `held:agent_busy`, `held:composer_busy`,
 `held:attempt_recorded`, `held:attempts_exhausted`,

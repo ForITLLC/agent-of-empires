@@ -37,6 +37,22 @@ pub(crate) fn released_disposition(attempts: u32) -> String {
     }
 }
 
+/// Automatic paste attempts a row may consume before it is held for an
+/// operator. Each one required the previous paste to be verifiably removed;
+/// three withheld Enters in a row means the pane, not the timing, is the
+/// problem.
+pub(crate) const MAX_AUTOMATIC_ATTEMPTS: u32 = 3;
+
+/// A receipt that holds its row for an operator: a claim nothing has
+/// re-evaluated (`claimed`, `legacy_uncertain`), or a release whose
+/// automatic attempts are spent (`released:N`, N at the cap or past it).
+pub(crate) fn receipt_is_held(disposition: &str) -> bool {
+    match released_attempts(disposition) {
+        Some(attempts) => attempts >= MAX_AUTOMATIC_ATTEMPTS,
+        None => matches!(disposition, "claimed" | "legacy_uncertain"),
+    }
+}
+
 /// Which existing receipt a write may overwrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Overwrite {
@@ -64,11 +80,12 @@ impl EventStore {
         Ok(())
     }
 
-    /// Release a held row (`claimed` or `legacy_uncertain`) for one more
-    /// attempt, recording `attempts` automatic attempts so far (0 for an
-    /// operator's release). `Ok(false)` when there is no held receipt to
-    /// release: none at all, delivered, dropped, or already released. A
-    /// delivered or dropped row can never come back this way.
+    /// Release a held row (see [`receipt_is_held`]) for one more attempt,
+    /// recording `attempts` automatic attempts so far (0 for an operator's
+    /// release, which also resets a spent count). `Ok(false)` when there is
+    /// no held receipt to release: none at all, delivered, dropped, or
+    /// released with attempts to spare. A delivered or dropped row can never
+    /// come back this way.
     pub(crate) fn release_terminal_prompt(
         &self,
         session: &str,
@@ -79,13 +96,25 @@ impl EventStore {
             .conn
             .lock()
             .map_err(|_| anyhow::anyhow!("queue receipt lock poisoned"))?;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT disposition FROM terminal_queue_receipts WHERE session_id = ?1 AND prompt_id = ?2",
+                params![session, qid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current) = current.filter(|d| receipt_is_held(d)) else {
+            return Ok(false);
+        };
         let previous: i64 = conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        // The lock serializes writers in this process; the compare on the
+        // receipt just read keeps a competing handle's write from being
+        // overwritten unseen.
         let result = conn.execute(
             "UPDATE terminal_queue_receipts SET disposition = ?3
-             WHERE session_id = ?1 AND prompt_id = ?2
-               AND disposition IN ('claimed', 'legacy_uncertain')",
-            params![session, qid, released_disposition(attempts)],
+             WHERE session_id = ?1 AND prompt_id = ?2 AND disposition = ?4",
+            params![session, qid, released_disposition(attempts), current],
         );
         let restored = conn.pragma_update(None, "synchronous", previous);
         let changed = result?;
@@ -188,6 +217,17 @@ mod tests {
         assert!(store.release_terminal_prompt("s", "q", 2).unwrap());
         assert!(!store.release_terminal_prompt("s", "q", 3).unwrap());
         assert_eq!(receipt("q").as_deref(), Some("released:2"));
+        // The drain's last automatic release leaves the row spent: held, so
+        // an operator's release brings it back and resets the count.
+        assert!(store.claim_terminal_prompt("s", "q").unwrap());
+        assert!(store
+            .release_terminal_prompt("s", "q", MAX_AUTOMATIC_ATTEMPTS)
+            .unwrap());
+        let spent = released_disposition(MAX_AUTOMATIC_ATTEMPTS);
+        assert_eq!(receipt("q").as_deref(), Some(spent.as_str()));
+        assert!(store.release_terminal_prompt("s", "q", 0).unwrap());
+        assert_eq!(receipt("q").as_deref(), Some("released"));
+        assert!(!store.release_terminal_prompt("s", "q", 0).unwrap());
         // Delivered and dropped rows never come back.
         store.claim_terminal_prompt("s", "q").unwrap();
         store.complete_terminal_prompt("s", "q").unwrap();
@@ -214,6 +254,20 @@ mod tests {
         assert!(store.release_terminal_prompt("s", "legacy", 0).unwrap());
         assert_eq!(receipt("legacy").as_deref(), Some("released"));
         assert!(store.claim_terminal_prompt("s", "legacy").unwrap());
+    }
+
+    #[test]
+    fn held_receipts_are_claims_and_spent_releases() {
+        assert!(receipt_is_held("claimed"));
+        assert!(receipt_is_held("legacy_uncertain"));
+        assert!(!receipt_is_held("released"));
+        assert!(!receipt_is_held("released:1"));
+        assert!(receipt_is_held(&released_disposition(
+            MAX_AUTOMATIC_ATTEMPTS
+        )));
+        assert!(receipt_is_held("released:9"));
+        assert!(!receipt_is_held("delivered"));
+        assert!(!receipt_is_held("dropped"));
     }
 
     #[test]
