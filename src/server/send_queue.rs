@@ -4,14 +4,29 @@
 //! submit, abort, panic, or stale queue reload must never cause another paste.
 //! Claimed rows remain held for operator review; dropping one writes a
 //! tombstone before mutating the queue. Structured queues use the ACP drain.
+//!
+//! A held row does not block the rows behind it: the drain walks the queue in
+//! order, retires consumed rows, skips held ones, and delivers the first row
+//! that may be attempted. An Enter withheld after the paste (agent no longer
+//! idle, paste clipped, composer unreadable) strips the paste and, when the
+//! composer verifiably holds none of it, releases the row for another attempt,
+//! up to [`MAX_AUTOMATIC_ATTEMPTS`]. An operator releases a held row with
+//! `aoe session queue release`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use super::state::AppState;
+use crate::acp::event_store::terminal_queue::released_attempts;
 use crate::session::{Instance, Status};
-use crate::tmux::{GuardedSend, KeystrokeAbort};
+use crate::tmux::{GuardedSend, KeystrokeAbort, WithheldPaste};
+
+/// Automatic paste attempts a row may consume before it is held for an
+/// operator. Each one required the previous paste to be verifiably removed;
+/// three withheld Enters in a row means the pane, not the timing, is the
+/// problem.
+pub(crate) const MAX_AUTOMATIC_ATTEMPTS: u32 = 3;
 
 /// The drain's clocks. Defaults are the tuned values; each has an
 /// environment override (milliseconds) read once at daemon start so a fleet
@@ -82,6 +97,10 @@ pub(crate) struct QuietState {
     pub aborts: u32,
     /// Last hold decision logged at INFO and when, to rate-limit repeats.
     last_logged: Option<(&'static str, Instant)>,
+    /// Rows already announced as held for review, so the skip logs once per
+    /// row at INFO and then at DEBUG. A row leaves the set when it becomes
+    /// deliverable again.
+    reviewed: HashSet<String>,
 }
 
 /// Why a row is held this tick.
@@ -91,6 +110,11 @@ pub(crate) enum Hold {
     ComposerBusy,
     AgentBusy,
     AttemptRecorded,
+    /// Released and re-attempted [`MAX_AUTOMATIC_ATTEMPTS`] times; only an
+    /// operator's release grants another.
+    AttemptsExhausted {
+        attempts: u32,
+    },
     UnsupportedReader,
     /// Clear, but not yet for the whole quiet window.
     QuietWindow {
@@ -113,11 +137,37 @@ impl Hold {
             Hold::ComposerBusy => "held:composer_busy",
             Hold::AgentBusy => "held:agent_busy",
             Hold::AttemptRecorded => "held:attempt_recorded",
+            Hold::AttemptsExhausted { .. } => "held:attempts_exhausted",
             Hold::UnsupportedReader => "held:unsupported_reader",
             Hold::QuietWindow { .. } => "held:quiet_window",
             Hold::Typing { .. } => "held:typing",
             Hold::Backoff { .. } => "held:backoff",
         }
+    }
+}
+
+/// What the drain does with one queue row, decided from its receipt alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowFate {
+    /// Delivered or dropped: a stale snapshot resurrected it. Remove it
+    /// without typing.
+    Retire,
+    /// Held for an operator; the rows behind it may still drain.
+    Held(Hold),
+    /// No receipt, or a release with attempts to spare: this row may be
+    /// attempted, and `attempts` automatic attempts precede this one.
+    Deliver { attempts: u32 },
+}
+
+pub(crate) fn row_fate(receipt: Option<&str>) -> RowFate {
+    match receipt {
+        None => RowFate::Deliver { attempts: 0 },
+        Some("delivered") | Some("dropped") => RowFate::Retire,
+        Some(disposition) => match released_attempts(disposition) {
+            Some(attempts) if attempts < MAX_AUTOMATIC_ATTEMPTS => RowFate::Deliver { attempts },
+            Some(attempts) => RowFate::Held(Hold::AttemptsExhausted { attempts }),
+            None => RowFate::Held(Hold::AttemptRecorded),
+        },
     }
 }
 
@@ -201,6 +251,21 @@ fn log_hold(id: &str, qid: &str, hold: Hold) {
     }
 }
 
+/// A row skipped for operator review: one INFO line the first time this
+/// daemon sees it held, DEBUG on every later tick.
+fn log_review_skip(id: &str, qid: &str, disposition: &str, hold: Hold) {
+    let first = with_quiet(id, |st| st.reviewed.insert(qid.to_string()));
+    if first {
+        tracing::info!(target: "server.send_queue", session = %id, %qid, %disposition,
+            decision = hold.label(),
+            "queued send held for operator review; rows behind it still drain \
+             (`aoe session queue release <session> <qid>` after inspecting the pane)");
+    } else {
+        tracing::debug!(target: "server.send_queue", session = %id, %qid, %disposition,
+            decision = hold.label(), "queued send still held for operator review");
+    }
+}
+
 static QUIET: LazyLock<Mutex<HashMap<String, QuietState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -273,6 +338,14 @@ pub(crate) enum DeliverOutcome {
     /// A human's keystroke landed beside the paste. The attempt is consumed
     /// and the row stays held for review, even after a successful cleanup.
     Aborted(KeystrokeAbort),
+    /// The paste was typed and its Enter withheld. `attempts` counts this
+    /// one; `released` says the row was granted another (the paste was
+    /// verifiably removed and the cap not reached).
+    Withheld {
+        paste: WithheldPaste,
+        attempts: u32,
+        released: bool,
+    },
     /// The pane is not running; the row waits for a start or restart.
     PaneMissing,
     /// A send failure. Any recorded claim prevents automatic retry.
@@ -281,8 +354,9 @@ pub(crate) enum DeliverOutcome {
     Nothing,
 }
 
-/// Deliver the head of one session's queue if its composer is clear and has
-/// been quiet for the whole window.
+/// Deliver the first deliverable row of one session's queue if its composer
+/// is clear and has been quiet for the whole window. Rows held for operator
+/// review are skipped, not waited on.
 async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
     // Same lock order as `send_message`: the instance lock serialises this
     // pane's keystrokes against a concurrent POST /send; the submission
@@ -297,7 +371,7 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
     else {
         return DeliverOutcome::Nothing;
     };
-    let (session_id, title, tool, status, head) = {
+    let (session_id, title, tool, status, queue) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return DeliverOutcome::Nothing;
@@ -307,40 +381,62 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
         }
         let mut queue = inst.queued_prompts.clone();
         queue.sort_by_key(|e| e.seq);
-        let Some(head) = queue.first().cloned() else {
-            return DeliverOutcome::Nothing;
-        };
         (
             inst.id.clone(),
             inst.title.clone(),
             inst.tool.clone(),
             inst.status,
-            head,
+            queue,
         )
     };
-    match state.acp_event_store.terminal_prompt_receipt(id, &head.id) {
-        Ok(Some(disposition)) if matches!(disposition.as_str(), "delivered" | "dropped") => {
-            state
-                .session_service
-                .retire_delivered_prompt(id, &head.id)
-                .await;
-            tracing::info!(target: "server.send_queue", session = %id, qid = %head.id,
-                %disposition, decision = "retired:replay", "consumed qid removed from stale queue");
-            return DeliverOutcome::Nothing;
-        }
-        Ok(Some(disposition)) => {
-            log_hold(id, &head.id, Hold::AttemptRecorded);
-            tracing::debug!(target: "server.send_queue", session = %id, qid = %head.id, %disposition,
-                "attempt requires operator review");
-            return DeliverOutcome::Held(Hold::AttemptRecorded);
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::error!(target: "server.send_queue", session = %id, qid = %head.id,
-                %error, decision = "held:receipt_unavailable", "queue receipt read failed; no input sent");
-            return DeliverOutcome::Failed(format!("queue receipt read failed: {error}"));
+    // Walk the queue in order: consumed rows are retired, held rows are
+    // skipped (they wait for an operator, not for the rows behind them),
+    // and the first row that may be attempted becomes this tick's head.
+    let mut chosen: Option<(crate::daemon::QueuedPromptEntry, u32)> = None;
+    let mut first_hold: Option<(String, Hold)> = None;
+    let mut held_for_review = 0usize;
+    for row in queue {
+        let receipt = match state.acp_event_store.terminal_prompt_receipt(id, &row.id) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tracing::error!(target: "server.send_queue", session = %id, qid = %row.id,
+                    %error, decision = "held:receipt_unavailable", "queue receipt read failed; no input sent");
+                return DeliverOutcome::Failed(format!("queue receipt read failed: {error}"));
+            }
+        };
+        match row_fate(receipt.as_deref()) {
+            RowFate::Retire => {
+                state
+                    .session_service
+                    .retire_delivered_prompt(id, &row.id)
+                    .await;
+                tracing::info!(target: "server.send_queue", session = %id, qid = %row.id,
+                    disposition = receipt.as_deref().unwrap_or("-"), decision = "retired:replay",
+                    "consumed qid removed from stale queue");
+            }
+            RowFate::Held(hold) => {
+                held_for_review += 1;
+                log_review_skip(id, &row.id, receipt.as_deref().unwrap_or("-"), hold);
+                if first_hold.is_none() {
+                    first_hold = Some((row.id.clone(), hold));
+                }
+            }
+            RowFate::Deliver { attempts } => {
+                with_quiet(id, |st| st.reviewed.remove(&row.id));
+                chosen = Some((row, attempts));
+                break;
+            }
         }
     }
+    let Some((head, attempts)) = chosen else {
+        return match first_hold {
+            Some((qid, hold)) => {
+                log_hold(id, &qid, hold);
+                DeliverOutcome::Held(hold)
+            }
+            None => DeliverOutcome::Nothing,
+        };
+    };
     if tool != "claude" {
         with_quiet(id, |st| st.clear_since = None);
         log_hold(id, &head.id, Hold::UnsupportedReader);
@@ -410,6 +506,21 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
                 DeliverOutcome::Held(Hold::ComposerBusy)
             }
             Ok(GuardedSend::AlreadyAttempted) => DeliverOutcome::Held(Hold::AttemptRecorded),
+            Ok(GuardedSend::Withheld(paste)) => {
+                // The pane changed under the paste. Back off as after an
+                // abort: whatever moved it (a turn starting, a human) is
+                // still there, and the strip just sent keystrokes.
+                with_quiet(&quiet_id, |st| {
+                    st.clear_since = None;
+                    st.backoff_until = Some(Instant::now() + t.abort_backoff);
+                    st.last_logged = None;
+                });
+                DeliverOutcome::Withheld {
+                    paste,
+                    attempts: attempts + 1,
+                    released: false,
+                }
+            }
             Ok(GuardedSend::Aborted(abort)) => {
                 with_quiet(&quiet_id, |st| {
                     st.clear_since = None;
@@ -433,6 +544,35 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
     .await
     .unwrap_or_else(|e| DeliverOutcome::Failed(format!("delivery task panicked: {e}")));
 
+    // A withheld Enter whose paste was verifiably removed releases the row
+    // for another attempt, recording how many it has had. The receipt
+    // stays `claimed` (held for review) when the composer could not be
+    // restored, or when the release itself could not be recorded.
+    let outcome = match outcome {
+        DeliverOutcome::Withheld {
+            paste, attempts, ..
+        } => {
+            let released = paste.restored
+                && match state
+                    .acp_event_store
+                    .release_terminal_prompt(id, &head.id, attempts)
+                {
+                    Ok(released) => released,
+                    Err(error) => {
+                        tracing::error!(target: "server.send_queue", session = %id, qid = %head.id,
+                            %error, "release receipt failed; row stays held for review");
+                        false
+                    }
+                };
+            DeliverOutcome::Withheld {
+                paste,
+                attempts,
+                released,
+            }
+        }
+        other => other,
+    };
+
     match &outcome {
         DeliverOutcome::Delivered => {
             if let Err(error) = state.acp_event_store.complete_terminal_prompt(id, &head.id) {
@@ -452,12 +592,31 @@ async fn deliver_head_once(state: Arc<AppState>, id: &str) -> DeliverOutcome {
                 st.last_logged = None;
             });
             tracing::info!(target: "server.send_queue", session = %id, qid = %head.id,
-                decision = "delivered",
+                decision = "delivered", attempts,
                 sender = head.origin_device.as_deref().unwrap_or("-"),
-                urgent_ack = ack.as_str(), "queued send delivered");
+                held_for_review, urgent_ack = ack.as_str(), "queued send delivered");
         }
         DeliverOutcome::Held(hold) => {
             log_hold(id, &head.id, *hold);
+        }
+        DeliverOutcome::Withheld {
+            paste,
+            attempts,
+            released,
+        } => {
+            let decision = if !released {
+                "withheld:held"
+            } else if *attempts < MAX_AUTOMATIC_ATTEMPTS {
+                "withheld:released"
+            } else {
+                "withheld:exhausted"
+            };
+            tracing::warn!(target: "server.send_queue", session = %id, qid = %head.id,
+                decision, reason = paste.reason.label(), restored = paste.restored,
+                rounds = paste.rounds, attempts, released,
+                backoff_ms = timing().abort_backoff.as_millis() as u64,
+                "queued send withheld before Enter; paste removed where it could be \
+                 identified: {}", paste.detail);
         }
         DeliverOutcome::Aborted(abort) => {
             let aborts = with_quiet(id, |st| st.aborts);
@@ -504,6 +663,50 @@ mod tests {
             origin_device: Some("aoe send".to_string()),
         });
         i
+    }
+
+    #[test]
+    fn row_fate_is_decided_by_the_receipt_alone() {
+        use super::{row_fate, RowFate, MAX_AUTOMATIC_ATTEMPTS};
+        assert_eq!(row_fate(None), RowFate::Deliver { attempts: 0 });
+        assert_eq!(row_fate(Some("delivered")), RowFate::Retire);
+        assert_eq!(row_fate(Some("dropped")), RowFate::Retire);
+        assert_eq!(
+            row_fate(Some("claimed")),
+            RowFate::Held(Hold::AttemptRecorded)
+        );
+        assert_eq!(
+            row_fate(Some("legacy_uncertain")),
+            RowFate::Held(Hold::AttemptRecorded)
+        );
+        // An operator's release, and automatic releases under the cap.
+        assert_eq!(row_fate(Some("released")), RowFate::Deliver { attempts: 0 });
+        assert_eq!(
+            row_fate(Some("released:1")),
+            RowFate::Deliver { attempts: 1 }
+        );
+        assert_eq!(
+            row_fate(Some(&format!("released:{}", MAX_AUTOMATIC_ATTEMPTS - 1))),
+            RowFate::Deliver {
+                attempts: MAX_AUTOMATIC_ATTEMPTS - 1
+            }
+        );
+        // At the cap only an operator's release (attempts 0) grants more.
+        assert_eq!(
+            row_fate(Some(&format!("released:{MAX_AUTOMATIC_ATTEMPTS}"))),
+            RowFate::Held(Hold::AttemptsExhausted {
+                attempts: MAX_AUTOMATIC_ATTEMPTS
+            })
+        );
+        assert_eq!(
+            Hold::AttemptsExhausted { attempts: 3 }.label(),
+            "held:attempts_exhausted"
+        );
+        // Anything unparseable is held, never delivered.
+        assert_eq!(
+            row_fate(Some("released:x")),
+            RowFate::Held(Hold::AttemptRecorded)
+        );
     }
 
     #[test]
