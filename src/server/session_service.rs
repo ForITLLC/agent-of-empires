@@ -93,7 +93,8 @@ pub(crate) enum ReleaseQueuedOutcome {
     /// No such session, or no row with that `prompt_id` in its queue.
     NotFound,
     /// The row exists but is not held for review: no receipt yet (nothing
-    /// to release), delivered, dropped, or already released.
+    /// to release), delivered, dropped, or released with automatic attempts
+    /// to spare.
     NotHeld { disposition: Option<String> },
 }
 
@@ -1004,7 +1005,8 @@ impl SessionService {
 
     /// Release a queued terminal row an operator has inspected, so the drain
     /// attempts it once more. Only a held receipt (`claimed`,
-    /// `legacy_uncertain`) is released; the row must still be in the queue.
+    /// `legacy_uncertain`, or a release whose automatic attempts are spent)
+    /// is released; the row must still be in the queue.
     /// Serialized against delivery like every other queue mutation, so the
     /// release never lands between a drain's receipt read and its claim.
     pub(crate) async fn release_queued_prompt(
@@ -2721,7 +2723,7 @@ mod tests {
         let id = inst.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         let service = &state.session_service;
-        for qid in ["held", "fresh", "done"] {
+        for qid in ["held", "fresh", "done", "spent"] {
             service
                 .enqueue_prompt(
                     &id,
@@ -2738,10 +2740,31 @@ mod tests {
         assert!(store.claim_terminal_prompt(&id, "held").unwrap());
         store.claim_terminal_prompt(&id, "done").unwrap();
         store.complete_terminal_prompt(&id, "done").unwrap();
+        store.claim_terminal_prompt(&id, "spent").unwrap();
+        store
+            .release_terminal_prompt(
+                &id,
+                "spent",
+                crate::acp::event_store::terminal_queue::MAX_AUTOMATIC_ATTEMPTS,
+            )
+            .unwrap();
 
         assert_eq!(
             service.release_queued_prompt(&id, "held").await.unwrap(),
             ReleaseQueuedOutcome::Released
+        );
+        // A row whose automatic attempts are spent is held as well; the
+        // operator's release resets its count.
+        assert_eq!(
+            service.release_queued_prompt(&id, "spent").await.unwrap(),
+            ReleaseQueuedOutcome::Released
+        );
+        assert_eq!(
+            store
+                .terminal_prompt_receipt(&id, "spent")
+                .unwrap()
+                .as_deref(),
+            Some("released")
         );
         assert_eq!(
             store
@@ -2780,6 +2803,7 @@ mod tests {
         );
         let receipts = service.queued_prompt_receipts(&id).await.unwrap();
         assert_eq!(receipts.get("held").map(String::as_str), Some("released"));
+        assert_eq!(receipts.get("spent").map(String::as_str), Some("released"));
         assert_eq!(receipts.get("done").map(String::as_str), Some("delivered"));
         assert!(!receipts.contains_key("fresh"));
     }

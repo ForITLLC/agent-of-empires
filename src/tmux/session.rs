@@ -98,8 +98,9 @@ pub(crate) enum StripStep {
     Clear,
     /// The composer could not be read: stop touching the pane.
     Unreadable,
-    /// The paste (one chip, or every character) or a leading remnant of it
-    /// is the composer's whole content: delete this many characters.
+    /// The paste (one chip, or every character), a leading remnant of it, or
+    /// its tail in a box scrolled to the caret is the composer's whole
+    /// content: delete this many characters.
     Backspace(usize),
     /// A human's bytes sit beside the paste: the abort path strips the paste
     /// and keeps theirs.
@@ -125,6 +126,7 @@ pub(crate) fn strip_plan(composer: Option<&str>, text: &str) -> StripStep {
         PasteResidue::Clean { chip: true } => StripStep::Backspace(1),
         PasteResidue::Clean { chip: false } => StripStep::Backspace(text.chars().count()),
         PasteResidue::Pending => StripStep::Backspace(composer.chars().count().max(1)),
+        PasteResidue::Scrolled => StripStep::Backspace(text.chars().count()),
         PasteResidue::Human {
             before,
             after,
@@ -1376,6 +1378,15 @@ impl Session {
                         self.name);
                     break;
                 }
+                PasteResidue::Scrolled => {
+                    // The box scrolled to its caret: the visible tail ends
+                    // the paste, so the whole paste landed and nothing
+                    // follows it. The box was empty immediately before.
+                    tracing::debug!(target: "tmux.command",
+                        "guarded send: composer scrolled to the paste's tail in {}; submitting",
+                        self.name);
+                    break;
+                }
                 PasteResidue::Human {
                     before,
                     after,
@@ -1554,7 +1565,9 @@ impl Session {
                     human_tail.push_str(&after);
                     Self::backspace(target, n)?;
                 }
-                PasteResidue::Human { .. } | PasteResidue::Clean { .. } => {
+                PasteResidue::Human { .. }
+                | PasteResidue::Clean { .. }
+                | PasteResidue::Scrolled => {
                     // The paste is now the composer's tail: delete it whole.
                     Self::backspace(target, paste_chars)?;
                 }
@@ -4695,6 +4708,16 @@ mod tests {
         assert_eq!(
             strip_plan(Some("I think it needs subtasks."), text),
             StripStep::Foreign
+        );
+        // The box scrolled to its caret and shows only the paste's tail:
+        // everything typed is the daemon's, so delete every character.
+        let long = "Please retain an actionable path for this case through any \
+                    migration; record its disposition before retiring the old \
+                    surface, and say so on the board.";
+        let tail = &long[long.len() - 70..];
+        assert_eq!(
+            strip_plan(Some(tail), long),
+            StripStep::Backspace(long.chars().count())
         );
     }
 

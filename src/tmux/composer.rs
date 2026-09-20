@@ -483,9 +483,17 @@ pub(crate) enum PasteResidue {
     /// The composer is empty or holds a strict prefix of the text: the paste
     /// has not rendered yet, or the captured region is clipped.
     Pending,
+    /// The box scrolled to its caret: a paste longer than the box shows only
+    /// its tail, and the visible text ends the paste. Nothing sits after it,
+    /// and the box was empty before the paste, so it is the daemon's own.
+    Scrolled,
     /// The composer holds text the paste does not explain at all.
     Unverifiable,
 }
+
+/// The fewest visible characters a scrolled tail must show before it is
+/// trusted as the paste's own rather than a coincidence.
+const SCROLLED_TAIL_MIN_CHARS: usize = 24;
 
 /// Verdict of an abort's final composer read (`final_n` and `expect` are
 /// whitespace-stripped). A composer holding the human's bytes PLUS MORE is
@@ -551,6 +559,9 @@ pub(crate) fn paste_residue(draft: Option<&str>, text: &str) -> PasteResidue {
     if tn.starts_with(&dn) {
         return PasteResidue::Pending;
     }
+    if dn.chars().count() >= SCROLLED_TAIL_MIN_CHARS && tn.ends_with(&dn) {
+        return PasteResidue::Scrolled;
+    }
     PasteResidue::Unverifiable
 }
 
@@ -601,8 +612,54 @@ pub(crate) fn queued_composer(raw_content: &str) -> Option<String> {
     Some(body.join("\n").trim().to_string())
 }
 
+/// A `❯` prompt row: the glyph alone, or followed by whitespace.
+fn claude_line_is_prompt_row(line: &str) -> bool {
+    line.trim()
+        .strip_prefix('❯')
+        .is_some_and(|rest| rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
+}
+
+/// The capture with the composer's body replaced by an empty prompt row.
+/// The post-paste idle read runs on this. The daemon's own paste can fill
+/// the box over many rows on a narrow pane, which defeats both idle rules:
+/// `ready_prompt` wants an empty `❯` row, and `completed_turn` reads the
+/// last non-empty row above the box, where Claude's `/goal` chrome sits on
+/// a session with a goal. The pane then read as not idle purely because of
+/// what the drain had typed (observed live: every attempt on a 46-column
+/// pane withheld with `agent_not_idle`, no status change logged). With the
+/// body collapsed the capture is the shape the pre-paste check passed on; a
+/// spinner or interrupt banner above the box still reads as running. An
+/// empty box, or no box, is returned as is.
+pub(crate) fn collapse_composer_body(clean: &str) -> String {
+    let lines: Vec<&str> = clean.lines().collect();
+    let Some(prompt) = lines
+        .iter()
+        .rposition(|line| claude_line_is_prompt_row(line))
+    else {
+        return clean.to_string();
+    };
+    if prompt == 0 || !claude_line_is_horizontal_rule(lines[prompt - 1].trim()) {
+        return clean.to_string();
+    }
+    let Some(close) =
+        (prompt + 1..lines.len()).find(|&row| claude_line_is_horizontal_rule(lines[row].trim()))
+    else {
+        return clean.to_string();
+    };
+    let prompt_rest = lines[prompt].trim().strip_prefix('❯').unwrap_or("").trim();
+    if prompt_rest.is_empty() && lines[prompt + 1..close].iter().all(|l| l.trim().is_empty()) {
+        return clean.to_string();
+    }
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    out.extend_from_slice(&lines[..prompt]);
+    out.push("❯ ");
+    out.extend_from_slice(&lines[close..]);
+    out.join("\n")
+}
+
 pub(crate) fn queued_pane_is_idle(raw_content: &str) -> bool {
-    super::detect::detect("claude", &strip_ansi(raw_content), "", None).is_some_and(|d| {
+    let view = collapse_composer_body(&strip_ansi(raw_content));
+    super::detect::detect("claude", &view, "", None).is_some_and(|d| {
         d.status == Some(crate::session::Status::Idle) && d.visible && d.rule != "no_rule"
     })
 }
@@ -1205,6 +1262,89 @@ mod delivery_gate_tests {
                 "unsafe queue boundary: {pane:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_scrolled_tail_of_the_paste_is_the_daemons_own() {
+        use super::{paste_residue, PasteResidue};
+        let text = "08:33 watch: row CB8B25F9 still pending, no decider or outcome. \
+                    Please retain an actionable path for this case through any \
+                    migration; record its disposition before retiring the old surface.";
+        let tail = &text[text.len() - 90..];
+        assert_eq!(paste_residue(Some(tail), text), PasteResidue::Scrolled);
+        // Wrapped tail rows compare regardless of the row boundaries.
+        let wrapped = tail.replace("; ", ";\n  ");
+        assert_eq!(paste_residue(Some(&wrapped), text), PasteResidue::Scrolled);
+        // Too short a window to trust as the paste's.
+        assert_eq!(
+            paste_residue(Some("surface."), text),
+            PasteResidue::Unverifiable
+        );
+        // A human's byte after the tail: not the paste's own.
+        let fused = format!("{tail}q");
+        assert_eq!(
+            paste_residue(Some(&fused), text),
+            PasteResidue::Unverifiable
+        );
+        // A prefix still reads as a paste that has not finished rendering.
+        assert_eq!(
+            paste_residue(Some(&text[..40]), text),
+            PasteResidue::Pending
+        );
+    }
+
+    #[test]
+    fn post_paste_idle_read_ignores_the_daemons_own_paste_in_the_box() {
+        use super::{collapse_composer_body, queued_pane_is_idle};
+        // A 46-column pane with Claude's `/goal` chrome between the completion
+        // line and the box (for-Productivity, 2026-09-20): a paste that filled
+        // the box over many rows read as not idle on every attempt.
+        fn pane(status: &str, body_rows: &[&str]) -> String {
+            let mut s = String::from(
+                "  The heartbeat is re-armed for the next\n  read-only re-probe. No other work is owed.\n\n",
+            );
+            s.push_str(status);
+            s.push('\n');
+            s.push_str("                         ◎ /goal active (5h)\n");
+            s.push_str("──────────────────────────────────────────────\n");
+            match body_rows.split_first() {
+                None => s.push_str("❯\u{a0}\n"),
+                Some((first, rest)) => {
+                    s.push_str(&format!("❯\u{a0}{first}\n"));
+                    for row in rest {
+                        s.push_str(&format!("  {row}\n"));
+                    }
+                }
+            }
+            s.push_str(
+                "──────────────────────────────────────────────\n  5h 2% · wk 28%\n  ⏵⏵ bypass permissions on · 1 shell",
+            );
+            s
+        }
+        let done = "✻ Sautéed for 24s · done 12:45 PM · 1 shell\n  still running";
+        let rows = [
+            "this active case and its captured",
+            "real approval through any migration;",
+            "record its explicit disposition before",
+            "retiring the old decision surface.",
+        ];
+        assert!(queued_pane_is_idle(&pane(done, &[])), "empty box is idle");
+        assert!(
+            queued_pane_is_idle(&pane(done, &rows)),
+            "the box holds only the paste: still idle"
+        );
+        let running = "✻ Working… (esc to interrupt)";
+        assert!(
+            !queued_pane_is_idle(&pane(running, &rows)),
+            "a spinner above the box is running, paste or not"
+        );
+        assert!(!queued_pane_is_idle(&pane(running, &[])));
+        // Collapsing touches nothing but the box body.
+        let collapsed = collapse_composer_body(&pane(done, &rows));
+        assert!(collapsed.contains("/goal active"));
+        assert!(collapsed.contains("\n❯ \n"));
+        assert!(!collapsed.contains("real approval"));
+        assert_eq!(collapse_composer_body(&pane(done, &[])), pane(done, &[]));
     }
 
     #[test]

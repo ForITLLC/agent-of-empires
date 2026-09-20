@@ -652,12 +652,17 @@ async fn queue_list(identifier: &str, json: bool) -> Result<()> {
         .as_ref()
         .map(|r| {
             rows.iter()
-                .filter(|e| queue_hold_label(r.get(&e.id).map(String::as_str)) == "review")
+                .filter(|e| {
+                    matches!(
+                        queue_hold_label(r.get(&e.id).map(String::as_str)),
+                        "review" | "exhausted"
+                    )
+                })
                 .count()
         })
         .unwrap_or(0);
     println!(
-        "Queued for '{}' (profile '{}', {} pending, {held} held for review, via {source}):",
+        "Queued for '{}' (profile '{}', {} pending, {held} held, via {source}):",
         inst.title,
         profile,
         rows.len()
@@ -678,9 +683,12 @@ async fn queue_list(identifier: &str, json: bool) -> Result<()> {
     }
     if held > 0 {
         println!(
-            "HOLD review: an attempt was recorded and nothing re-attempts it. Inspect the pane; \
-             then `aoe session queue release {} <qid>` or `... drop {} <qid>`.",
-            inst.id, inst.id
+            "HOLD review: an attempt was recorded and nothing re-attempts it. HOLD exhausted: \
+             {cap} automatic attempts withheld Enter. Inspect the pane; then \
+             `aoe session queue release {} <qid>` or `... drop {} <qid>`.",
+            inst.id,
+            inst.id,
+            cap = crate::acp::event_store::terminal_queue::MAX_AUTOMATIC_ATTEMPTS
         );
     }
     Ok(())
@@ -711,7 +719,7 @@ async fn queue_release(identifier: &str, qid: &str) -> Result<()> {
     if !receipts.release_terminal_prompt(&inst.id, qid, 0)? {
         let disposition = receipts.terminal_prompt_receipt(&inst.id, qid)?;
         bail!(
-            "{qid} on '{}' is not held for review (receipt: {})",
+            "{qid} on '{}' is not held (receipt: {})",
             inst.title,
             disposition.as_deref().unwrap_or("none")
         );
@@ -837,14 +845,21 @@ async fn daemon_queue_remove(session_id: &str, qid: &str) -> Result<Option<bool>
 
 /// The HOLD column for one queued row, from its delivery receipt: `-` never
 /// attempted, `review` held until an operator releases or drops it,
-/// `released` waiting for its next attempt, `retiring` consumed (a stale
-/// snapshot brought it back; the drain removes it without typing).
+/// `released` waiting for its next attempt, `exhausted` held with its
+/// automatic attempts spent, `retiring` consumed (a stale snapshot brought
+/// it back; the drain removes it without typing).
 fn queue_hold_label(disposition: Option<&str>) -> &'static str {
-    use crate::acp::event_store::terminal_queue::released_attempts;
+    use crate::acp::event_store::terminal_queue::{receipt_is_held, released_attempts};
     match disposition {
         None => "-",
         Some("delivered") | Some("dropped") => "retiring",
-        Some(d) if released_attempts(d).is_some() => "released",
+        Some(d) if released_attempts(d).is_some() => {
+            if receipt_is_held(d) {
+                "exhausted"
+            } else {
+                "released"
+            }
+        }
         Some(_) => "review",
     }
 }
@@ -4270,6 +4285,11 @@ mod queue_command_tests {
         assert_eq!(queue_hold_label(Some("legacy_uncertain")), "review");
         assert_eq!(queue_hold_label(Some("released")), "released");
         assert_eq!(queue_hold_label(Some("released:2")), "released");
+        let spent = format!(
+            "released:{}",
+            crate::acp::event_store::terminal_queue::MAX_AUTOMATIC_ATTEMPTS
+        );
+        assert_eq!(queue_hold_label(Some(&spent)), "exhausted");
         assert_eq!(queue_hold_label(Some("delivered")), "retiring");
         assert_eq!(queue_hold_label(Some("dropped")), "retiring");
         let entry = crate::daemon::QueuedPromptEntry {

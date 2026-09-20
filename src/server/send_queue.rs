@@ -18,15 +18,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use super::state::AppState;
-use crate::acp::event_store::terminal_queue::released_attempts;
+use crate::acp::event_store::terminal_queue::{released_attempts, MAX_AUTOMATIC_ATTEMPTS};
 use crate::session::{Instance, Status};
 use crate::tmux::{GuardedSend, KeystrokeAbort, WithheldPaste};
-
-/// Automatic paste attempts a row may consume before it is held for an
-/// operator. Each one required the previous paste to be verifiably removed;
-/// three withheld Enters in a row means the pane, not the timing, is the
-/// problem.
-pub(crate) const MAX_AUTOMATIC_ATTEMPTS: u32 = 3;
 
 /// The drain's clocks. Defaults are the tuned values; each has an
 /// environment override (milliseconds) read once at daemon start so a fleet
