@@ -28,7 +28,9 @@ pub use acp::{
     switch_acp_agent,
 };
 
-pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
+pub use queue::{
+    queue_clear, queue_edit, queue_enqueue, queue_list, queue_receipts, queue_release, queue_remove,
+};
 
 pub use client_log::post_client_log;
 pub use git::{clone_repo, is_git_repo, list_branches};

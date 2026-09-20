@@ -18,9 +18,10 @@ use serde::Deserialize;
 
 use super::acp::validate_attachments;
 use super::read_only_block;
+use crate::acp::event_store::terminal_queue::released_attempts;
 use crate::acp::protocol::PromptAttachmentUpload;
 use crate::daemon::PromptAttachmentRef;
-use crate::server::session_service::EditQueuedOutcome;
+use crate::server::session_service::{EditQueuedOutcome, ReleaseQueuedOutcome};
 use crate::server::AppState;
 
 /// Cap on total queued-attachment bytes buffered per session: enough for
@@ -106,7 +107,9 @@ pub async fn queue_enqueue(
     // the guard and which is not reentrant.
     let _submission = state.session_service.prompt_submission(&id).await;
     match state.acp_event_store.terminal_prompt_receipt(&id, &req.id) {
-        Ok(Some(disposition)) => {
+        // A released row is a live row awaiting its next attempt: rewriting
+        // its text is the ordinary idempotent-by-id replace.
+        Ok(Some(disposition)) if released_attempts(&disposition).is_none() => {
             return (
                 StatusCode::CONFLICT,
                 Json(
@@ -116,7 +119,7 @@ pub async fn queue_enqueue(
             )
                 .into_response()
         }
-        Ok(None) => {}
+        Ok(_) => {}
         Err(error) => {
             tracing::error!(%error, session = %id, "queue receipt lookup failed");
             return (
@@ -323,6 +326,68 @@ pub async fn queue_remove(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "queue drop was not durably recorded",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /api/sessions/{id}/queue/{promptId}/release`: an operator has
+/// inspected the pane and grants a held row one more delivery attempt.
+/// 409 `queue_row_not_held` when the row is not held for review.
+pub async fn queue_release(
+    State(state): State<Arc<AppState>>,
+    Path((id, prompt_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    match state
+        .session_service
+        .release_queued_prompt(&id, &prompt_id)
+        .await
+    {
+        Ok(ReleaseQueuedOutcome::Released) => StatusCode::NO_CONTENT.into_response(),
+        Ok(ReleaseQueuedOutcome::NotFound) => {
+            (StatusCode::NOT_FOUND, "queued prompt not found").into_response()
+        }
+        Ok(ReleaseQueuedOutcome::NotHeld { disposition }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "queue_row_not_held",
+                "queue_id": prompt_id,
+                "disposition": disposition,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, session = %id, "queue release could not persist its receipt");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "queue release was not durably recorded",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /api/sessions/{id}/queue/receipts`: the delivery receipt of every
+/// queued row that has one, by queue id (`claimed`, `legacy_uncertain`,
+/// `released`, `released:N`, `delivered`, `dropped`).
+pub async fn queue_receipts(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !session_exists(&state, &id).await {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    }
+    match state.session_service.queued_prompt_receipts(&id).await {
+        Ok(receipts) => Json(receipts).into_response(),
+        Err(error) => {
+            tracing::error!(%error, session = %id, "queue receipt lookup failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "queue receipt lookup failed",
             )
                 .into_response()
         }

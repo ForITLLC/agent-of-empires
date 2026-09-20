@@ -432,6 +432,36 @@ impl HttpClient {
             .await
     }
 
+    /// `POST /api/sessions/{id}/queue/{promptId}/release`: grant a queued
+    /// row held for operator review one more delivery attempt. A 409
+    /// (`queue_row_not_held`) surfaces as [`HttpError::Server`].
+    pub async fn queue_release(&self, session_id: &str, prompt_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue/{}/release",
+            self.endpoint.base_url,
+            session_id,
+            utf8_percent_encode(prompt_id, PATH_SEGMENT)
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `GET /api/sessions/{id}/queue/receipts`: delivery receipt by queue id
+    /// for every queued row that has one.
+    pub async fn queue_receipts(
+        &self,
+        session_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue/receipts",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json().await?)
+    }
+
     pub async fn queue_clear(&self, session_id: &str) -> Result<(), HttpError> {
         self.session_call(Method::DELETE, session_id, "/queue", None)
             .await

@@ -173,6 +173,14 @@ pub enum QueueAction {
         /// Queue id as printed by `aoe session queue <id>` (e.g. `send-0123456789ab`)
         qid: String,
     },
+    /// Grant a queued message held for review one more delivery attempt
+    /// (after inspecting the pane: nothing of it may still be in the composer)
+    Release {
+        /// Session ID or title (looked up across ALL profiles)
+        identifier: String,
+        /// Queue id shown with HOLD `review` by `aoe session queue <id>`
+        qid: String,
+    },
 }
 
 #[derive(Args)]
@@ -598,14 +606,17 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     }
 }
 
-/// `aoe session queue <id>` / `aoe session queue drop <id> <qid>`.
+/// `aoe session queue <id>` / `aoe session queue drop <id> <qid>` /
+/// `aoe session queue release <id> <qid>`.
 async fn queue_session(args: QueueArgs) -> Result<()> {
     match args.action {
         Some(QueueAction::Drop { identifier, qid }) => queue_drop(&identifier, &qid).await,
+        Some(QueueAction::Release { identifier, qid }) => queue_release(&identifier, &qid).await,
         None => {
             let identifier = args.identifier.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "usage: aoe session queue <session> | aoe session queue drop <session> <qid>"
+                    "usage: aoe session queue <session> | aoe session queue drop <session> <qid> \
+                     | aoe session queue release <session> <qid>"
                 )
             })?;
             queue_list(&identifier, args.json).await
@@ -618,12 +629,13 @@ async fn queue_list(identifier: &str, json: bool) -> Result<()> {
     // Daemon-first: the daemon owns the queue and its view is authoritative
     // for a row it has just retired. Disk is the fallback when no daemon is
     // reachable (the rows are persisted there too).
-    let (rows, source) = match daemon_queue_list(&inst.id).await {
-        Some(rows) => (rows, "daemon"),
+    let (rows, receipts, source) = match daemon_queue_list(&inst.id).await {
+        Some(rows) => (rows, daemon_queue_receipts(&inst.id).await, "daemon"),
         None => {
             let mut rows = inst.queued_prompts.clone();
             rows.sort_by_key(|e| e.seq);
-            (rows, "disk")
+            let receipts = disk_queue_receipts(&inst.id, &rows);
+            (rows, receipts, "disk")
         }
     };
     if json {
@@ -636,17 +648,78 @@ async fn queue_list(identifier: &str, json: bool) -> Result<()> {
         );
         return Ok(());
     }
+    let held = receipts
+        .as_ref()
+        .map(|r| {
+            rows.iter()
+                .filter(|e| queue_hold_label(r.get(&e.id).map(String::as_str)) == "review")
+                .count()
+        })
+        .unwrap_or(0);
     println!(
-        "Queued for '{}' (profile '{}', {} pending, via {source}):",
+        "Queued for '{}' (profile '{}', {} pending, {held} held for review, via {source}):",
         inst.title,
         profile,
         rows.len()
     );
-    println!("{:<18} {:>6}  {:<24} TEXT", "QID", "AGE", "SENDER");
+    match &receipts {
+        Some(_) => println!(
+            "{:<18} {:>6}  {:<9} {:<24} TEXT",
+            "QID", "AGE", "HOLD", "SENDER"
+        ),
+        None => println!("{:<18} {:>6}  {:<24} TEXT", "QID", "AGE", "SENDER"),
+    }
     let now = chrono::Utc::now();
     for e in &rows {
-        println!("{}", format_queue_row(e, now));
+        let hold = receipts
+            .as_ref()
+            .map(|r| queue_hold_label(r.get(&e.id).map(String::as_str)));
+        println!("{}", format_queue_row(e, now, hold));
     }
+    if held > 0 {
+        println!(
+            "HOLD review: an attempt was recorded and nothing re-attempts it. Inspect the pane; \
+             then `aoe session queue release {} <qid>` or `... drop {} <qid>`.",
+            inst.id, inst.id
+        );
+    }
+    Ok(())
+}
+
+/// Release a held queued message for one more delivery attempt. Daemon
+/// first; on disk (the receipt store) when no daemon is reachable.
+async fn queue_release(identifier: &str, qid: &str) -> Result<()> {
+    let (profile, inst) = find_session_across_profiles(identifier)?;
+    match daemon_queue_release(&inst.id, qid).await? {
+        Some(true) => {
+            println!(
+                "Released {qid} on '{}' (daemon-side); it is attempted again once the composer is clear",
+                inst.title
+            );
+            return Ok(());
+        }
+        Some(false) => bail!("No queued message {qid:?} on '{}'", inst.title),
+        None => {}
+    }
+    if !inst.queued_prompts.iter().any(|q| q.id == qid) {
+        bail!("No queued message {qid:?} on '{}'", inst.title);
+    }
+    let receipts = crate::acp::event_store::EventStore::open(
+        &crate::session::get_app_dir()?.join("acp_events.db"),
+        1000,
+    )?;
+    if !receipts.release_terminal_prompt(&inst.id, qid, 0)? {
+        let disposition = receipts.terminal_prompt_receipt(&inst.id, qid)?;
+        bail!(
+            "{qid} on '{}' is not held for review (receipt: {})",
+            inst.title,
+            disposition.as_deref().unwrap_or("none")
+        );
+    }
+    println!(
+        "Released {qid} on '{}' (on disk, profile '{profile}'; no daemon reachable)",
+        inst.title
+    );
     Ok(())
 }
 
@@ -696,6 +769,54 @@ async fn daemon_queue_list(session_id: &str) -> Option<Vec<crate::daemon::Queued
     client.queue_list(session_id).await.ok()
 }
 
+/// The daemon's receipts for the queue, or `None` when it cannot answer
+/// (older daemon without the route, or unreachable).
+async fn daemon_queue_receipts(
+    session_id: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    use crate::acp::client::{discovery, HttpClient};
+    let endpoint = discovery::discover_local().ok()?;
+    let client = HttpClient::new(endpoint).ok()?;
+    client.queue_receipts(session_id).await.ok()
+}
+
+/// Receipts read straight from the receipt store when no daemon answers.
+fn disk_queue_receipts(
+    session_id: &str,
+    rows: &[crate::daemon::QueuedPromptEntry],
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let store = crate::acp::event_store::EventStore::open(
+        &crate::session::get_app_dir().ok()?.join("acp_events.db"),
+        1000,
+    )
+    .ok()?;
+    let mut receipts = std::collections::BTreeMap::new();
+    for row in rows {
+        if let Some(d) = store.terminal_prompt_receipt(session_id, &row.id).ok()? {
+            receipts.insert(row.id.clone(), d);
+        }
+    }
+    Some(receipts)
+}
+
+/// `Ok(Some(true))` released, `Ok(Some(false))` the daemon has no such row,
+/// `Ok(None)` no daemon reachable (fall back to disk).
+async fn daemon_queue_release(session_id: &str, qid: &str) -> Result<Option<bool>> {
+    use crate::acp::client::{discovery, HttpClient, HttpError};
+    let Ok(endpoint) = discovery::discover_local() else {
+        return Ok(None);
+    };
+    let Ok(client) = HttpClient::new(endpoint) else {
+        return Ok(None);
+    };
+    match client.queue_release(session_id, qid).await {
+        Ok(()) => Ok(Some(true)),
+        Err(HttpError::Transport(_)) => Ok(None),
+        Err(HttpError::SessionNotFound(_)) => Ok(Some(false)),
+        Err(e) => bail!("daemon refused to release {qid}: {e}"),
+    }
+}
+
 /// `Ok(Some(true))` dropped, `Ok(Some(false))` the daemon has no such row,
 /// `Ok(None)` no daemon reachable (fall back to disk).
 async fn daemon_queue_remove(session_id: &str, qid: &str) -> Result<Option<bool>> {
@@ -714,11 +835,26 @@ async fn daemon_queue_remove(session_id: &str, qid: &str) -> Result<Option<bool>
     }
 }
 
-/// `<qid> <age> <sender> <first 80 chars>`: one queued row for a human.
-/// Whitespace is collapsed so a multi-line report reads as one line.
+/// The HOLD column for one queued row, from its delivery receipt: `-` never
+/// attempted, `review` held until an operator releases or drops it,
+/// `released` waiting for its next attempt, `retiring` consumed (a stale
+/// snapshot brought it back; the drain removes it without typing).
+fn queue_hold_label(disposition: Option<&str>) -> &'static str {
+    use crate::acp::event_store::terminal_queue::released_attempts;
+    match disposition {
+        None => "-",
+        Some("delivered") | Some("dropped") => "retiring",
+        Some(d) if released_attempts(d).is_some() => "released",
+        Some(_) => "review",
+    }
+}
+
+/// `<qid> <age> [<hold>] <sender> <first 80 chars>`: one queued row for a
+/// human. Whitespace is collapsed so a multi-line report reads as one line.
 fn format_queue_row(
     entry: &crate::daemon::QueuedPromptEntry,
     now: chrono::DateTime<chrono::Utc>,
+    hold: Option<&str>,
 ) -> String {
     let age = chrono::DateTime::parse_from_rfc3339(&entry.created_at)
         .map(|t| humanize_age((now - t.with_timezone(&chrono::Utc)).num_seconds().max(0)))
@@ -735,7 +871,13 @@ fn format_queue_row(
     if collapsed.chars().count() > 80 {
         text.push('…');
     }
-    format!("{:<18} {:>6}  {:<24} {}", entry.id, age, sender, text)
+    match hold {
+        Some(hold) => format!(
+            "{:<18} {:>6}  {:<9} {:<24} {}",
+            entry.id, age, hold, sender, text
+        ),
+        None => format!("{:<18} {:>6}  {:<24} {}", entry.id, age, sender, text),
+    }
 }
 
 fn humanize_age(secs: i64) -> String {
@@ -4059,7 +4201,7 @@ mod restart_args_tests {
 
 #[cfg(test)]
 mod queue_command_tests {
-    use super::{format_queue_row, humanize_age, QueueAction, SessionCommands};
+    use super::{format_queue_row, humanize_age, queue_hold_label, QueueAction, SessionCommands};
     use clap::Parser;
 
     #[derive(Parser)]
@@ -4100,6 +4242,52 @@ mod queue_command_tests {
     }
 
     #[test]
+    fn queue_release_parses_identifier_and_qid() {
+        let cli = Cli::try_parse_from([
+            "aoe",
+            "queue",
+            "release",
+            "for-Productivity",
+            "send-8bcbf22386ea",
+        ])
+        .expect("queue release must parse");
+        match cli.cmd {
+            SessionCommands::Queue(args) => match args.action {
+                Some(QueueAction::Release { identifier, qid }) => {
+                    assert_eq!(identifier, "for-Productivity");
+                    assert_eq!(qid, "send-8bcbf22386ea");
+                }
+                _ => panic!("expected release"),
+            },
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn hold_column_reads_the_receipt() {
+        assert_eq!(queue_hold_label(None), "-");
+        assert_eq!(queue_hold_label(Some("claimed")), "review");
+        assert_eq!(queue_hold_label(Some("legacy_uncertain")), "review");
+        assert_eq!(queue_hold_label(Some("released")), "released");
+        assert_eq!(queue_hold_label(Some("released:2")), "released");
+        assert_eq!(queue_hold_label(Some("delivered")), "retiring");
+        assert_eq!(queue_hold_label(Some("dropped")), "retiring");
+        let entry = crate::daemon::QueuedPromptEntry {
+            id: "send-8bcbf22386ea".to_string(),
+            seq: 1,
+            text: "STATUS: shipped".to_string(),
+            attachments: Vec::new(),
+            created_at: "2026-09-20T07:58:00Z".to_string(),
+            origin_device: Some("aoe send".to_string()),
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-20T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let row = format_queue_row(&entry, now, Some("review"));
+        assert!(row.contains("  review    aoe send"), "{row}");
+    }
+
+    #[test]
     fn queue_row_shows_sender_age_and_first_80_chars() {
         let long = "STATUS: shipped ".repeat(10);
         let entry = crate::daemon::QueuedPromptEntry {
@@ -4113,7 +4301,7 @@ mod queue_command_tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-09-04T08:05:30Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let row = format_queue_row(&entry, now);
+        let row = format_queue_row(&entry, now, None);
         assert!(row.starts_with("send-0123456789ab "), "{row}");
         assert!(row.contains("    5m  "), "{row}");
         assert!(row.contains("aoe send from for-dev"), "{row}");

@@ -364,8 +364,16 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
                 .delete(api::queue_clear),
         )
         .route(
+            "/api/sessions/{id}/queue/receipts",
+            get(api::queue_receipts),
+        )
+        .route(
             "/api/sessions/{id}/queue/{promptId}",
             patch(api::queue_edit).delete(api::queue_remove),
+        )
+        .route(
+            "/api/sessions/{id}/queue/{promptId}/release",
+            post(api::queue_release),
         )
         .route(
             "/api/sessions/{id}/acp/approvals/{nonce}",

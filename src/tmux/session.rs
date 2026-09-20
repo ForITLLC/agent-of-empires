@@ -47,6 +47,95 @@ pub enum GuardedSend {
     NotReady,
     /// This qid was already claimed or dropped, including before a restart.
     AlreadyAttempted,
+    /// The paste was typed but its Enter withheld: the pane stopped reading
+    /// as idle, the paste never rendered whole, or the composer could not be
+    /// read. Nothing was submitted. The daemon then removed its own bytes
+    /// where it could positively identify them; `restored` says the composer
+    /// verifiably holds none of them any more.
+    Withheld(WithheldPaste),
+}
+
+/// Why a guarded delivery withheld its Enter after typing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithheldReason {
+    /// The pane no longer read as positively idle.
+    AgentNotIdle,
+    /// The composer never showed the whole paste inside the render grace.
+    PasteClipped,
+    /// The composer held text the paste does not explain, or could not be read.
+    ComposerUnverifiable,
+}
+
+impl WithheldReason {
+    pub fn label(&self) -> &'static str {
+        match self {
+            WithheldReason::AgentNotIdle => "agent_not_idle",
+            WithheldReason::PasteClipped => "paste_clipped",
+            WithheldReason::ComposerUnverifiable => "composer_unverifiable",
+        }
+    }
+}
+
+/// A withheld Enter and the cleanup that followed it. Never the human's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithheldPaste {
+    pub reason: WithheldReason,
+    /// The composer verifiably holds nothing of the paste: it reads empty, or
+    /// holds exactly a human's bytes again after an abort-style strip.
+    pub restored: bool,
+    /// Capture/keystroke rounds the cleanup took.
+    pub rounds: usize,
+    /// One line for the log.
+    pub detail: String,
+}
+
+/// One round of removing the daemon's own paste from the composer after a
+/// withheld Enter. The composer was verified empty immediately before the
+/// paste, so whatever is beside the paste now is a human's and is kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StripStep {
+    /// The composer reads empty: the paste is gone.
+    Clear,
+    /// The composer could not be read: stop touching the pane.
+    Unreadable,
+    /// The paste (one chip, or every character) or a leading remnant of it
+    /// is the composer's whole content: delete this many characters.
+    Backspace(usize),
+    /// A human's bytes sit beside the paste: the abort path strips the paste
+    /// and keeps theirs.
+    Human {
+        before: String,
+        after: String,
+        chip: bool,
+    },
+    /// The composer holds text the paste does not explain: leave it alone.
+    Foreign,
+}
+
+/// `composer` is the read of this round: `None` when the box could not be
+/// found, `Some("")` when it rendered empty.
+pub(crate) fn strip_plan(composer: Option<&str>, text: &str) -> StripStep {
+    let Some(composer) = composer else {
+        return StripStep::Unreadable;
+    };
+    if composer.trim().is_empty() {
+        return StripStep::Clear;
+    }
+    match paste_residue(Some(composer), text) {
+        PasteResidue::Clean { chip: true } => StripStep::Backspace(1),
+        PasteResidue::Clean { chip: false } => StripStep::Backspace(text.chars().count()),
+        PasteResidue::Pending => StripStep::Backspace(composer.chars().count().max(1)),
+        PasteResidue::Human {
+            before,
+            after,
+            chip,
+        } => StripStep::Human {
+            before,
+            after,
+            chip,
+        },
+        PasteResidue::Unverifiable => StripStep::Foreign,
+    }
 }
 
 /// Counts describing an aborted delivery. Never the human's text.
@@ -1272,7 +1361,7 @@ impl Session {
             // the Enter below follows it by one tmux call.
             let content = self.capture_pane(PRE_ENTER_CAPTURE_LINES)?;
             if !queued_pane_is_idle(&content) {
-                bail!("agent no longer positively idle; Enter withheld, attempt held for review");
+                return self.withhold(&target, text, WithheldReason::AgentNotIdle);
             }
             let draft = queued_composer(&content);
             let residue = if draft.is_some() {
@@ -1300,14 +1389,16 @@ impl Session {
                         std::thread::sleep(Duration::from_millis(100));
                         continue;
                     }
-                    bail!("queued paste is missing or clipped; Enter withheld, attempt held for review");
+                    return self.withhold(&target, text, WithheldReason::PasteClipped);
                 }
                 PasteResidue::Unverifiable => {
-                    tracing::warn!(target: "tmux.command",
-                        "guarded send: composer text in {} does not match the paste; Enter withheld, \
-                         attempt held for review without retry",
-                        self.name);
-                    bail!("pre-Enter composer read unverifiable; Enter withheld");
+                    // A composer mid-redraw after a large paste can read as
+                    // unrelated text for a frame: same grace as a slow render.
+                    if Instant::now() < render_deadline {
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    return self.withhold(&target, text, WithheldReason::ComposerUnverifiable);
                 }
             }
         }
@@ -1321,6 +1412,96 @@ impl Session {
         } else {
             bail!("queued submit unconfirmed; attempt held for review without retry")
         }
+    }
+
+    /// Enter withheld after the paste. The text the daemon typed must not be
+    /// left parked: it reads as an operator draft to every later delivery
+    /// and the row behind it never moves (observed live: a session refusing
+    /// every send behind an orphaned `[Pasted text]` chip). Remove the
+    /// daemon's own bytes where they can be positively identified, then say
+    /// whether the composer is verifiably free of them. Bytes that cannot be
+    /// attributed to the paste are never touched.
+    fn withhold(&self, target: &str, text: &str, reason: WithheldReason) -> Result<GuardedSend> {
+        tracing::warn!(target: "tmux.command",
+            "guarded send: {} in {}; Enter withheld, removing the paste",
+            reason.label(), self.name);
+        let (restored, rounds, detail) = self.strip_paste(target, text)?;
+        tracing::warn!(target: "tmux.command",
+            "guarded send: withheld ({}) in {}: {detail}", reason.label(), self.name);
+        Ok(GuardedSend::Withheld(WithheldPaste {
+            reason,
+            restored,
+            rounds,
+            detail,
+        }))
+    }
+
+    /// Remove the daemon's paste from a composer that held nothing before it.
+    /// Each round re-reads the composer and acts on what it positively
+    /// recognises ([`strip_plan`]); bounded, and it stops the moment the
+    /// composer stops matching. Returns (restored, rounds, detail).
+    fn strip_paste(&self, target: &str, text: &str) -> Result<(bool, usize, String)> {
+        let mut rounds = 0usize;
+        loop {
+            if rounds >= ABORT_MAX_ROUNDS {
+                return Ok((
+                    false,
+                    rounds,
+                    format!("gave up removing the paste after {rounds} rounds"),
+                ));
+            }
+            rounds += 1;
+            let composer = self.withheld_composer()?;
+            match strip_plan(composer.as_deref(), text) {
+                StripStep::Clear => {
+                    return Ok((
+                        true,
+                        rounds,
+                        format!("paste removed; composer empty after {rounds} round(s)"),
+                    ));
+                }
+                StripStep::Unreadable => {
+                    return Ok((
+                        false,
+                        rounds,
+                        "composer not readable; left as is".to_string(),
+                    ));
+                }
+                StripStep::Backspace(n) => Self::backspace(target, n)?,
+                StripStep::Human {
+                    before,
+                    after,
+                    chip,
+                } => {
+                    let abort = self.abort_paste(target, text, &before, &after, chip)?;
+                    return Ok((
+                        abort.restored,
+                        rounds + abort.rounds,
+                        format!("human bytes beside the paste; {}", abort.detail),
+                    ));
+                }
+                StripStep::Foreign => {
+                    return Ok((
+                        false,
+                        rounds,
+                        "composer holds text the paste does not explain; left as is".to_string(),
+                    ));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+    }
+
+    /// The composer as the strip sees it: `Some("")` only for a completely
+    /// rendered empty box ([`queued_composer`]), otherwise the tolerant
+    /// region read the abort path uses, `None` when neither can find a box.
+    fn withheld_composer(&self) -> Result<Option<String>> {
+        let content = self.capture_pane(PRE_ENTER_CAPTURE_LINES)?;
+        let rendered = queued_composer(&content);
+        if rendered.as_deref() == Some("") {
+            return Ok(rendered);
+        }
+        Ok(claude_composer_draft_region(&content, PRE_ENTER_REGION).or(rendered))
     }
 
     /// The composer's content for the pre-Enter check: a deeper capture and
@@ -4475,6 +4656,57 @@ mod tests {
         assert_eq!(sanitize_session_name("my-project"), "my-project");
         assert_eq!(sanitize_session_name("my project"), "my_project");
         assert_eq!(sanitize_session_name("a".repeat(30).as_str()).len(), 20);
+    }
+
+    #[test]
+    fn strip_plan_removes_only_what_it_can_attribute_to_the_paste() {
+        use super::{strip_plan, StripStep};
+        let text = "STATUS: shipped\nEVIDENCE: commit abc";
+        // Unreadable box: hands off.
+        assert_eq!(strip_plan(None, text), StripStep::Unreadable);
+        // Empty box: done, restored.
+        assert_eq!(strip_plan(Some(""), text), StripStep::Clear);
+        assert_eq!(strip_plan(Some("   "), text), StripStep::Clear);
+        // The whole paste inline: one Backspace per character.
+        assert_eq!(
+            strip_plan(Some(text), text),
+            StripStep::Backspace(text.chars().count())
+        );
+        // Collapsed to a chip: one Backspace.
+        assert_eq!(
+            strip_plan(Some("[Pasted text #23 +4 lines]"), text),
+            StripStep::Backspace(1)
+        );
+        // A leading remnant (mid-strip, or a clipped render): delete it.
+        assert_eq!(
+            strip_plan(Some("STATUS: ship"), text),
+            StripStep::Backspace("STATUS: ship".chars().count())
+        );
+        // A human's bytes beside the paste: the abort path keeps them.
+        assert_eq!(
+            strip_plan(Some("STATUS: shipped\nEVIDENCE: commit abcq"), text),
+            StripStep::Human {
+                before: String::new(),
+                after: "q".to_string(),
+                chip: false,
+            }
+        );
+        // Text the paste does not explain: never touched.
+        assert_eq!(
+            strip_plan(Some("I think it needs subtasks."), text),
+            StripStep::Foreign
+        );
+    }
+
+    #[test]
+    fn withheld_reasons_have_stable_labels() {
+        use super::WithheldReason;
+        assert_eq!(WithheldReason::AgentNotIdle.label(), "agent_not_idle");
+        assert_eq!(WithheldReason::PasteClipped.label(), "paste_clipped");
+        assert_eq!(
+            WithheldReason::ComposerUnverifiable.label(),
+            "composer_unverifiable"
+        );
     }
 
     #[test]

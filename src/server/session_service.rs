@@ -85,6 +85,18 @@ pub(crate) enum EditQueuedOutcome {
     WouldEmpty,
 }
 
+/// Result of `SessionService::release_queued_prompt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReleaseQueuedOutcome {
+    /// The row's receipt is `released`; the drain attempts it once more.
+    Released,
+    /// No such session, or no row with that `prompt_id` in its queue.
+    NotFound,
+    /// The row exists but is not held for review: no receipt yet (nothing
+    /// to release), delivered, dropped, or already released.
+    NotHeld { disposition: Option<String> },
+}
+
 /// Pick the leading drain batch from a session's queue and its combined text, matching the
 /// client's `useAcpSession` split exactly.
 fn queue_drain_batch<'a>(
@@ -988,6 +1000,57 @@ impl SessionService {
                 .delete_pending_attachments_for_ref(id, &prompt_id);
         }
         Ok(())
+    }
+
+    /// Release a queued terminal row an operator has inspected, so the drain
+    /// attempts it once more. Only a held receipt (`claimed`,
+    /// `legacy_uncertain`) is released; the row must still be in the queue.
+    /// Serialized against delivery like every other queue mutation, so the
+    /// release never lands between a drain's receipt read and its claim.
+    pub(crate) async fn release_queued_prompt(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: &str,
+    ) -> anyhow::Result<ReleaseQueuedOutcome> {
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return Ok(ReleaseQueuedOutcome::NotFound);
+        };
+        if !self
+            .queued_prompts_snapshot(id)
+            .await
+            .iter()
+            .any(|q| q.id == prompt_id)
+        {
+            return Ok(ReleaseQueuedOutcome::NotFound);
+        }
+        if self
+            .acp_event_store
+            .release_terminal_prompt(id, prompt_id, 0)?
+        {
+            tracing::info!(target: "server.send_queue", session = %id, qid = %prompt_id,
+                decision = "released:operator", "queued send released for another attempt");
+            return Ok(ReleaseQueuedOutcome::Released);
+        }
+        Ok(ReleaseQueuedOutcome::NotHeld {
+            disposition: self
+                .acp_event_store
+                .terminal_prompt_receipt(id, prompt_id)?,
+        })
+    }
+
+    /// The delivery receipt of every row still in the session's queue, by
+    /// queue id. Rows without a receipt (never attempted) are absent.
+    pub(crate) async fn queued_prompt_receipts(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        let mut receipts = std::collections::BTreeMap::new();
+        for row in self.queued_prompts_snapshot(id).await {
+            if let Some(disposition) = self.acp_event_store.terminal_prompt_receipt(id, &row.id)? {
+                receipts.insert(row.id, disposition);
+            }
+        }
+        Ok(receipts)
     }
 
     /// Snapshot the session's queue, ordered by `seq`.
@@ -2643,5 +2706,81 @@ mod tests {
         let (sub, combined) = queue_drain_batch(&q, claude);
         assert_eq!(sub.len(), 3);
         assert_eq!(combined, "one\n\nthree");
+    }
+
+    /// The Commander's 2026-09-20 defect: a `claimed` row wedged a session's
+    /// queue forever because nothing could re-evaluate it. An operator
+    /// release turns it back into a deliverable row; consumed rows and rows
+    /// the queue no longer holds cannot be released.
+    #[tokio::test]
+    async fn an_operator_releases_only_a_held_row_still_in_the_queue() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("queue-release", "/tmp/aoe-release");
+        inst.id = "sess-release".to_string();
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = &state.session_service;
+        for qid in ["held", "fresh", "done"] {
+            service
+                .enqueue_prompt(
+                    &id,
+                    qid.to_string(),
+                    format!("STATUS: {qid}"),
+                    Vec::new(),
+                    None,
+                    "2026-09-20T08:00:00Z".to_string(),
+                )
+                .await
+                .expect("enqueued");
+        }
+        let store = &state.acp_event_store;
+        assert!(store.claim_terminal_prompt(&id, "held").unwrap());
+        store.claim_terminal_prompt(&id, "done").unwrap();
+        store.complete_terminal_prompt(&id, "done").unwrap();
+
+        assert_eq!(
+            service.release_queued_prompt(&id, "held").await.unwrap(),
+            ReleaseQueuedOutcome::Released
+        );
+        assert_eq!(
+            store
+                .terminal_prompt_receipt(&id, "held")
+                .unwrap()
+                .as_deref(),
+            Some("released")
+        );
+        // Released rows, never-attempted rows and delivered rows are not held.
+        assert_eq!(
+            service.release_queued_prompt(&id, "held").await.unwrap(),
+            ReleaseQueuedOutcome::NotHeld {
+                disposition: Some("released".to_string())
+            }
+        );
+        assert_eq!(
+            service.release_queued_prompt(&id, "fresh").await.unwrap(),
+            ReleaseQueuedOutcome::NotHeld { disposition: None }
+        );
+        assert_eq!(
+            service.release_queued_prompt(&id, "done").await.unwrap(),
+            ReleaseQueuedOutcome::NotHeld {
+                disposition: Some("delivered".to_string())
+            }
+        );
+        assert_eq!(
+            service.release_queued_prompt(&id, "gone").await.unwrap(),
+            ReleaseQueuedOutcome::NotFound
+        );
+        assert_eq!(
+            service
+                .release_queued_prompt("no-such-session", "held")
+                .await
+                .unwrap(),
+            ReleaseQueuedOutcome::NotFound
+        );
+        let receipts = service.queued_prompt_receipts(&id).await.unwrap();
+        assert_eq!(receipts.get("held").map(String::as_str), Some("released"));
+        assert_eq!(receipts.get("done").map(String::as_str), Some("delivered"));
+        assert!(!receipts.contains_key("fresh"));
     }
 }
