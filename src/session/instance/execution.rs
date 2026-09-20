@@ -981,6 +981,9 @@ impl Instance {
         environment
             .env
             .push(("AOE_INSTANCE_ID".into(), self.id.clone()));
+        environment
+            .env
+            .push(("AOE_SESSION_TITLE".into(), self.title.clone()));
         if let Some(source) = source {
             environment
                 .env

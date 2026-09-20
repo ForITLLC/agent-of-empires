@@ -813,7 +813,7 @@ impl Instance {
             fallback_profile = self.effective_profile();
             &fallback_profile
         };
-        let mut env_prefix = status_hook_env_prefix(profile, &self.id, self.status_agent());
+        let mut env_prefix = status_hook_env_prefix(profile, &self.id, &self.title, self.status_agent());
         // The publisher is pane-scoped, including for safe Default wrappers.
         self.pi_extension_launched = false;
         if let Some((_, ref env)) = identity_extension {
