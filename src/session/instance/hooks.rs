@@ -3,6 +3,13 @@
 use super::*;
 use anyhow::bail;
 
+/// The `KEY=value ` assignments prefixed to a hook agent's launch command.
+///
+/// `AOE_SESSION_TITLE` is the session title at launch (the same value the
+/// lifecycle and status hooks receive), so a tool the agent runs can name the
+/// session it belongs to without an aoe API round trip; a rename after launch
+/// is picked up on the next restart, like every other value here.
+///
 /// `program` is the basename of the executable the launch runs. A bare-token wrapper such as
 /// `company-codex` can be the agent itself under another name (a symlink or copy), so the identity
 /// hook's ancestor walk must count that name too: otherwise a nested `codex exec` is the only
@@ -10,6 +17,7 @@ use anyhow::bail;
 pub(super) fn status_hook_env_prefix(
     profile: &str,
     instance_id: &str,
+    title: &str,
     agent: Option<&crate::agents::AgentDef>,
     program: Option<&str>,
 ) -> String {
@@ -26,9 +34,10 @@ pub(super) fn status_hook_env_prefix(
             });
         // `$$` is the launch shell, which `exec`s into the agent.
         format!(
-            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} {program}",
+            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_SESSION_TITLE={} AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} {program}",
             shell_escape(profile),
             shell_escape(instance_id),
+            shell_escape(title),
             shell_escape(&hook_bin.to_string_lossy()),
             shell_escape(agent_bin)
         )
@@ -823,11 +832,17 @@ mod tests {
 
     use crate::session::test_support::EnvGuard;
 
-    fn expected_status_prefix(profile: &str, instance_id: &str, agent: &str) -> String {
+    fn expected_status_prefix(
+        profile: &str,
+        instance_id: &str,
+        title: &str,
+        agent: &str,
+    ) -> String {
         format!(
-            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} ",
+            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_SESSION_TITLE={} AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN={} ",
             shell_escape(profile),
             shell_escape(instance_id),
+            shell_escape(title),
             shell_escape(&std::env::current_exe().unwrap().to_string_lossy()),
             shell_escape(crate::agents::get_agent(agent).unwrap().binary)
         )
@@ -1861,15 +1876,67 @@ mod tests {
                     status_hook_env_prefix(
                         "work",
                         "abc123",
+                        "Build API",
                         crate::agents::get_agent(agent),
                         program
                     ),
-                    expected_status_prefix("work", "abc123", agent)
+                    expected_status_prefix("work", "abc123", "Build API", agent)
                 );
             }
         }
         assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode"), None),
+            status_hook_env_prefix(
+                "work",
+                "abc123",
+                "Build API",
+                crate::agents::get_agent("opencode"),
+                None
+            ),
+            ""
+        );
+    }
+
+    /// The title rides in the agent's environment verbatim: a space, a quote
+    /// and a newline are shell-escaped, never dropped or truncated, and an
+    /// empty title still exports the (empty) variable so `${AOE_SESSION_TITLE:-}`
+    /// expands consistently in every hook agent.
+    #[test]
+    fn status_hook_env_prefix_exports_the_session_title_shell_escaped() {
+        let claude = crate::agents::get_agent("claude");
+        for title in [
+            "for-Productivity",
+            "Build API",
+            "it's a 'quoted' title",
+            "two\nlines",
+            "",
+        ] {
+            let prefix = status_hook_env_prefix("work", "abc123", title, claude, None);
+            assert_eq!(
+                prefix,
+                expected_status_prefix("work", "abc123", title, "claude"),
+                "title {title:?}"
+            );
+            let want = format!(" AOE_SESSION_TITLE={} ", shell_escape(title));
+            assert!(prefix.contains(&want), "prefix {prefix:?} lacks {want:?}");
+            // The assignment stays one word: no raw newline or unescaped quote.
+            assert!(!prefix.contains('\n'));
+        }
+        assert_eq!(
+            status_hook_env_prefix("work", "abc123", "for-Productivity", claude, None),
+            format!(
+                "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' AOE_SESSION_TITLE='for-Productivity' AOE_HOOK_BIN={} AOE_AGENT_PID=$$ AOE_AGENT_BIN='claude' ",
+                shell_escape(&std::env::current_exe().unwrap().to_string_lossy())
+            )
+        );
+        // A hook-less agent exports nothing, title or not.
+        assert_eq!(
+            status_hook_env_prefix(
+                "work",
+                "abc123",
+                "for-Productivity",
+                crate::agents::get_agent("opencode"),
+                None
+            ),
             ""
         );
     }
@@ -1881,6 +1948,7 @@ mod tests {
         let prefix = status_hook_env_prefix(
             "work",
             "abc123",
+            "Build API",
             crate::agents::get_agent("codex"),
             Some("company-codex"),
         );
