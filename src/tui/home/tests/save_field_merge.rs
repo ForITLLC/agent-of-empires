@@ -973,6 +973,41 @@ fn restart_profile_move_account_swap_keeps_the_conversation() {
 
 #[test]
 #[serial]
+fn restart_profile_move_ignores_archived_and_trashed_twins_in_target() {
+    let (_temp, _guard, mut view, id) =
+        boot_view_with_one_session("for-Jamf", "/tmp/profile-restart-archived-twin");
+    let target = Storage::new_unwatched("target").unwrap();
+    target
+        .update(|instances, _groups| {
+            let mut twin = Instance::new("for-Jamf", "/tmp/profile-restart-archived-twin/");
+            twin.source_profile = "target".to_string();
+            twin.archive();
+            instances.push(twin);
+            let mut corpse = Instance::new("for-Jamf", "/tmp/profile-restart-archived-twin");
+            corpse.source_profile = "target".to_string();
+            corpse.trash();
+            instances.push(corpse);
+            Ok(())
+        })
+        .unwrap();
+    view.storages.insert("target".to_string(), target);
+    view.selected_session = Some(id.clone());
+
+    view.restart_selected_session(Some("target"), Some("claude"), None, None)
+        .expect("an archived or trashed twin must not block a restart profile move");
+
+    let source_rows = Storage::new_unwatched("test").unwrap().load().unwrap();
+    assert!(!source_rows.iter().any(|row| row.id == id));
+    let target_rows = Storage::new_unwatched("target").unwrap().load().unwrap();
+    assert_eq!(target_rows.len(), 3);
+    let moved = target_rows.iter().find(|row| row.id == id).unwrap();
+    assert!(!moved.is_archived());
+    assert!(!moved.is_trashed());
+    assert_eq!(view.get_instance(&id).unwrap().source_profile, "target");
+}
+
+#[test]
+#[serial]
 fn restart_profile_move_rejection_leaves_source_tool_state_unchanged() {
     let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/profile-reject");
     view.mutate_instance(&id, |instance| {

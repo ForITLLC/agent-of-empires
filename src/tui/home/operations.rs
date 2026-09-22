@@ -3,8 +3,9 @@
 use crate::session::builder::{self, InstanceParams};
 use crate::session::conversation_carry;
 use crate::session::{
-    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
-    GroupMovePlan, Instance, Item, LifecycleOperation, Status, Storage,
+    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session,
+    is_live_duplicate_session, list_profiles, GroupMovePlan, Instance, Item, LifecycleOperation,
+    Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
@@ -402,7 +403,7 @@ impl HomeView {
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
         if let Some(target_profile) = profile_move_target.as_deref() {
             let target_rows = Storage::open(target_profile, self.file_watch.clone())?.load()?;
-            if is_duplicate_session(
+            if is_live_duplicate_session(
                 target_rows.iter(),
                 &restart_edit_authoritative.title,
                 &restart_edit_authoritative.project_path,
@@ -1459,7 +1460,7 @@ impl HomeView {
                 // effect. The dual-locked transaction repeats this check.
                 let target_storage = Storage::open(target_profile, self.file_watch.clone())?;
                 let target_rows = target_storage.load()?;
-                if is_duplicate_session(
+                if is_live_duplicate_session(
                     target_rows.iter(),
                     &projected_move.title,
                     &projected_move.project_path,

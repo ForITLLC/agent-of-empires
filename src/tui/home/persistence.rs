@@ -380,7 +380,7 @@ impl HomeView {
             &requested,
             account_swap,
             |instances, candidate| {
-                if crate::session::is_duplicate_session(
+                if crate::session::is_live_duplicate_session(
                     instances.iter(),
                     &candidate.title,
                     &candidate.project_path,

@@ -75,8 +75,9 @@ pub(crate) use instance::install_aliases;
 pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 pub(crate) use instance::seed_mcp_servers_from_template;
 pub(crate) use instance::{
-    duplicate_session_error, find_duplicate_session, is_duplicate_session,
-    persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite,
+    duplicate_session_error, find_duplicate_session, find_title_collision, is_duplicate_session,
+    is_live_duplicate_session, load_all_profile_rows,
+    persist_session_to_storage, title_collision_error, PassiveStatusPatch, ResumeIntent, SidWrite,
     NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{

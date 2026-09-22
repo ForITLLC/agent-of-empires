@@ -148,6 +148,12 @@ pub struct AddArgs {
     #[arg(long = "model")]
     model: Option<String>,
 
+    /// Create the session even if another non-trashed session (archived
+    /// included, in any profile) already carries this title. Without it,
+    /// `aoe add` refuses a board-wide duplicate title and names the row.
+    #[arg(long = "allow-duplicate")]
+    allow_duplicate: bool,
+
     /// Create the session in a fresh scratch directory under
     /// `<app_dir>/scratch/<id>/` instead of a project path. The directory is
     /// removed when the session is deleted (unless `aoe rm` is given
@@ -236,6 +242,21 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let storage = Storage::new_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
     let final_title = resolve_session_title(&args, &instances)?;
+
+    // Board-wide title hygiene (WO#2205): a title already carried by any
+    // non-trashed row -- archived included, in any profile -- is refused
+    // unless the caller opts in. The per-profile title+path check below
+    // still guards the storage key.
+    if !args.allow_duplicate {
+        let rows = crate::session::load_all_profile_rows()?;
+        if let Some(hit) = crate::session::find_title_collision(
+            rows.iter().map(|(profile, inst)| (profile.as_str(), inst)),
+            &final_title,
+            None,
+        ) {
+            return Err(crate::session::title_collision_error(&final_title, &hit));
+        }
+    }
 
     let mut resolved_tool = resolve_tool_for_add(&args, &config)?;
 

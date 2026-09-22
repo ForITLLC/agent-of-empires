@@ -102,7 +102,7 @@ pub enum SessionCommands {
     Archive(ArchiveArgs),
 
     /// Unarchive a session (restores it to its tier in the Attention sort)
-    Unarchive(SessionIdArgs),
+    Unarchive(UnarchiveArgs),
 
     /// Restore a trashed session, returning it to its prior bucket with its
     /// transcript and metadata intact. See #2489.
@@ -263,6 +263,18 @@ pub struct KeepArgs {
 pub struct SessionIdArgs {
     /// Session ID or title
     identifier: String,
+}
+
+#[derive(Args)]
+pub struct UnarchiveArgs {
+    /// Session ID or title
+    identifier: String,
+
+    /// Unarchive even if another non-trashed session (archived included, in
+    /// any profile) already carries this title. Without it the restore is
+    /// refused and the blocking row is named.
+    #[arg(long = "allow-duplicate")]
+    allow_duplicate: bool,
 }
 
 #[derive(Args)]
@@ -540,8 +552,8 @@ fn scope_command(profile: &str, mut command: SessionCommands) -> Result<(String,
         | SessionCommands::Attach(a)
         | SessionCommands::Unsnooze(a)
         | SessionCommands::Favorite(a)
-        | SessionCommands::Unfavorite(a)
-        | SessionCommands::Unarchive(a) => Some(&mut a.identifier),
+        | SessionCommands::Unfavorite(a) => Some(&mut a.identifier),
+        SessionCommands::Unarchive(a) => Some(&mut a.identifier),
         SessionCommands::Restart(a) => a.identifier.as_mut(),
         SessionCommands::Show(a) => a.identifier.as_mut(),
         SessionCommands::Rename(a) => a.identifier.as_mut(),
@@ -593,9 +605,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::UrgentAck(args) => urgent_ack_session(profile, args).await,
         SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
-        SessionCommands::Unarchive(args) => {
-            mark_session(profile, args, "Unarchived", Instance::unarchive).await
-        }
+        SessionCommands::Unarchive(args) => unarchive_session(profile, args).await,
         SessionCommands::Restore(args) => restore_session(profile, args).await,
         SessionCommands::Import(args) => import_sessions(profile, args).await,
         SessionCommands::ListTrash => list_trash(profile).await,
@@ -1614,6 +1624,33 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
             title
         );
     }
+}
+
+async fn unarchive_session(profile: &str, args: UnarchiveArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    // Board-wide title hygiene (WO#2205): restoring a row whose title another
+    // non-trashed row already carries would put a duplicate back on the
+    // board, so it is refused unless the caller opts in.
+    if !args.allow_duplicate {
+        let instances = storage.load()?;
+        let target = super::resolve_session(&args.identifier, &instances)?;
+        let rows = crate::session::load_all_profile_rows()?;
+        if let Some(hit) = crate::session::find_title_collision(
+            rows.iter().map(|(profile, inst)| (profile.as_str(), inst)),
+            &target.title,
+            Some(&target.id),
+        ) {
+            return Err(crate::session::title_collision_error(&target.title, &hit));
+        }
+    }
+    let title = storage.update(|instances, _groups| {
+        super::patch_instance(instances, &args.identifier, |inst| {
+            inst.unarchive();
+            Ok(inst.title.clone())
+        })
+    })?;
+    println!("Unarchived: {}", title);
+    Ok(())
 }
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -4118,6 +4155,24 @@ mod restart_args_tests {
             (true, None, 5)
         );
         assert!(restart(&["aoe", "restart", "claude-3", "--all"]).is_err());
+    }
+
+    #[test]
+    fn unarchive_parses_allow_duplicate_opt_in() {
+        let cli = Cli::try_parse_from(["aoe", "unarchive", "abc"]).expect("unarchive must parse");
+        match cli.cmd {
+            SessionCommands::Unarchive(args) => {
+                assert_eq!(args.identifier, "abc");
+                assert!(!args.allow_duplicate);
+            }
+            _ => panic!("expected unarchive"),
+        }
+        let cli = Cli::try_parse_from(["aoe", "unarchive", "abc", "--allow-duplicate"])
+            .expect("unarchive --allow-duplicate must parse");
+        match cli.cmd {
+            SessionCommands::Unarchive(args) => assert!(args.allow_duplicate),
+            _ => panic!("expected unarchive"),
+        }
     }
 
     #[test]
