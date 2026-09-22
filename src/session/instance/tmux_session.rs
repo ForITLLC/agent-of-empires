@@ -77,6 +77,110 @@ pub(crate) fn duplicate_session_error(title: &str) -> anyhow::Error {
     )
 }
 
+/// [`find_duplicate_session`] restricted to rows that are neither archived
+/// nor trashed. Restart and profile-move paths use this so a shelved corpse
+/// holding the same title and path can never block a live row: on
+/// 2026-09-22 a `for-Jamf` restart was refused by an archived twin in the
+/// target profile (WO#2205).
+pub(crate) fn find_live_duplicate_session<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+    title: &str,
+    path: &str,
+    exclude_id: Option<&str>,
+) -> Option<&'a Instance> {
+    find_duplicate_session(
+        instances
+            .into_iter()
+            .filter(|inst| !inst.is_archived() && !inst.is_trashed()),
+        title,
+        path,
+        exclude_id,
+    )
+}
+
+pub(crate) fn is_live_duplicate_session<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+    title: &str,
+    path: &str,
+    exclude_id: Option<&str>,
+) -> bool {
+    find_live_duplicate_session(instances, title, path, exclude_id).is_some()
+}
+
+/// A board-wide title collision: another non-trashed row (archived included,
+/// in any profile) already carries the title, compared case-insensitively
+/// after trimming whitespace. The path is deliberately ignored: the board is
+/// keyed by what a human reads, and two rows reading `for-Jamf` are a
+/// duplicate no matter where they check out (WO#2205).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TitleCollision {
+    pub profile: String,
+    pub id: String,
+    pub title: String,
+    pub archived: bool,
+}
+
+impl TitleCollision {
+    pub fn state(&self) -> &'static str {
+        if self.archived {
+            "archived"
+        } else {
+            "live"
+        }
+    }
+}
+
+pub(crate) fn find_title_collision<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a Instance)>,
+    title: &str,
+    exclude_id: Option<&str>,
+) -> Option<TitleCollision> {
+    let wanted = title.trim().to_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    rows.into_iter().find_map(|(profile, inst)| {
+        if inst.is_trashed() || exclude_id == Some(inst.id.as_str()) {
+            return None;
+        }
+        if inst.title.trim().to_lowercase() != wanted {
+            return None;
+        }
+        Some(TitleCollision {
+            profile: profile.to_string(),
+            id: inst.id.clone(),
+            title: inst.title.clone(),
+            archived: inst.is_archived(),
+        })
+    })
+}
+
+pub(crate) fn title_collision_error(title: &str, hit: &TitleCollision) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Title '{}' is already in use by {} session {} in profile '{}' (titled '{}')\n\
+         Tip: pick another title, or pass --allow-duplicate to proceed anyway",
+        title,
+        hit.state(),
+        hit.id,
+        hit.profile,
+        hit.title
+    )
+}
+
+/// Every profile's persisted rows, paired with the profile name, for a
+/// board-wide title check. Reads the sessions files directly, so archived
+/// rows are included.
+pub(crate) fn load_all_profile_rows() -> anyhow::Result<Vec<(String, Instance)>> {
+    let mut rows = Vec::new();
+    for profile in crate::session::list_profiles()? {
+        let storage = crate::session::Storage::open_unwatched(&profile)?;
+        for inst in storage.load()? {
+            rows.push((profile.clone(), inst));
+        }
+    }
+    Ok(rows)
+}
+
 impl Instance {
     pub fn tmux_session(&self) -> Result<tmux::Session> {
         tmux::Session::new(&self.id, &self.title)
@@ -174,6 +278,88 @@ mod tests {
     use super::*;
 
     use crate::session::test_support::EnvGuard;
+
+    #[test]
+    fn live_duplicate_ignores_archived_and_trashed_twins() {
+        let live = Instance::new("for-Jamf", "/tmp/for-Jamf");
+        let mut archived = Instance::new("for-Jamf", "/tmp/for-Jamf");
+        archived.archive();
+        let mut trashed = Instance::new("for-Jamf", "/tmp/for-Jamf/");
+        trashed.trash();
+
+        let shelved = vec![archived.clone(), trashed.clone()];
+        assert!(is_duplicate_session(
+            &shelved,
+            "for-Jamf",
+            "/tmp/for-Jamf",
+            None
+        ));
+        assert!(!is_live_duplicate_session(
+            &shelved,
+            "for-Jamf",
+            "/tmp/for-Jamf",
+            None
+        ));
+
+        let with_live = vec![archived, trashed, live.clone()];
+        assert!(is_live_duplicate_session(
+            &with_live,
+            "for-Jamf",
+            "/tmp/for-Jamf",
+            None
+        ));
+        assert!(!is_live_duplicate_session(
+            &with_live,
+            "for-Jamf",
+            "/tmp/for-Jamf",
+            Some(&live.id)
+        ));
+    }
+
+    #[test]
+    fn title_collision_spans_profiles_ignores_case_and_path_and_skips_trash() {
+        let live = Instance::new("for-Jamf", "/home/a/for-Jamf");
+        let mut archived = Instance::new("For-jamf ", "/home/b/for-Jamf");
+        archived.archive();
+        let mut trashed = Instance::new("for-Jamf", "/home/c/for-Jamf");
+        trashed.trash();
+        let rows = vec![
+            ("gna-main", &live),
+            ("forit-codex", &archived),
+            ("p9-main", &trashed),
+        ];
+
+        let hit = find_title_collision(rows.clone(), "for-jamf", None).expect("live twin collides");
+        assert_eq!(hit.profile, "gna-main");
+        assert_eq!(hit.id, live.id);
+        assert!(!hit.archived);
+        assert_eq!(hit.state(), "live");
+
+        let hit = find_title_collision(rows.clone(), "FOR-JAMF", Some(&live.id))
+            .expect("archived twin still collides");
+        assert_eq!(hit.profile, "forit-codex");
+        assert_eq!(hit.id, archived.id);
+        assert!(hit.archived);
+        assert_eq!(hit.state(), "archived");
+
+        assert!(find_title_collision(vec![("p9-main", &trashed)], "for-Jamf", None).is_none());
+        assert!(find_title_collision(rows.clone(), "for-Forms", None).is_none());
+        assert!(find_title_collision(rows, "  ", None).is_none());
+
+        let msg = title_collision_error(
+            "for-Jamf",
+            &TitleCollision {
+                profile: "forit-codex".into(),
+                id: "abc123".into(),
+                title: "For-jamf".into(),
+                archived: true,
+            },
+        )
+        .to_string();
+        assert!(msg.contains("archived session abc123"), "{msg}");
+        assert!(msg.contains("profile 'forit-codex'"), "{msg}");
+        assert!(msg.contains("--allow-duplicate"), "{msg}");
+    }
 
     #[test]
     fn duplicate_session_normalizes_path_and_excludes_self() {
