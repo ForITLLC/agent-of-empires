@@ -22,6 +22,18 @@ fn prompt_req(text: &str) -> Result<Json<PromptRequest>, axum::extract::rejectio
         text: text.to_string(),
         attachments: Vec::new(),
         prompt_id: None,
+        no_revive: false,
+    }))
+}
+
+fn no_revive_prompt_req(
+    text: &str,
+) -> Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection> {
+    Ok(Json(PromptRequest {
+        text: text.to_string(),
+        attachments: Vec::new(),
+        prompt_id: None,
+        no_revive: true,
     }))
 }
 
@@ -295,6 +307,70 @@ async fn rate_limit_park_is_sendable_at_the_shared_decision_point() {
     }
 }
 
+/// #4081 review: `no_revive` must refuse a prompt to a fully stopped worker
+/// (`WorkerDown`) rather than queue it. Queuing still hands the prompt off
+/// once something else revives the worker, which is exactly the auto-revive
+/// `no_revive` asks to skip.
+#[tokio::test]
+async fn no_revive_refuses_a_prompt_to_a_stopped_worker() {
+    let id = "sess-no-revive-stopped".to_string();
+    let state = structured_state(&id, false);
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        no_revive_prompt_req("hello"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+    assert!(!published(&state, &id, |e| matches!(
+        e,
+        Event::UserPromptSent { .. }
+    )));
+}
+
+/// #4081 review: `no_revive` must refuse an idle-dormant session without
+/// waking it. The wake (and the worker spawn it triggers) is exactly the
+/// side effect `no_revive` asks to skip, so it must not happen even
+/// partially before the refusal.
+#[tokio::test]
+async fn no_revive_refuses_a_prompt_to_an_idle_dormant_worker_without_waking_it() {
+    let id = "sess-no-revive-dormant".to_string();
+    let state = structured_state(&id, false);
+    state.instances.write().await[0].mark_idle_dormant();
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        no_revive_prompt_req("hello"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        state.instances.read().await[0].last_accessed_at.is_none(),
+        "no_revive must refuse before the wake touches the session"
+    );
+    assert!(state.instances.read().await[0].is_idle_dormant());
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+    assert!(!published(&state, &id, |e| matches!(
+        e,
+        Event::UserPromptSent { .. }
+    )));
+}
+
 /// #3688 and the armed park: a prompt or review on a rate-limit park drives a
 /// resume instead of queueing or refusing, so the prompt is the recovery the
 /// user reaches for rather than RESUME NOW, which re-sends the rate-limited
@@ -379,6 +455,96 @@ async fn turn_on_a_park_resumes_instead_of_queueing() {
             }
         }
     }
+}
+
+/// #4081 review: a prompt into either park dispatches `Sent` (see
+/// `turn_on_a_park_resumes_instead_of_queueing`), so `no_revive` is enforced
+/// by `send_turn`'s resume decision. The refusal must start no worker and
+/// leave the park, the queue, and a pending initial turn as they were.
+#[tokio::test]
+async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
+    for (park, seed) in PARKS {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let id = format!("sess-no-revive-{park}-park");
+        let (state, launches) = failing_start_state(&id, true);
+        seed(&state, &id);
+        state.instances.write().await[0].pending_initial_turn =
+            Some(crate::session::PendingInitialTurn {
+                text: "queued before the park".to_string(),
+                attachments: Vec::new(),
+                synthesized: true,
+            });
+
+        let response = acp_prompt(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            no_revive_prompt_req("hello"),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{park}");
+        assert_eq!(
+            launches.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{park}: no_revive must not start a worker"
+        );
+        assert!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .is_empty(),
+            "{park}"
+        );
+        assert!(
+            !published(&state, &id, |e| matches!(
+                e,
+                Event::UserPromptSent { .. } | Event::AgentStartupError { .. }
+            )),
+            "{park}"
+        );
+        assert!(
+            state.acp_event_store.rate_limit_park(&id).is_some(),
+            "{park}: the park must stand"
+        );
+        assert!(
+            state.instances.read().await[0]
+                .pending_initial_turn
+                .is_some(),
+            "{park}: no_revive refusal must not clear the pending initial turn"
+        );
+    }
+}
+
+/// #4081 review: refusing a `no_revive` prompt to a stopped worker must not
+/// discard a pending initial turn on the way to the refusal.
+#[tokio::test]
+async fn no_revive_refusal_preserves_a_pending_initial_turn() {
+    let id = "sess-no-revive-pending".to_string();
+    let state = structured_state(&id, false);
+    state.instances.write().await[0].pending_initial_turn =
+        Some(crate::session::PendingInitialTurn {
+            text: "queued before the park".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        });
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        no_revive_prompt_req("hello"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        state.instances.read().await[0]
+            .pending_initial_turn
+            .is_some(),
+        "no_revive refusal must not clear the pending initial turn"
+    );
 }
 
 /// #3621: a direct prompt parks while a drain owns the session, and the drain
