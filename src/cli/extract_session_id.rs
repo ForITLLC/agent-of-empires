@@ -105,6 +105,7 @@ fn run_inner<R: Read>(
     let mut buf = String::new();
     stdin.take(STDIN_BYTE_CAP).read_to_string(&mut buf)?;
     let value: serde_json::Value = serde_json::from_str(&buf)?;
+    ack_urgent_on_submit(instance_id, &value);
     let sid = match field {
         crate::agents::HookIdentityField::SessionId => value
             .get("session_id")
@@ -122,6 +123,27 @@ fn run_inner<R: Read>(
         return Err(anyhow!("payload contains an unsafe native session id"));
     }
     crate::hooks::write_session_id_via_guard(instance_id, sid, source)
+}
+
+/// A committed prompt is someone handling the session, so it clears the
+/// session's urgent stamp (Ben-direct 2026-09-23: "as soon as I send a message
+/// to an urgent chat, it should disarm the urgent"). `UserPromptSubmit` is the
+/// one point every submission passes through: typed in the pane, `aoe send`,
+/// or the web composer. A genuine human prompt clears every urgent key, the
+/// same as `urgent_ack`. Fleet or harness text takes the delivery rule, so a
+/// sticky cap/auth/overload/mcp stamp outlives machine traffic. Fail-open:
+/// the hook never blocks the agent.
+fn ack_urgent_on_submit(instance_id: &str, value: &serde_json::Value) {
+    if value.get("hook_event_name").and_then(|v| v.as_str()) != Some("UserPromptSubmit") {
+        return;
+    }
+    let prompt = value.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+    let ack = if crate::hooks::is_human_prompt(prompt) {
+        crate::hooks::ack_hook_urgent(instance_id)
+    } else {
+        crate::hooks::ack_hook_urgent_on_send(instance_id, prompt)
+    };
+    tracing::debug!(target: "hooks.urgent", "submit ack {instance_id}: {}", ack.as_str());
 }
 
 #[cfg(test)]
@@ -144,6 +166,77 @@ mod tests {
 
     fn read_sidecar(base: &std::path::Path, instance_id: &str) -> Option<String> {
         std::fs::read_to_string(base.join(instance_id).join("session_id")).ok()
+    }
+
+    fn stamp(base: &std::path::Path, instance_id: &str, kind: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = base.join(instance_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The instance dir guard refuses a group/world-readable dir.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let exp = crate::util::now_secs() + 3600;
+        std::fs::write(
+            dir.join("attention.json"),
+            format!(
+                r#"{{"tier":5,"urgent":true,"urgent_kind":"{kind}","urgent_source":"pane-watchdog","urgent_reason":"pane-watchdog: x","urgent_expires_at":{exp}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn urgent_left(base: &std::path::Path, instance_id: &str) -> bool {
+        let raw = std::fs::read_to_string(base.join(instance_id).join("attention.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["tier"], 5, "the tier/reason fields are untouched");
+        v.get("urgent").is_some()
+    }
+
+    const SID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn submit(instance_id: &str, event: &str, prompt: &str) {
+        let payload = serde_json::json!({
+            "session_id": SID, "hook_event_name": event, "prompt": prompt,
+        })
+        .to_string();
+        extract(&payload, instance_id).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn a_typed_prompt_clears_any_urgent_like_urgent_ack() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        stamp(&base, "submit_model", "model");
+        submit(
+            "submit_model",
+            "UserPromptSubmit",
+            "why is this still urgent?",
+        );
+        assert!(!urgent_left(&base, "submit_model"));
+        stamp(&base, "submit_cap", "cap");
+        submit("submit_cap", "UserPromptSubmit", "carry on");
+        assert!(!urgent_left(&base, "submit_cap"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn fleet_traffic_clears_a_plain_urgent_but_keeps_a_sticky_one() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let fleet = "do the thing\n-- AoE-Commander (e284618842464176)";
+        stamp(&base, "fleet_model", "model");
+        submit("fleet_model", "UserPromptSubmit", fleet);
+        assert!(!urgent_left(&base, "fleet_model"));
+        stamp(&base, "fleet_cap", "cap");
+        submit("fleet_cap", "UserPromptSubmit", fleet);
+        assert!(urgent_left(&base, "fleet_cap"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn session_start_leaves_the_urgent_alone() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        stamp(&base, "start_model", "model");
+        submit("start_model", "SessionStart", "");
+        assert!(urgent_left(&base, "start_model"));
     }
 
     #[test]
