@@ -371,7 +371,8 @@ fn the_deprecated_tool_badge_survives_every_tool_row_layout() {
     assert!(screen.contains("⚠ deprecated"), "read-only row: {screen}");
 
     // The narrow row has to keep the suffix behind the configuration metadata.
-    let screen = screen_of(&mut configured, 64, 40);
+    // 66 columns: a 64-wide dialog plus the fork's one-column fit margin a side.
+    let screen = screen_of(&mut configured, 66, 40);
     assert!(screen.contains("⚠ deprecated"), "configured row: {screen}");
     assert!(screen.contains("(configured) Ctrl+P"), "{screen}");
 }
