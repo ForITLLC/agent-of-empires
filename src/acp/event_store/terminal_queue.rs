@@ -5,6 +5,7 @@
 //! an operator writes one after inspecting the pane (`released`).
 
 use super::*;
+use rusqlite::{params, OptionalExtension};
 
 pub(crate) fn initialize(conn: &Connection) -> Result<()> {
     conn.execute_batch(
