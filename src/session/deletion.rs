@@ -1818,6 +1818,14 @@ mod tests {
                     .join(&request.instance.id);
                 std::fs::create_dir_all(&store).unwrap();
                 std::fs::write(store.join(".credentials.json"), b"token").unwrap();
+                if case != Case::PreTransition {
+                    crate::migrations::v033_isolate_sandbox_content::certify_owned_test_root(
+                        &crate::session::get_app_dir().unwrap(),
+                        &request.instance.id,
+                        &store,
+                    )
+                    .unwrap();
+                }
 
                 let result = perform_deletion_with(&request, |_id| match case {
                     Case::FailedTeardown => Teardown::Failed(DockerError::DaemonNotRunning),
