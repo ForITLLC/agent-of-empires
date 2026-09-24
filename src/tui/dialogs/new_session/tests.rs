@@ -1234,6 +1234,9 @@ fn terminal_fork_hides_structured_despite_structured_default() {
     });
     assert!(!dialog.structured_capable);
     assert!(!dialog.structured_enabled);
+    assert!(!submitted(dialog.build_submit_result()).structured);
+}
+
 // --- tool ↔ profile binding ---
 //
 // The fleet shape these pin: sixteen profiles whose resolved default_tool is
@@ -1437,6 +1440,10 @@ fn test_profile_cycle_to_codex_snaps_tool_and_extra_args() {
     assert_eq!(dialog.selected_tool(), "claude");
     assert_eq!(dialog.extra_args.value(), "");
     assert_eq!(dialog.snap_hint, None);
+}
+
+fn stage_focusable(dialog: &mut NewSessionDialog, field: usize, rect: ratatui::layout::Rect) {
+    dialog.focusable_rects.push((field, rect));
 }
 
 #[test]

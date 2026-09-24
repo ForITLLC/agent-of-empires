@@ -230,6 +230,7 @@ web = ["rust-embed", "qrcode"]
 serve = ["web"]
 
 [dev-dependencies]
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 serial_test = "4.0"
 # Test-only tokio clock control (`start_paused`), so the token-rotation
 # loop's grace deadline can be asserted without sleeping through it.

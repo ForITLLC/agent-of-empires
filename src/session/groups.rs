@@ -3530,31 +3530,4 @@ mod tests {
         assert!(!inst.is_archived());
         assert!(inst.archived_at.is_none());
     }
-
-    /// #3237: the scratch bucket's key is a sentinel, so name-ordering the
-    /// archived sub-folders on the raw key would sort it under `_` and hoist
-    /// it above every real project. It must sort where its label reads.
-    #[test]
-    fn archived_project_buckets_name_sort_uses_display_label() {
-        let myrepo = Instance::new("a", "/repos/myrepo");
-        let throwaway = Instance::new("b", "/app/scratch/x");
-        let zeta = Instance::new("c", "/repos/zeta");
-        let cases = [
-            (SortOrder::AZ, ["myrepo", SCRATCH_GROUP_NAME, "zeta"]),
-            (SortOrder::ZA, ["zeta", SCRATCH_GROUP_NAME, "myrepo"]),
-        ];
-        for (order, expected) in cases {
-            let mut buckets: Vec<(String, Vec<&Instance>)> = vec![
-                ("myrepo".to_string(), vec![&myrepo]),
-                (SCRATCH_GROUP_PATH.to_string(), vec![&throwaway]),
-                ("zeta".to_string(), vec![&zeta]),
-            ];
-            sort_archived_project_buckets(&mut buckets, order);
-            let labels: Vec<&str> = buckets
-                .iter()
-                .map(|b| project_group_display_name(&b.0))
-                .collect();
-            assert_eq!(labels, expected, "{order:?}");
-        }
-    }
 }

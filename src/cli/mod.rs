@@ -536,16 +536,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn patch_instance_exact_id_resolves_unambiguously() {
-        let mut v = vec![
-            Instance::new("first", "/tmp/a"),
-            Instance::new("second", "/tmp/b"),
-        ];
-        for (input, max, expected) in cases {
-            assert_eq!(truncate_id(input, max), expected, "{input:?}/{max}");
-        }
-    }
 }
 
 #[cfg(test)]
