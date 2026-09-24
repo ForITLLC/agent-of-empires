@@ -4737,8 +4737,6 @@ mod move_divergence_tests {
 }
 
 #[cfg(test)]
-mod set_session_id_tests {
-    use super::{set_session_id, SetSessionIdArgs};
 mod session_mutation_tests {
     use super::{set_color_session, set_session_id, SetColorArgs, SetSessionIdArgs};
     use crate::session::{Instance, ResumeIntent, Storage};
