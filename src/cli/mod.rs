@@ -535,7 +535,6 @@ mod tests {
             }
         );
     }
-
 }
 
 #[cfg(test)]

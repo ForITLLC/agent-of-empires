@@ -71,13 +71,13 @@ pub use groups::{
 };
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
+pub(crate) use instance::seed_mcp_servers_from_template;
 #[cfg(test)]
 pub(crate) use instance::test_helpers::publish_host_pi_transcript;
-pub(crate) use instance::seed_mcp_servers_from_template;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, find_title_collision, is_duplicate_session,
-    is_live_duplicate_session, load_all_profile_rows,
-    persist_session_to_storage, title_collision_error, PassiveStatusPatch, ResumeIntent, SidWrite,
+    is_live_duplicate_session, load_all_profile_rows, persist_session_to_storage,
+    title_collision_error, PassiveStatusPatch, ResumeIntent, SidWrite,
     NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
@@ -87,10 +87,10 @@ pub(crate) use instance::{
 pub use instance::{
     is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,
     EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation, Instance,
-    LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
-    PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
-    StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    KeepRefused, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    KeepRefused, LaunchSidOutcome, LifecycleOperation, LifecycleReservation,
+    LifecycleReservationError, PendingInitialTurn, PluginCreateIdempotency, PollerStart,
+    SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
+    WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{

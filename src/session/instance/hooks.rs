@@ -1322,7 +1322,12 @@ agent_status_hooks = false
     fn status_hook_env_prefix_is_set_for_hook_agents_only() {
         for agent in ["codex", "hermes", "settl", "claude", "kiro", "kimi"] {
             assert_eq!(
-                status_hook_env_prefix("work", "abc123", "Build API", crate::agents::get_agent(agent)),
+                status_hook_env_prefix(
+                    "work",
+                    "abc123",
+                    "Build API",
+                    crate::agents::get_agent(agent)
+                ),
                 expected_status_prefix("work", "abc123", "Build API", agent)
             );
         }
