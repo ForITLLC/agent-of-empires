@@ -385,9 +385,10 @@ mod tests {
         let app = crate::session::get_app_dir().unwrap();
         fs::create_dir_all(&app).unwrap();
         fs::write(app.join(VERSION_FILE), "31").unwrap();
+        // v034 (the fork's terminal-queue quarantine) refuses an id-less row.
         fs::write(
             app.join("sessions.json"),
-            r#"[{"agent_session_id":"old","resume_intent":{"kind":"Use","value":"target"},"retroactive_capture_excludes":["old"]}]"#,
+            r#"[{"id":"s1","agent_session_id":"old","resume_intent":{"kind":"Use","value":"target"},"retroactive_capture_excludes":["old"]}]"#,
         )
         .unwrap();
 
