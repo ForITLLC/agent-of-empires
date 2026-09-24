@@ -78,8 +78,8 @@ pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 pub(crate) use instance::ActiveExecution;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, find_title_collision, is_duplicate_session,
-    is_live_duplicate_session, load_all_profile_rows,
-    persist_session_to_storage, title_collision_error, PassiveStatusPatch, ResumeIntent, SidWrite,
+    is_live_duplicate_session, load_all_profile_rows, persist_session_to_storage,
+    title_collision_error, PassiveStatusPatch, ResumeIntent, SidWrite,
     NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
