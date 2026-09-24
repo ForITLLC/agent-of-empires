@@ -368,32 +368,23 @@ impl HttpClient {
         text: &str,
         origin_device: Option<&str>,
     ) -> Result<crate::daemon::QueuedPromptEntry, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/queue",
-            self.endpoint.base_url, session_id
-        );
         let body = serde_json::json!({
             "id": prompt_id,
             "text": text,
             "origin_device": origin_device,
             "attachments": [],
         });
-        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        let res = check_status(res, session_id).await?;
+        let path = format!("/api/sessions/{session_id}/queue");
+        let request = self.request(Method::POST, &path).json(&body);
+        let res = self.send(request, Scope::Session(session_id)).await?;
         Ok(res.json().await?)
     }
 
     /// `DELETE /api/sessions/{id}/queue/{promptId}`: drop one queued prompt.
     pub async fn queue_remove(&self, session_id: &str, prompt_id: &str) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/queue/{}",
-            self.endpoint.base_url,
-            session_id,
-            utf8_percent_encode(prompt_id, PATH_SEGMENT)
-        );
-        let res = self.auth(self.http.delete(&url)).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        let path = format!("/queue/{}", utf8_percent_encode(prompt_id, PATH_SEGMENT));
+        self.session_call(Method::DELETE, session_id, &path, None)
+            .await
     }
 
     /// `PATCH /api/sessions/{id}/keep` (WO#1953): set (`keep = true`) or
@@ -405,17 +396,9 @@ impl HttpClient {
         keep: bool,
         by: &str,
     ) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/keep",
-            self.endpoint.base_url, session_id
-        );
-        let res = self
-            .auth(self.http.patch(&url))
-            .json(&serde_json::json!({ "keep": keep, "by": by }))
-            .send()
-            .await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        let body = serde_json::json!({ "keep": keep, "by": by });
+        self.session_call(Method::PATCH, session_id, "/keep", Some(body))
+            .await
     }
 
     /// Replace a queued prompt's text in place. The client-minted id is
@@ -436,15 +419,12 @@ impl HttpClient {
     /// row held for operator review one more delivery attempt. A 409
     /// (`queue_row_not_held`) surfaces as [`HttpError::Server`].
     pub async fn queue_release(&self, session_id: &str, prompt_id: &str) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/queue/{}/release",
-            self.endpoint.base_url,
-            session_id,
+        let path = format!(
+            "/queue/{}/release",
             utf8_percent_encode(prompt_id, PATH_SEGMENT)
         );
-        let res = self.auth(self.http.post(&url)).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        self.session_call(Method::POST, session_id, &path, None)
+            .await
     }
 
     /// `GET /api/sessions/{id}/queue/receipts`: delivery receipt by queue id
@@ -453,13 +433,8 @@ impl HttpClient {
         &self,
         session_id: &str,
     ) -> Result<std::collections::BTreeMap<String, String>, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/queue/receipts",
-            self.endpoint.base_url, session_id
-        );
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json().await?)
+        let path = format!("/api/sessions/{session_id}/queue/receipts");
+        self.get_json(&path, Scope::Session(session_id)).await
     }
 
     pub async fn queue_clear(&self, session_id: &str) -> Result<(), HttpError> {
@@ -497,25 +472,15 @@ impl HttpClient {
     /// kill+resume cascade for a terminal session. Returns as soon as the
     /// daemon accepted (202); poll `restart_status` for the verdict.
     pub async fn restart_session(&self, session_id: &str) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/restart",
-            self.endpoint.base_url, session_id
-        );
-        let res = self.auth(self.http.post(&url)).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        self.session_call(Method::POST, session_id, "/restart", None)
+            .await
     }
 
     /// `GET /api/sessions/{id}/restart-status`: the daemon's own verdict on
     /// the last restart cascade (`in_flight` / `stale` / `done` / `unknown`).
     pub async fn restart_status(&self, session_id: &str) -> Result<serde_json::Value, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/restart-status",
-            self.endpoint.base_url, session_id
-        );
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json().await?)
+        let path = format!("/api/sessions/{session_id}/restart-status");
+        self.get_json(&path, Scope::Session(session_id)).await
     }
 
     /// Hand the session to another ACP backend, keeping the transcript.
@@ -625,10 +590,7 @@ impl HttpClient {
     /// `GET /api/accounts`: the daemon's cached account identity + usage
     /// rows (WO#1852). Only the fields the CLI overlays are decoded.
     pub async fn accounts(&self) -> Result<crate::session::account::AccountsWire, HttpError> {
-        let url = format!("{}/api/accounts", self.endpoint.base_url);
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, "").await?;
-        Ok(res.json().await?)
+        self.get_json("/api/accounts", Scope::Global).await
     }
 
     /// Cheapest authenticated probe: separates a down host (transport error)

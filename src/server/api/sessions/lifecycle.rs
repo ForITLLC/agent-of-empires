@@ -1979,6 +1979,7 @@ async fn run_detached_restart(state: Arc<AppState>, id: String) {
             skip_on_launch: false,
             bound_hooks: true,
             discard_sandbox_container: false,
+            conversation_carry: None,
         })
     })
     .await;

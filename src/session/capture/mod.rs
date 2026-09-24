@@ -19,7 +19,6 @@ mod opencode;
 mod pi;
 mod prime;
 
-#[cfg(test)]
 pub(crate) use claude::encode_claude_project_path;
 pub(crate) use claude::{
     claude_home_for_host_environment, claude_host_transcript_confirmed_absent,

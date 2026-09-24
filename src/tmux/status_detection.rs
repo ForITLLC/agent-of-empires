@@ -5,6 +5,15 @@ use crate::session::Status;
 use super::detect::{Detection, HookObservation};
 use super::utils::strip_ansi;
 
+/// The built-in detector alone, for callers holding a pane but no profile
+/// (the restart wake loop and the send submit check).
+pub fn detect_status_from_content(content: &str, tool: &str) -> Status {
+    let clean = strip_ansi(content);
+    crate::agents::get_agent(tool)
+        .map(|a| (a.detect_status)(&clean))
+        .unwrap_or(Status::Idle)
+}
+
 /// Configured rules for `(profile, tool)` outrank the built-in detector.
 pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -> Status {
     // capture-pane runs with -e, so colors would split plain substring matches.
