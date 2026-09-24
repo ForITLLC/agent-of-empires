@@ -647,6 +647,7 @@ mod tests {
                 op,
                 generation: 4,
                 at: Utc::now(),
+                holder_pid: None,
             });
             reserved.merge_runtime_from_reload(&deleting);
             assert_eq!(reserved.lifecycle_generation, 4);

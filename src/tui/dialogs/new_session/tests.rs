@@ -1561,6 +1561,10 @@ fn test_profile_cycle_to_codex_snaps_tool_and_extra_args() {
     assert_eq!(dialog.snap_hint, None);
 }
 
+fn stage_focusable(dialog: &mut NewSessionDialog, field: usize, rect: ratatui::layout::Rect) {
+    dialog.focusable_rects.push((field, rect));
+}
+
 #[test]
 #[serial_test::serial]
 fn test_click_on_tool_snaps_profile_like_the_keyboard() {
