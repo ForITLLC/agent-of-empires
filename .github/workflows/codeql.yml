@@ -11,8 +11,6 @@ on:
   # No branch filter, for the same reason as ci.yml: a stacked PR targets its
   # parent branch rather than main.
   pull_request:
-  schedule:
-    - cron: "27 4 * * 1"
 
 permissions:
   contents: read

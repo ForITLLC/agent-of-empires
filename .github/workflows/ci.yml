@@ -368,3 +368,8 @@ jobs:
       - name: Install and build
         working-directory: website
         run: npm install && npm run build
+
+  # ForIT drift guards (for-Common rail). workflow-schedule fails the build on any
+  # `schedule` or `repository_dispatch` trigger: timers run in Azure, not GitHub cron.
+  site-guards:
+    uses: ForITLLC/forit-Common/.github/workflows/site-guards.yml@v1
