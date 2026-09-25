@@ -1801,6 +1801,18 @@ impl Instance {
         })
     }
 
+    /// The value the next launch routes `key` to for this row's conversation
+    /// target, as [`Self::resolve_native_execution`] resolves it.
+    #[cfg(test)]
+    pub(crate) fn resolved_conversation_routing(&self, key: &str) -> Result<Option<String>> {
+        let native = self.resolve_native_execution(self.conversation_target())?;
+        Ok(native
+            .routing
+            .into_iter()
+            .find(|(name, _)| name == key)
+            .and_then(|(_, value)| value))
+    }
+
     pub(crate) fn conversation_target(&self) -> Option<(&str, Option<&ConversationBinding>, bool)> {
         Some(match &self.resume_intent {
             ResumeIntent::Cleared => return None,

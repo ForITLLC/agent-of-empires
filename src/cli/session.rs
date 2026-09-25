@@ -1315,6 +1315,31 @@ async fn move_session(args: MoveArgs) -> Result<()> {
         let expected = extract_config_dir(
             &crate::session::config::profile_config::resolve_config_or_warn(&target).environment,
         );
+        // The label matching says nothing about the conversation binding: a
+        // record whose conversation is still bound to another account's store
+        // resumes there no matter what the profile resolves. Rebind it (or
+        // refuse) before any restart, and persist it even with --no-restart.
+        let mut rebound = record.clone();
+        rebound.source_profile = target.clone();
+        let rebound_sid = rebind_conversation_store(&mut rebound, expected.as_deref())?;
+        if let Some(sid) = &rebound_sid {
+            let storage = Storage::new_unwatched(&target)?;
+            storage.update(|instances, _groups| {
+                super::patch_instance(instances, &id, |inst| {
+                    inst.source_profile = target.clone();
+                    inst.resume_intent = rebound.resume_intent.clone();
+                    inst.resume_binding = rebound.resume_binding.clone();
+                    inst.resume_probe_failed_sid = None;
+                    Ok(())
+                })
+            })?;
+            println!(
+                "✓ Conversation {} rebound to profile '{}' store ({}).",
+                sid,
+                target,
+                expected.as_deref().unwrap_or("?")
+            );
+        }
         let live = live_config_dir(&record);
         if !args.no_restart && config_dir_diverged(live.as_deref(), expected.as_deref()) {
             println!(
@@ -1330,6 +1355,14 @@ async fn move_session(args: MoveArgs) -> Result<()> {
             // path re-resolves CLAUDE_CONFIG_DIR from it and relaunches the
             // pane on the correct account, clearing the out-of-band override.
             restart_session(&target, SessionIdArgs { identifier: id }).await?;
+            return Ok(());
+        }
+        if rebound_sid.is_some() {
+            println!(
+                "Session '{}' ({}) is already in profile '{}'; its next start resumes under \
+                 that profile's account.",
+                title, id, target
+            );
             return Ok(());
         }
         println!(
@@ -1399,20 +1432,30 @@ async fn move_session(args: MoveArgs) -> Result<()> {
         None => {}
     }
 
-    // Build the relocated record: re-home it on the target profile and drop
-    // the per-profile group association (group_path is meaningful only
-    // within its origin profile; carrying it over would dangle).
-    let mut moved = record.clone();
-    moved.source_profile = target.clone();
-    moved.group_path = String::new();
+    // Build the relocated record. A known Claude conversation is rebound to
+    // the destination store at the same time (refusing, before any record is
+    // written, when that store cannot see the transcript), so the restart
+    // below and a `--no-restart` move's next start both resume under the
+    // target account.
+    let target_dir = extract_config_dir(&target_environment);
+    let (moved, rebound_sid) = relocated_record(&record, &target, target_dir.as_deref())?;
+    if let Some(sid) = rebound_sid {
+        println!(
+            "✓ Conversation {} rebound to the destination store ({}).",
+            sid,
+            target_dir.as_deref().unwrap_or("?")
+        );
+    }
 
     // Insert into the target FIRST, then remove from the source. A crash
     // between the two leaves a harmless duplicate (recoverable) rather than
-    // a vanished session. Insert is idempotent on id.
+    // a vanished session. Insert is idempotent on id; a duplicate left by an
+    // earlier crashed move is replaced so it carries this move's rebind.
     let target_storage = Storage::new_unwatched(&target)?;
     target_storage.update(|instances, _groups| {
-        if !instances.iter().any(|i| i.id == id) {
-            instances.push(moved.clone());
+        match instances.iter_mut().find(|i| i.id == id) {
+            Some(existing) => *existing = moved.clone(),
+            None => instances.push(moved.clone()),
         }
         Ok(())
     })?;
@@ -1491,6 +1534,129 @@ async fn move_session(args: MoveArgs) -> Result<()> {
         ),
     }
     Ok(())
+}
+
+/// Build the relocated record: re-home it on the target profile and drop
+/// the per-profile group association (group_path is meaningful only
+/// within its origin profile; carrying it over would dangle).
+///
+/// A Claude conversation's recorded store outranks the profile's
+/// `CLAUDE_CONFIG_DIR` when the next launch resolves its native execution
+/// (`resolve_native_execution` in `session/instance/execution.rs`), so
+/// relabeling the profile alone would resume under the SOURCE account. The
+/// store is therefore rebound here too; see [`rebind_conversation_store`].
+fn relocated_record(
+    record: &crate::session::Instance,
+    target: &str,
+    target_config_dir: Option<&str>,
+) -> Result<(crate::session::Instance, Option<String>)> {
+    let mut moved = record.clone();
+    moved.source_profile = target.to_string();
+    moved.group_path = String::new();
+    let rebound_sid = rebind_conversation_store(&mut moved, target_config_dir)?;
+    Ok((moved, rebound_sid))
+}
+
+/// Point a Claude row's known conversation at `target_config_dir`, the store
+/// the (already relabeled) profile resolves, when the binding records another
+/// one. This is exactly what `session set-session-id <sid> --store <dir>`
+/// asserts: a pinned resume intent plus an asserted binding naming the new
+/// store. Must run after `source_profile` is set, because the asserted
+/// binding resolves its execution from the row's profile.
+///
+/// Refuses (never silently falls back) when the target store cannot see the
+/// transcript: resuming there would start an empty conversation, and keeping
+/// the old binding would keep spending the source account.
+///
+/// Returns the rebound conversation id, or `None` when nothing needed to
+/// change (no known host Claude conversation, no pinned target dir, or the
+/// recorded store already is the target's).
+fn rebind_conversation_store(
+    inst: &mut crate::session::Instance,
+    target_config_dir: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(target_dir) = target_config_dir.filter(|dir| !dir.is_empty()) else {
+        return Ok(None);
+    };
+    if inst.is_structured() || inst.is_sandboxed() {
+        return Ok(None);
+    }
+    let Some((sid, binding, _)) = inst.conversation_target() else {
+        return Ok(None);
+    };
+    let Some(recorded) = binding
+        .filter(|binding| binding.is_known())
+        .and_then(|binding| binding.execution.as_ref())
+        .filter(|execution| execution.agent == "claude" && execution.filesystem == "host")
+        .and_then(|execution| execution.stores.first())
+        .map(|store| store.to_string_lossy().into_owned())
+    else {
+        return Ok(None);
+    };
+    if !config_dir_diverged(Some(&recorded), Some(target_dir)) {
+        return Ok(None);
+    }
+    let sid = sid.to_string();
+    let target_path = std::path::Path::new(target_dir);
+    let refused = |why: &str| {
+        move_store_refused_message(
+            &inst.title,
+            &inst.id,
+            &inst.source_profile,
+            &sid,
+            &recorded,
+            target_dir,
+            why,
+        )
+    };
+    let visible = crate::session::conversation_carry::claude_transcript_visible(target_path, &sid)
+        .map_err(|e| {
+            anyhow::anyhow!(refused(&format!("could not read the target store: {e:#}")))
+        })?;
+    if !visible {
+        bail!(
+            "{}",
+            refused("its transcript is not visible in the target store")
+        );
+    }
+    let asserted = inst
+        .asserted_resume_binding(&sid, Some(target_path))
+        .map_err(|e| {
+            anyhow::anyhow!(refused(&format!(
+                "could not assert the target store: {e:#}"
+            )))
+        })?;
+    inst.resume_intent = match &inst.resume_intent {
+        crate::session::ResumeIntent::Fork { from } => {
+            crate::session::ResumeIntent::Fork { from: from.clone() }
+        }
+        _ => crate::session::ResumeIntent::Use(sid.clone()),
+    };
+    inst.resume_binding = Some(asserted);
+    inst.resume_probe_failed_sid = None;
+    Ok(Some(sid))
+}
+
+/// The one message a refused conversation rebind prints: nothing moved, and
+/// the operator gets the manual carry that makes the move possible.
+fn move_store_refused_message(
+    title: &str,
+    id: &str,
+    target: &str,
+    sid: &str,
+    source_store: &str,
+    target_store: &str,
+    why: &str,
+) -> String {
+    format!(
+        "MOVE REFUSED: '{title}' ({id}) resumes conversation {sid} from store {source_store}, \
+         but profile '{target}' runs Claude from {target_store}: {why}. Moving anyway would \
+         resume under the old account or start an empty conversation. Carry it first: copy \
+         {source_store}/projects/<encoded-cwd>/{sid}.jsonl (and its {sid}/ directory, if any) \
+         into {target_store}/projects/<encoded-cwd>/, then either re-run the move or run:\n  \
+         aoe -p {target} session set-session-id {id} {sid} --store {target_store}\n  \
+         aoe -p {target} session restart {id}"
+    )
 }
 
 /// The one message a failed re-bind prints. Loud on purpose: the record is
@@ -4733,6 +4899,156 @@ mod move_divergence_tests {
         );
         let no_live = move_incomplete_message("t", "id1", "a", "b", None, "why");
         assert!(!no_live.contains("live CLAUDE_CONFIG_DIR="), "{no_live}");
+    }
+}
+
+#[cfg(test)]
+mod move_rebind_tests {
+    use super::{extract_config_dir, relocated_record};
+    use crate::session::{Instance, ResumeIntent};
+
+    const SID: &str = "33333333-3333-4333-8333-333333333333";
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        _app: crate::session::test_support::AppDirGuard,
+        _config_dir: crate::session::test_support::EnvGuard,
+        _claude: crate::session::test_support::EnvGuard,
+        store_a: std::path::PathBuf,
+        store_b: std::path::PathBuf,
+        project: std::path::PathBuf,
+    }
+
+    /// Two profiles pinned to two accounts (`CLAUDE_CONFIG_DIR` A and B) and
+    /// a Claude row on the first whose conversation is recorded in store A.
+    fn fixture() -> (Fixture, Instance) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let app = crate::session::test_support::isolate_app_dir_at(&root);
+        let config_dir = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let claude = crate::session::test_support::install_login_shell_path_command(
+            &root,
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let store_a = root.join("accounts").join("move-src-main");
+        let store_b = root.join("accounts").join("move-dst-main");
+        for (profile, store) in [("move-src", &store_a), ("move-dst", &store_b)] {
+            std::fs::create_dir_all(store).unwrap();
+            let path =
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!(
+                    "environment = [\"CLAUDE_CONFIG_DIR={}\"]\n",
+                    store.display()
+                ),
+            )
+            .unwrap();
+        }
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut record = Instance::new("t", project.to_str().unwrap());
+        record.tool = "claude".into();
+        record.command = "claude".into();
+        record.source_profile = "move-src".into();
+        let binding = record.asserted_resume_binding(SID, None).unwrap();
+        assert_eq!(
+            binding.execution.as_ref().unwrap().stores.first(),
+            Some(&store_a),
+            "fixture: the conversation must be recorded in the source store"
+        );
+        record.set_agent_conversation(Some(SID.into()), Some(binding), None);
+        (
+            Fixture {
+                _temp: temp,
+                _app: app,
+                _config_dir: config_dir,
+                _claude: claude,
+                store_a,
+                store_b,
+                project,
+            },
+            record,
+        )
+    }
+
+    fn write_transcript(store: &std::path::Path, project: &std::path::Path) {
+        let dir = store
+            .join("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &project.to_string_lossy(),
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{SID}.jsonl")), "conversation\n").unwrap();
+    }
+
+    fn target_config_dir() -> Option<String> {
+        extract_config_dir(
+            &crate::session::config::profile_config::resolve_config_or_warn("move-dst").environment,
+        )
+    }
+
+    // 2026-09-25: a moved Claude session with a known conversation kept
+    // relaunching under the SOURCE account, because the recorded binding's
+    // store outranks the profile's CLAUDE_CONFIG_DIR at launch resolution.
+    #[test]
+    #[serial_test::serial]
+    fn move_routes_a_known_conversation_to_the_target_profiles_store() {
+        let (fx, record) = fixture();
+        write_transcript(&fx.store_a, &fx.project);
+        write_transcript(&fx.store_b, &fx.project);
+        let target_dir = target_config_dir();
+        assert_eq!(target_dir.as_deref(), fx.store_b.to_str());
+
+        let (moved, rebound) =
+            relocated_record(&record, "move-dst", target_dir.as_deref()).unwrap();
+        assert_eq!(rebound.as_deref(), Some(SID));
+
+        assert_eq!(moved.source_profile, "move-dst");
+        assert_eq!(
+            moved
+                .resolved_conversation_routing("CLAUDE_CONFIG_DIR")
+                .unwrap()
+                .as_deref(),
+            fx.store_b.to_str(),
+            "the next launch must resume under the target account"
+        );
+        assert_eq!(moved.resume_intent, ResumeIntent::Use(SID.into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn move_refuses_when_the_target_store_cannot_see_the_transcript() {
+        let (fx, record) = fixture();
+        write_transcript(&fx.store_a, &fx.project);
+        let target_dir = target_config_dir();
+
+        let error = relocated_record(&record, "move-dst", target_dir.as_deref())
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.starts_with("MOVE REFUSED"), "{error}");
+        assert!(error.contains(fx.store_b.to_str().unwrap()), "{error}");
+        assert!(error.contains(fx.store_a.to_str().unwrap()), "{error}");
+        assert!(error.contains(SID), "{error}");
+        assert!(error.contains("set-session-id"), "{error}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn move_leaves_a_conversation_already_in_the_target_store_alone() {
+        let (fx, record) = fixture();
+        let target_dir = fx.store_a.to_str().map(str::to_string);
+
+        let (moved, rebound) =
+            relocated_record(&record, "move-src", target_dir.as_deref()).unwrap();
+        assert_eq!(rebound, None);
+
+        assert_eq!(moved.resume_intent, record.resume_intent);
+        assert_eq!(moved.resume_binding, record.resume_binding);
     }
 }
 

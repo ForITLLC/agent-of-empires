@@ -621,6 +621,19 @@ fn claude_transcripts_for(root: &AnchoredDir, session_id: &str) -> Result<Vec<Pa
     Ok(found)
 }
 
+/// Whether the Claude config root `root` holds a transcript for
+/// `session_id` under any `projects/<encoded-cwd>/`, i.e. whether
+/// `--resume <session_id>` launched against that root can reach it. A root
+/// that does not exist holds nothing.
+pub(crate) fn claude_transcript_visible(root: &Path, session_id: &str) -> Result<bool> {
+    if !root.is_dir() {
+        return Ok(false);
+    }
+    let anchored =
+        AnchoredDir::open(root).with_context(|| format!("opening {}", root.display()))?;
+    Ok(!claude_transcripts_for(&anchored, session_id)?.is_empty())
+}
+
 /// Copy `relative` from `source` to `target`.
 ///
 /// A destination copy at least as new as the source is left alone; a strictly
