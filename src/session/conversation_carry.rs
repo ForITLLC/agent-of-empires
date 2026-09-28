@@ -708,7 +708,15 @@ fn config_root(
 /// so this scans `projects/` instead of recomputing it. A session that moved
 /// between directories has one transcript per cwd it spoke in.
 fn claude_transcripts_for(root: &AnchoredDir, session_id: &str) -> Result<Vec<PathBuf>> {
-    let projects = Path::new("projects");
+    transcripts_under(root, Path::new("projects"), session_id)
+}
+
+/// Every `<encoded-cwd>/<sid>.jsonl` under the anchored `projects` directory.
+fn transcripts_under(
+    root: &AnchoredDir,
+    projects: &Path,
+    session_id: &str,
+) -> Result<Vec<PathBuf>> {
     if root.directory_modified(projects)?.is_none() {
         return Ok(Vec::new());
     }
@@ -737,9 +745,29 @@ fn claude_transcripts_for(root: &AnchoredDir, session_id: &str) -> Result<Vec<Pa
 /// `session_id` under any `projects/<encoded-cwd>/`, i.e. whether
 /// `--resume <session_id>` launched against that root can reach it. A root
 /// that does not exist holds nothing.
+///
+/// Claude follows a `projects` symlink (pool accounts on the fleet VM share
+/// one projects directory through it), so this read-only answer does too. The
+/// anchored carry copy stays no-follow; it only has to agree with what a
+/// resume can reach.
 pub(crate) fn claude_transcript_visible(root: &Path, session_id: &str) -> Result<bool> {
     if !root.is_dir() {
         return Ok(false);
+    }
+    let projects = root.join("projects");
+    let linked = std::fs::symlink_metadata(&projects)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if linked {
+        let Ok(resolved) = std::fs::canonicalize(&projects) else {
+            return Ok(false);
+        };
+        if !resolved.is_dir() {
+            return Ok(false);
+        }
+        let anchored = AnchoredDir::open(&resolved)
+            .with_context(|| format!("opening {}", resolved.display()))?;
+        return Ok(!transcripts_under(&anchored, Path::new(""), session_id)?.is_empty());
     }
     let anchored =
         AnchoredDir::open(root).with_context(|| format!("opening {}", root.display()))?;
@@ -1044,5 +1072,34 @@ mod tests {
         set_age(&on_b, 60);
         carry(&account_b, &account_a, &["sid-a"]).run();
         assert_eq!(std::fs::read_to_string(&on_a).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
+    fn transcript_visible_through_a_shared_projects_symlink() {
+        // Fleet VM 2026-09-28: every pool account's `projects` is a symlink to
+        // one shared directory, and `aoe session move` refused for-HR for every
+        // target because the no-follow scan saw that symlink as nothing.
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        seed_transcript(&shared, "-work-repo", "sid-a", "conversation\n");
+        let account = temp.path().join("claude-2");
+        std::fs::create_dir_all(&account).unwrap();
+        std::os::unix::fs::symlink(shared.join("projects"), account.join("projects")).unwrap();
+
+        assert!(claude_transcript_visible(&account, "sid-a").unwrap());
+        assert!(!claude_transcript_visible(&account, "sid-b").unwrap());
+    }
+
+    #[test]
+    fn transcript_visible_reads_a_plain_projects_dir_and_not_a_dangling_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let plain = temp.path().join("claude-1");
+        seed_transcript(&plain, "-work-repo", "sid-a", "conversation\n");
+        assert!(claude_transcript_visible(&plain, "sid-a").unwrap());
+
+        let dangling = temp.path().join("claude-3");
+        std::fs::create_dir_all(&dangling).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("gone"), dangling.join("projects")).unwrap();
+        assert!(!claude_transcript_visible(&dangling, "sid-a").unwrap());
     }
 }
