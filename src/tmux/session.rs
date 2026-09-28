@@ -140,6 +140,29 @@ pub(crate) fn strip_plan(composer: Option<&str>, text: &str) -> StripStep {
     }
 }
 
+/// Whether the outgoing `text` still sits unsubmitted in the composer after
+/// its Enter: inline behind `❯`, or collapsed by Claude into a
+/// `[Pasted text #N +K lines]` chip, which a multi-line message always is.
+/// The prompt-row prefix match alone cannot see the chip, so a swallowed
+/// Enter on a multi-line send read as delivered and the chip stayed parked,
+/// where every later send and the queue drain took it for an operator's
+/// draft (the AoE-Commander queue at 100/100, 2026-09-22..27). The composer
+/// box read is exempt from `running`: Claude takes a submit mid-turn and
+/// clears the box, so our paste still in it was not sent. Only the prefix
+/// match, which scans rows above the box too, keeps the Running exemption.
+pub(crate) fn outgoing_parked(content: &str, text: &str, running: bool) -> bool {
+    if !running && claude_message_stuck_in_composer(content, text) {
+        return true;
+    }
+    matches!(
+        paste_residue(
+            claude_composer_draft_region(content, PRE_ENTER_REGION).as_deref(),
+            text
+        ),
+        PasteResidue::Clean { .. } | PasteResidue::Scrolled
+    )
+}
+
 /// Counts describing an aborted delivery. Never the human's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeystrokeAbort {
@@ -1670,7 +1693,7 @@ impl Session {
             let content = self.capture_pane(VERIFY_CAPTURE_LINES)?;
             let running = super::status_detection::detect_status_from_content(&content, tool)
                 == Status::Running;
-            if running || !claude_message_stuck_in_composer(&content, text) {
+            if !outgoing_parked(&content, text, running) {
                 return Ok(());
             }
             if attempts >= MAX_SUBMIT_RETRIES {
@@ -1678,8 +1701,13 @@ impl Session {
                     attempts,
                     prior_machine_message: prior,
                 };
+                // Never leave our own text parked: the next send and the
+                // queue drain would read it as an operator's draft and hold
+                // behind it for as long as it sits there.
+                let (removed, rounds, detail) = self.strip_paste(&target, text)?;
                 tracing::warn!(target: "tmux.command",
-                    "send_keys_verified: {} for {}", unconfirmed, self.name);
+                    removed, rounds,
+                    "send_keys_verified: {} for {}; {detail}", unconfirmed, self.name);
                 return Err(unconfirmed.into());
             }
             attempts += 1;
@@ -4628,6 +4656,60 @@ mod tests {
             !is_pane_running_shell(&session_name),
             "is_pane_running_shell should check pane 0 (sleep) with pane-base-index pinned to 0"
         );
+    }
+
+    #[test]
+    /// The AoE-Commander pane on 2026-09-28, as captured: a worker's 5-line
+    /// report collapsed to a chip under an empty prompt row, its Enter never
+    /// landed. The prompt-row prefix check called this delivered.
+    const COMMANDER_PARKED_CHIP: &str = "\u{273b} Cogitated for 4m 16s \u{b7} done 12:00 AM\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+        \u{276f}\u{a0}\n\
+        \n\
+        \x20 [Pasted text #1421 +4 lines]\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+        \x20 5h 2% \u{b7} wk 3%\n\
+        \x20 \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)\n";
+    const WORKER_REPORT: &str = "STATUS: shipped\nACTION-NEEDED: none\n\
+        EVIDENCE: commit abc123\nNEXT: none\n-- for-x (0123456789abcdef)";
+
+    #[test]
+    fn a_parked_chip_is_not_delivered() {
+        assert!(outgoing_parked(COMMANDER_PARKED_CHIP, WORKER_REPORT, false));
+    }
+
+    #[test]
+    fn a_parked_chip_is_not_delivered_while_a_turn_runs() {
+        // A /loop pane is Running most of the time; the box still holds it.
+        assert!(outgoing_parked(COMMANDER_PARKED_CHIP, WORKER_REPORT, true));
+    }
+
+    #[test]
+    fn an_empty_box_after_the_enter_is_delivered() {
+        let pane =
+            "\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f}\u{a0}\n\u{2500}\u{2500}\u{2500}\u{2500}\n";
+        assert!(!outgoing_parked(pane, WORKER_REPORT, false));
+        assert!(!outgoing_parked(pane, WORKER_REPORT, true));
+    }
+
+    #[test]
+    fn an_inline_single_line_send_left_in_the_box_is_parked() {
+        let pane = "\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} wake up: pick up what you were doing\n\u{2500}\u{2500}\u{2500}\u{2500}\n";
+        let msg = "wake up: pick up what you were doing";
+        assert!(outgoing_parked(pane, msg, false));
+        assert!(outgoing_parked(pane, msg, true));
+    }
+
+    #[test]
+    fn the_queued_messages_hint_is_not_our_paste() {
+        let pane = "\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} Press up to edit queued messages\n\u{2500}\u{2500}\u{2500}\u{2500}\n";
+        assert!(!outgoing_parked(pane, WORKER_REPORT, true));
+    }
+
+    #[test]
+    fn a_human_draft_beside_nothing_of_ours_is_not_our_paste() {
+        let pane = "\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} can you also check the\n\u{2500}\u{2500}\u{2500}\u{2500}\n";
+        assert!(!outgoing_parked(pane, WORKER_REPORT, false));
     }
 
     #[test]
