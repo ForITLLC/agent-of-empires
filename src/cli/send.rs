@@ -344,6 +344,7 @@ mod tests {
                 identifier: id.clone(),
                 message: "hello".to_string(),
                 no_revive: false,
+                no_queue: false,
             };
             let err = run(profile, args).await.unwrap_err();
             assert_eq!(err.to_string(), message, "structured={structured}");
@@ -389,6 +390,7 @@ mod tests {
                 identifier: id.clone(),
                 message: "hello".to_string(),
                 no_revive,
+                no_queue: false,
             };
             let err = run(profile, args).await.unwrap_err();
             let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();

@@ -88,7 +88,6 @@ async fn queue_parked_send(
             message,
             Vec::new(),
             Some(origin),
-            chrono::Utc::now().to_rfc3339(),
         )
         .await
         .ok_or(NotQueued::Gone)?;

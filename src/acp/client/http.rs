@@ -400,8 +400,12 @@ impl HttpClient {
             "attachments": [],
         });
         let path = format!("/api/sessions/{session_id}/queue");
-        let request = self.request(Method::POST, &path).json(&body);
-        let res = self.send(request, Scope::Session(session_id)).await?;
+        let res = self
+            .send(
+                || self.request(Method::POST, &path).json(&body),
+                Scope::Session(session_id),
+            )
+            .await?;
         Ok(res.json().await?)
     }
 

@@ -2899,6 +2899,8 @@ async fn handlers_take_instance_lock_before_snapshot() {
                     Ok(Json(SendMessageRequest {
                         message: "hello".into(),
                         revive: false,
+                        queue: true,
+                        sender: None,
                     })),
                 )
                 .await
@@ -3417,6 +3419,8 @@ async fn start_paths_refuse_archived_and_trashed_sessions() {
                     Ok(Json(SendMessageRequest {
                         message: "hello".into(),
                         revive: true,
+                        queue: true,
+                        sender: None,
                     })),
                 )
                 .await
@@ -3597,6 +3601,8 @@ async fn send_refuses_a_live_pane_a_peer_shelved() {
             Ok(Json(SendMessageRequest {
                 message: "hello".into(),
                 revive: false,
+                queue: true,
+                sender: None,
             })),
         )
         .await

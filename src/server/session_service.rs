@@ -2846,7 +2846,6 @@ mod tests {
                     format!("STATUS: {qid}"),
                     Vec::new(),
                     None,
-                    "2026-09-20T08:00:00Z".to_string(),
                 )
                 .await
                 .expect("enqueued");
