@@ -1354,6 +1354,8 @@ fn terminal_fork_hides_structured_despite_structured_default() {
     });
     assert!(!dialog.structured_capable);
     assert!(!dialog.structured_enabled);
+}
+
 // --- tool ↔ profile binding ---
 //
 // The fleet shape these pin: sixteen profiles whose resolved default_tool is
