@@ -4658,7 +4658,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// The AoE-Commander pane on 2026-09-28, as captured: a worker's 5-line
     /// report collapsed to a chip under an empty prompt row, its Enter never
     /// landed. The prompt-row prefix check called this delivered.
