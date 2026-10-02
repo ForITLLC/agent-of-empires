@@ -526,10 +526,7 @@ fn row_title(inst: &crate::session::Instance, in_attention: bool) -> String {
 }
 
 #[cfg(test)]
-pub(super) fn row_title_for_test(
-    inst: &crate::session::Instance,
-    in_attention: bool,
-) -> String {
+pub(super) fn row_title_for_test(inst: &crate::session::Instance, in_attention: bool) -> String {
     row_title(inst, in_attention)
 }
 

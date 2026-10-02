@@ -4707,6 +4707,8 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["error"], "create_outcome_unknown");
     assert_eq!(effects(), 1);
+}
+
 fn parse_goal_body(json: &str) -> UpdateGoalBody {
     serde_json::from_str(json).expect("body parses")
 }
