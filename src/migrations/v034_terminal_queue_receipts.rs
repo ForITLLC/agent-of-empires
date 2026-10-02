@@ -58,6 +58,9 @@ fn run_in(app_dir: &Path) -> Result<()> {
 // Validate the fields that determine queue identity and terminal ownership.
 #[derive(serde::Deserialize)]
 struct LegacyQueueSession {
+    // Only a row with queued terminal prompts needs an identity; upstream's
+    // own migration fixtures write partial rows with no id at all.
+    #[serde(default)]
     id: String,
     #[serde(default)]
     view: crate::session::View,
@@ -76,12 +79,13 @@ fn read_snapshot(path: &Path, queued: &mut Vec<(String, String)>) -> Result<()> 
     let instances: Vec<LegacyQueueSession> = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse legacy queue snapshot {}", path.display()))?;
     for instance in instances {
-        anyhow::ensure!(
-            !instance.id.is_empty(),
-            "empty legacy session id in {}",
-            path.display()
-        );
-        if instance.view != crate::session::View::Structured {
+        if instance.view != crate::session::View::Structured && !instance.queued_prompts.is_empty()
+        {
+            anyhow::ensure!(
+                !instance.id.is_empty(),
+                "empty legacy session id in {}",
+                path.display()
+            );
             for prompt in instance.queued_prompts {
                 anyhow::ensure!(
                     !prompt.id.is_empty(),
@@ -198,7 +202,7 @@ mod tests {
         for contents in [
             "not json",
             "{}",
-            "[{}]",
+            r#"[{"queued_prompts":[{"id":"q","seq":0,"text":"t","attachments":[],"created_at":"2026-09-10T00:00:00Z"}]}]"#,
             "[{\"id\":\"s\",\"queued_prompts\":42}]",
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -206,6 +210,10 @@ mod tests {
             assert!(run_in(dir.path()).is_err(), "{contents}");
             assert!(!dir.path().join("acp_events.db").exists());
         }
+        // A row with nothing queued has nothing to deliver, so it needs no id.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("sessions.json"), "[{}]").unwrap();
+        run_in(dir.path()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("sessions.json")).unwrap();
         assert!(run_in(dir.path()).is_err());

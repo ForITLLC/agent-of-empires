@@ -82,13 +82,7 @@ async fn queue_parked_send(
         .unwrap_or_else(|| "api send".to_string());
     let entry = state
         .session_service
-        .enqueue_prompt(
-            id,
-            new_send_queue_id(),
-            message,
-            Vec::new(),
-            Some(origin),
-        )
+        .enqueue_prompt(id, new_send_queue_id(), message, Vec::new(), Some(origin))
         .await
         .ok_or(NotQueued::Gone)?;
     let position = state
