@@ -2346,12 +2346,14 @@ mod tests {
         assert_eq!(SortOrder::LastActivity.cycle(), SortOrder::Oldest);
         assert_eq!(SortOrder::Oldest.cycle(), SortOrder::AZ);
         assert_eq!(SortOrder::AZ.cycle(), SortOrder::ZA);
-        assert_eq!(SortOrder::ZA.cycle(), SortOrder::Newest);
+        assert_eq!(SortOrder::ZA.cycle(), SortOrder::Custom);
+        assert_eq!(SortOrder::Custom.cycle(), SortOrder::Newest);
     }
 
     #[test]
     fn test_sort_order_cycle_reverse() {
-        assert_eq!(SortOrder::Newest.cycle_reverse(), SortOrder::ZA);
+        assert_eq!(SortOrder::Newest.cycle_reverse(), SortOrder::Custom);
+        assert_eq!(SortOrder::Custom.cycle_reverse(), SortOrder::ZA);
         assert_eq!(SortOrder::ZA.cycle_reverse(), SortOrder::AZ);
         assert_eq!(SortOrder::AZ.cycle_reverse(), SortOrder::Oldest);
         assert_eq!(SortOrder::Oldest.cycle_reverse(), SortOrder::LastActivity);

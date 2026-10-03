@@ -234,8 +234,11 @@ fn kept_rows_carry_the_anchor_marker_after_the_title() {
 }
 
 #[test]
+#[serial]
 fn favorite_rows_carry_a_star_after_the_title() {
     // Ben, 2026-09-06: "favorite should use a star and it should also be after".
+    let original = crate::session::favorites_first();
+    crate::session::set_favorites_first(false);
     let mut inst = Instance::new("fav-me", "/tmp/f");
     inst.favorite();
     assert_eq!(
@@ -253,4 +256,5 @@ fn favorite_rows_carry_a_star_after_the_title() {
         super::super::render::row_title_for_test(&inst, true),
         "z fav-me"
     );
+    crate::session::set_favorites_first(original);
 }
